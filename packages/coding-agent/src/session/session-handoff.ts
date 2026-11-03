@@ -25,6 +25,12 @@ function createHandoffFileName(date = new Date()): string {
 	return `handoff-${fileTimestamp}.md`;
 }
 
+const RELAY_PROMPT = `Create concise working memory for continuing this same session after its context is compacted.
+Preserve the user's goal and constraints, current state and decisions, relevant files and identifiers,
+work completed, outstanding work and immediate next steps, and any important errors or evidence.
+Distinguish facts from uncertainty. Omit irrelevant history and do not invent details.
+Write only the working memory, with enough detail to continue without asking the user to repeat themselves.`;
+
 function throwIfHandoffAborted(signal: AbortSignal): void {
 	if (!signal.aborted) return;
 	const reason = signal.reason;
@@ -140,7 +146,10 @@ export class SessionHandoff {
 			// Both can diverge from this.#host.sessionId() (tan/subagent/shared sessions), so
 			// mirror exactly what the live turn populated the cache under.
 			const handoffPromptCacheKey = this.#host.getPromptCacheKeyForModel(model) ?? this.#host.agent.sessionId;
-			const handoffPromptText = renderHandoffPrompt(this.#host.obfuscateTextForProvider(customInstructions));
+			const focus = this.#host.obfuscateTextForProvider(customInstructions);
+			const handoffPromptText = options?.relay
+				? `${RELAY_PROMPT}${focus ? `\n\nAdditional focus:\n${focus}` : ""}`
+				: renderHandoffPrompt(focus);
 			const handoffSnapshot: AgentMessage[] = [
 				...this.#host.agent.state.messages,
 				{

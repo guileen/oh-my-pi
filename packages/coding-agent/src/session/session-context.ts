@@ -27,6 +27,7 @@ import {
 	type SessionEntry,
 	type SessionMessageEntry,
 } from "./session-entries";
+import { QA_TOOL_TIP_TYPE } from "./compact-modes";
 
 // #4470 crash artifacts had legacy frames (no shape metadata) with 17 frames,
 // ~306k archive chars, and ~1.5M truncated chars. Current snapcompact frames
@@ -502,6 +503,28 @@ export function buildSessionContext(
 		for (let i = resetBoundaryIdx + 1; i < path.length; i++) {
 			appendMessage(path[i]);
 		}
+	} else if (compaction && isRecord(compaction.details) && compaction.details.kind === "qaonly" &&
+		Array.isArray(compaction.details.retainedEntryIds)) {
+		const compactionIdx = path.findIndex(entry => entry.id === compaction.id);
+		const retained = new Set(compaction.details.retainedEntryIds);
+		for (let i = resetBoundaryIdx + 1; i < compactionIdx; i++) {
+			const entry = path[i];
+			if (!retained.has(entry.id)) continue;
+			if (!options?.transcript && entry.type === "message" && entry.message.role === "assistant") {
+				const content = entry.message.content.filter(block => block.type === "text");
+				pushMessage({ ...entry.message, content });
+			} else {
+				appendMessage(entry);
+			}
+		}
+		if (!options?.transcript && typeof compaction.details.toolTip === "string" && compaction.details.toolTip) {
+			pushMessage(createCustomMessage(QA_TOOL_TIP_TYPE, compaction.details.toolTip, false, undefined, compaction.timestamp));
+		}
+		if (options?.transcript) {
+			handleEntryResetTracking(compaction);
+			pushMessage(createCompactionSummaryMessage(compaction.summary, compaction.tokensBefore, compaction.timestamp));
+		}
+		for (let i = compactionIdx + 1; i < path.length; i++) appendMessage(path[i]);
 	} else if (compaction) {
 		const remotePayload = getOpenAiRemoteCompactionPayload(compaction);
 		const remoteReplacementHistory = remotePayload?.items;

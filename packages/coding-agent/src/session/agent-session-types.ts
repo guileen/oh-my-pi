@@ -540,6 +540,8 @@ export interface HandoffResult {
 /** Options controlling handoff generation. */
 export interface SessionHandoffOptions {
 	autoTriggered?: boolean;
+	/** Generate concise working memory for a manual relay compaction. */
+	relay?: boolean;
 	signal?: AbortSignal;
 }
 

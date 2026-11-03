@@ -216,6 +216,11 @@ Including `shake` in `compaction.methodOrder` performs an inline, local reductio
 
 Threshold, incomplete-output, and overflow recovery advance to the next configured method when shake cannot reclaim enough context to get below the recovery band; this prevents repeated no-op shake loops. Idle shake does not use that fallback because the idle timer rechecks usage before running again. Manual `/shake` is a separate, more aggressive command that can target all eligible history.
 
+### Manual relay and QA-only modes
+
+- `/compact relay [focus]` generates working memory using the live conversation and cache-aware handoff request, then compacts in the same session. Provider cache hits depend on the request and cache lifetime.
+- `/compact qaonly` locally retains user instructions and final answers without a model call. Deduplicated file, skill and command tips are temporary context after the next instruction; later compaction may discard them. The session journal remains available.
+
 ### Snapcompact method
 
 Including `snapcompact` in `compaction.methodOrder` replaces the LLM summarization call with a local, deterministic archival pass (`compact` from `@oh-my-pi/snapcompact`):

@@ -13,7 +13,9 @@
 import type { CompactionMethod } from "./compaction-methods";
 
 /** Subcommand selecting a one-off compaction mode for manual `/compact`. */
-export type CompactMode = "soft" | "remote" | "snapcompact";
+export type CompactMode = "soft" | "remote" | "snapcompact" | "relay" | "qaonly";
+
+export const QA_TOOL_TIP_TYPE = "qa-compaction-tool-tip";
 
 /**
  * Per-invocation ordered methods merged over the configured
@@ -30,9 +32,7 @@ export interface CompactModeDef {
 	/** Settings overrides applied on top of `compaction.*` for this run. */
 	readonly overrides: CompactionOverride;
 	/**
-	 * When true, the mode produces no LLM summary, so trailing focus text is
-	 * meaningless and rejected by the parser (snapcompact archives history into
-	 * images without a directed summary).
+	 * When true, the mode produces no directed LLM summary and rejects focus text.
 	 */
 	readonly rejectsFocus?: boolean;
 }
@@ -52,6 +52,17 @@ export const COMPACT_MODES: readonly CompactModeDef[] = [
 		name: "snapcompact",
 		description: "Archive history onto dense bitmap images the model reads back (no LLM call)",
 		overrides: { methodOrder: ["snapcompact"] },
+		rejectsFocus: true,
+	},
+	{
+		name: "relay",
+		description: "Hand off the current work into a compact working memory",
+		overrides: {},
+	},
+	{
+		name: "qaonly",
+		description: "Keep user instructions and final answers without a model call",
+		overrides: {},
 		rejectsFocus: true,
 	},
 ];
@@ -90,7 +101,7 @@ export function parseCompactArgs(args: string): ParsedCompactArgs | { error: str
 	const focus = spaceIndex === -1 ? "" : trimmed.slice(spaceIndex + 1).trim();
 	if (mode.rejectsFocus && focus) {
 		return {
-			error: `/compact ${mode.name} does not take focus instructions (it archives history without an LLM summary).`,
+			error: `/compact ${mode.name} does not take focus instructions (it compacts history without an LLM summary).`,
 		};
 	}
 	return { mode: mode.name, instructions: focus || undefined };

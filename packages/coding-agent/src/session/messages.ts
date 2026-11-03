@@ -58,6 +58,7 @@ import { COLLAB_PROMPT_MESSAGE_TYPE } from "@oh-my-pi/pi-wire";
 import userInterjectionTemplate from "../prompts/steering/user-interjection.md" with { type: "text" };
 import { cleanTinyMessage, formatTitleConversationContext, type TitleConversationTurn } from "../tiny/message-preproc";
 import { stripXdUrlPrefix } from "@oh-my-pi/pi-tui/tools/xd-url";
+import { QA_TOOL_TIP_TYPE } from "./compact-modes";
 
 export {
 	type BranchSummaryMessage,
@@ -1260,7 +1261,18 @@ function convertMessageAt(
 	convert: (m: AgentMessage, interruptedNext: boolean) => Message[],
 ): Message[] {
 	const m = messages[index];
-	return convert(m, m.role === "assistant" && followedByInterruptedThinking(messages, index));
+	if (m.role === "custom" && m.customType === QA_TOOL_TIP_TYPE) return [];
+	const fragment = convert(m, m.role === "assistant" && followedByInterruptedThinking(messages, index));
+	if (isUserAuthoredMessage(m)) {
+		for (let i = index - 1; i >= 0; i--) {
+			const previous = messages[i];
+			if (previous.role === "custom" && previous.customType === QA_TOOL_TIP_TYPE) {
+				return [...fragment, ...convert(previous, false)];
+			}
+			if (isUserAuthoredMessage(previous)) break;
+		}
+	}
+	return fragment;
 }
 
 /** A converted viewer message and its position in the source and converted histories. */

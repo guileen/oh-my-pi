@@ -170,6 +170,67 @@ describe("AgentSession handoff", () => {
 		expect(events.filter(event => event.type === "auto_compaction_end")).toHaveLength(0);
 	});
 
+	it("uses a cache-preserving handoff for relay and retains the session journal", async () => {
+		const previousSessionFile = session.sessionFile;
+		const previousSessionId = session.sessionId;
+		const previousEntries = [...sessionManager.getEntries()];
+		const placeholder = obfuscator.obfuscate(HANDOFF_SECRET);
+		const generateHandoffSpy = vi
+			.spyOn(compactionModule, "generateHandoffFromContext")
+			.mockResolvedValue("## Working memory\nContinue the task");
+
+		await session.compact(`keep ${HANDOFF_SECRET}`, { mode: "relay" });
+
+		const call = generateHandoffSpy.mock.calls[0];
+		if (!call) throw new Error("Expected relay handoff generation");
+		const trailing = call[0].messages.at(-1);
+		const text = typeof trailing?.content === "string"
+			? trailing.content
+			: (trailing?.content ?? []).map(block => (block.type === "text" ? block.text : "")).join("");
+		expect(text).toContain("working memory");
+		expect(text).toContain(`keep ${placeholder}`);
+		expect(text).not.toContain(HANDOFF_SECRET);
+		expect(call[0].systemPrompt).toEqual(["Test"]);
+		expect(call[2].streamOptions.sessionId).toStartWith(`${previousSessionId}:side:`);
+		expect(session.sessionId).toBe(previousSessionId);
+		expect(session.sessionFile).toBe(previousSessionFile);
+		expect(sessionManager.getEntries().slice(0, previousEntries.length)).toEqual(previousEntries);
+		const compaction = sessionManager.getBranch().at(-1);
+		expect(compaction?.type).toBe("compaction");
+		if (compaction?.type !== "compaction") throw new Error("Expected relay compaction entry");
+		expect(compaction.summary).toContain("## Working memory\nContinue the task");
+	});
+
+	it("surfaces relay generation failures without changing the journal or falling back", async () => {
+		const entries = [...sessionManager.getEntries()];
+		const failure = new Error("relay provider failed");
+		const generateHandoffSpy = vi.spyOn(compactionModule, "generateHandoffFromContext").mockRejectedValue(failure);
+		const compactSpy = vi.spyOn(compactionModule, "compact");
+
+		await expect(session.compact(undefined, { mode: "relay" })).rejects.toThrow("relay provider failed");
+
+		expect(generateHandoffSpy).toHaveBeenCalledTimes(1);
+		expect(compactSpy).not.toHaveBeenCalled();
+		expect(sessionManager.getEntries()).toEqual(entries);
+	});
+
+	it("cancels relay generation without changing the journal", async () => {
+		const entries = [...sessionManager.getEntries()];
+		const started = Promise.withResolvers<void>();
+		const finish = Promise.withResolvers<string>();
+		vi.spyOn(compactionModule, "generateHandoffFromContext").mockImplementation(async () => {
+			started.resolve();
+			return finish.promise;
+		});
+
+		const operation = session.compact(undefined, { mode: "relay" });
+		await started.promise;
+		session.abortCompaction();
+		finish.resolve("## Working memory\nMust not be committed");
+		await expect(operation).rejects.toBeInstanceOf(compactionModule.CompactionCancelledError);
+		expect(sessionManager.getEntries()).toEqual(entries);
+	});
+
 	it("dispatches a prompt only after manual handoff commits its compaction", async () => {
 		const started = Promise.withResolvers<void>();
 		const finish = Promise.withResolvers<string>();

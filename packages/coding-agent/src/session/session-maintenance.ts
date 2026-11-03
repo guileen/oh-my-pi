@@ -103,6 +103,7 @@ import {
 	stripImagesFromMessage,
 } from "./messages";
 import { isTerminalTextAssistantAnswer } from "./queued-messages";
+import { prepareQaCompaction } from "./qa-compaction";
 import {
 	resolveCompactionConfiguredTarget,
 	resolveContextPromotionConfiguredTarget,
@@ -1266,9 +1267,80 @@ export class SessionMaintenance {
 					false,
 				);
 			}
+			if (compactMode?.name === "qaonly") {
+				const { details, summary } = prepareQaCompaction(this.#host.sessionManager.getBranch());
+				if (details.retainedEntryIds.length === 0) {
+					throw new ManualCompactionNoOpError("Nothing to compact (no user instructions)");
+				}
+				const result: CompactionResult = {
+					summary,
+					firstKeptEntryId: "",
+					tokensBefore: this.#host.getContextUsage()?.tokens ?? 0,
+					details,
+				};
+				if (compactionAbortController.signal.aborted) throw new CompactionCancelledError();
+				markCommitted();
+				await this.#commitCompactionEntry({
+					...result,
+					details,
+					shortSummary: undefined,
+					fromExtension: false,
+					preserveData: undefined,
+					method: undefined,
+					codexCompaction: undefined,
+					advisorResetReason: "compact",
+				});
+				options?.onComplete?.(result);
+				return finish(result);
+			}
 			const activeModel = this.#model;
 			if (!activeModel) {
 				throw new Error("No model selected");
+			}
+			if (compactMode?.name === "relay") {
+				const preparation = prepareCompaction(
+					this.#host.sessionManager.getBranch(),
+					resolveMethodSettings(this.#compactionSettings, "handoff"),
+					activeModel,
+					this.#tokenizer,
+				);
+				if (!preparation) throw new ManualCompactionNoOpError("Nothing to compact (session too small or already compacted)");
+				let handoff: HandoffResult | undefined;
+				try {
+					handoff = await this.#host.generateHandoffDocument(customInstructions, {
+						relay: true,
+						signal: compactionAbortController.signal,
+					});
+				} catch (error) {
+					if (compactionAbortController.signal.aborted) {
+						throw new CompactionCancelledError(undefined, { cause: compactionAbortController.signal.reason });
+					}
+					throw error;
+				}
+				if (compactionAbortController.signal.aborted) {
+					throw new CompactionCancelledError(undefined, { cause: compactionAbortController.signal.reason });
+				}
+				if (!handoff) throw new Error("Relay compaction did not produce a handoff.");
+				const { summary, details } = handoffSummaryFromDocument(handoff.document, preparation);
+				const result: CompactionResult = {
+					summary,
+					firstKeptEntryId: preparation.firstKeptEntryId,
+					tokensBefore: preparation.tokensBefore,
+					details,
+				};
+				markCommitted();
+				await this.#commitCompactionEntry({
+					...result,
+					details,
+					shortSummary: undefined,
+					fromExtension: false,
+					preserveData: undefined,
+					method: "handoff",
+					codexCompaction: undefined,
+					advisorResetReason: "compact",
+				});
+				options?.onComplete?.(result);
+				return finish(result);
 			}
 			if (
 				this.#usesExperimentalContextManagement() &&
