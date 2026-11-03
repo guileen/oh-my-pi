@@ -103,7 +103,7 @@ import {
 	stripImagesFromMessage,
 } from "./messages";
 import { isTerminalTextAssistantAnswer } from "./queued-messages";
-import { prepareQaCompaction } from "./qa-compaction";
+import { prepareQaCompaction, type QaCompactionRuntimeState } from "./qa-compaction";
 import {
 	resolveCompactionConfiguredTarget,
 	resolveContextPromotionConfiguredTarget,
@@ -458,6 +458,7 @@ export interface SessionMaintenanceHost {
 	reconnectToAgent(): void;
 	drainStrandedQueuedMessages(): void;
 	buildDisplaySessionContext(): SessionContext;
+	getQaCompactionRuntimeState(): Promise<QaCompactionRuntimeState>;
 	/** Preserve the eval runtime snapshot at the history rewrite boundary for replay. */
 	persistEvalStateContext(): void;
 	convertToLlmForSideRequest(messages: AgentMessage[]): Message[];
@@ -1268,7 +1269,8 @@ export class SessionMaintenance {
 				);
 			}
 			if (compactMode?.name === "qaonly") {
-				const { details, summary } = prepareQaCompaction(this.#host.sessionManager.getBranch());
+				const runtimeState = await this.#host.getQaCompactionRuntimeState();
+				const { details, summary } = prepareQaCompaction(this.#host.sessionManager.getBranch(), runtimeState);
 				if (details.retainedEntryIds.length === 0) {
 					throw new ManualCompactionNoOpError("Nothing to compact (no user instructions)");
 				}
@@ -1304,7 +1306,8 @@ export class SessionMaintenance {
 					activeModel,
 					this.#tokenizer,
 				);
-				if (!preparation) throw new ManualCompactionNoOpError("Nothing to compact (session too small or already compacted)");
+				if (!preparation)
+					throw new ManualCompactionNoOpError("Nothing to compact (session too small or already compacted)");
 				let handoff: HandoffResult | undefined;
 				try {
 					handoff = await this.#host.generateHandoffDocument(customInstructions, {

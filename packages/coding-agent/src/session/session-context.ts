@@ -27,7 +27,7 @@ import {
 	type SessionEntry,
 	type SessionMessageEntry,
 } from "./session-entries";
-import { QA_TOOL_TIP_TYPE } from "./compact-modes";
+import { QA_STATE_TYPE, QA_TOOL_TIP_TYPE } from "./compact-modes";
 
 // #4470 crash artifacts had legacy frames (no shape metadata) with 17 frames,
 // ~306k archive chars, and ~1.5M truncated chars. Current snapcompact frames
@@ -503,8 +503,12 @@ export function buildSessionContext(
 		for (let i = resetBoundaryIdx + 1; i < path.length; i++) {
 			appendMessage(path[i]);
 		}
-	} else if (compaction && isRecord(compaction.details) && compaction.details.kind === "qaonly" &&
-		Array.isArray(compaction.details.retainedEntryIds)) {
+	} else if (
+		compaction &&
+		isRecord(compaction.details) &&
+		compaction.details.kind === "qaonly" &&
+		Array.isArray(compaction.details.retainedEntryIds)
+	) {
 		const compactionIdx = path.findIndex(entry => entry.id === compaction.id);
 		const retained = new Set(compaction.details.retainedEntryIds);
 		for (let i = resetBoundaryIdx + 1; i < compactionIdx; i++) {
@@ -517,8 +521,15 @@ export function buildSessionContext(
 				appendMessage(entry);
 			}
 		}
+		if (!options?.transcript && typeof compaction.details.state === "string" && compaction.details.state) {
+			pushMessage(
+				createCustomMessage(QA_STATE_TYPE, compaction.details.state, false, undefined, compaction.timestamp),
+			);
+		}
 		if (!options?.transcript && typeof compaction.details.toolTip === "string" && compaction.details.toolTip) {
-			pushMessage(createCustomMessage(QA_TOOL_TIP_TYPE, compaction.details.toolTip, false, undefined, compaction.timestamp));
+			pushMessage(
+				createCustomMessage(QA_TOOL_TIP_TYPE, compaction.details.toolTip, false, undefined, compaction.timestamp),
+			);
 		}
 		if (options?.transcript) {
 			handleEntryResetTracking(compaction);

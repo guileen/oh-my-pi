@@ -2748,6 +2748,22 @@ export class AgentSession implements SettingsScope {
 			reconnectToAgent: () => this.#reconnectToAgent(),
 			drainStrandedQueuedMessages: () => this.#drainStrandedQueuedMessages(),
 			buildDisplaySessionContext: () => this.buildDisplaySessionContext(),
+			getQaCompactionRuntimeState: async () => {
+				const planning = this.#planModeState?.enabled === true;
+				const approvedPlan = planning
+					? undefined
+					: await loadOverallPlanReference(this.#planReferencePath, this.#localProtocolOptions());
+				return {
+					plan:
+						planning && this.#planModeState
+							? { path: this.#planModeState.planFilePath, mode: "planning" }
+							: approvedPlan
+								? { path: approvedPlan.path, mode: "approved" }
+								: undefined,
+					goal: this.#goalModeState?.enabled ? this.#goalModeState.goal : undefined,
+					jobs: this.getAsyncJobSnapshot({ recentLimit: 0 }) ?? undefined,
+				};
+			},
 			persistEvalStateContext: () => {
 				// The rewritten history carries no snapshot yet, so always build one.
 				const message = this.#buildEvalStateContextMessage([]);
@@ -4224,18 +4240,13 @@ export class AgentSession implements SettingsScope {
 	}
 
 	/**
-	 * Session transitions (`/compact`, `/new`, session switch) disconnect before
-	 * `await abort()`, so the result the abort gives a running tool reaches no
-	 * persisting handler. Record it before the transition rewrites or leaves the
-	 * session; otherwise its call is left without a result and replay fills in a
-	 * synthetic one. Only results of calls the last assistant turn before the
-	 * disconnect made qualify: that turn was persisted at its `message_end`. A turn
-	 * the abort cut short mid-stream was never persisted, so its synthetic results
-	 * would be orphans. A successful `rewind` result is the exception too: the
-	 * aborted turn never applies it, so recording "rewind requested" would claim
-	 * a branch cut that never happened.
+	 * Preserve settled prompts and paired tool results consumed while transitions
+	 * disconnect event listeners. The core can start streaming before its buffered
+	 * user-message events reach the session; losing that prompt changes the intent
+	 * resumed after compaction. Interrupted assistant turns remain excluded, as do
+	 * their orphan results and successful rewinds the aborted turn never applied.
 	 */
-	#persistToolResultsEndedWhileDisconnected(): void {
+	#persistMessagesEndedWhileDisconnected(): void {
 		const start = this.#disconnectedMessageCount;
 		if (start === undefined) return;
 		// Once per disconnect: the transition may replace the agent's messages next (compaction, reset).
@@ -4245,10 +4256,17 @@ export class AgentSession implements SettingsScope {
 		for (let index = Math.min(start, messages.length) - 1; index >= 0 && !lastAssistant; index--) {
 			if (messages[index].role === "assistant") lastAssistant = messages[index];
 		}
-		if (lastAssistant?.role !== "assistant") return;
-		const knownCalls = new Set(lastAssistant.content.flatMap(block => (block.type === "toolCall" ? [block.id] : [])));
+		const knownCalls = new Set(
+			lastAssistant?.role === "assistant"
+				? lastAssistant.content.flatMap(block => (block.type === "toolCall" ? [block.id] : []))
+				: [],
+		);
 		for (let index = start; index < messages.length; index++) {
 			const message = messages[index];
+			if (isUserAuthoredMessage(message) || message.role === "developer" || message.role === "fileMention") {
+				this.#persistMessageEnd(message, this.#promptGeneration);
+				continue;
+			}
 			if (message.role !== "toolResult" || !knownCalls.has(message.toolCallId)) continue;
 			if (!message.isError && semanticToolResult(message.toolName, message)?.toolName === "rewind") continue;
 			this.#persistSessionMessageIfMissing(message);
@@ -11281,6 +11299,10 @@ export class AgentSession implements SettingsScope {
 		const unwind = Promise.withResolvers<void>();
 		this.#abortUnwinds.add(unwind.promise);
 		try {
+			// Keep already-emitted user/tool state before compaction rewrites history.
+			// These commits do not await notification listeners; bumping the generation
+			// first would instead discard them as belonging to an abandoned prompt.
+			if (options?.preserveCompaction) await this.#messageEndPersistenceTail;
 			this.#titleGenerationAbortController.abort();
 			if (!this.#isDisposed) this.#titleGenerationAbortController = new AbortController();
 			this.#abortAutolearnCapture();
@@ -11314,7 +11336,7 @@ export class AgentSession implements SettingsScope {
 			this.agent.abort(options?.reason);
 			await Promise.all([postPromptDrain, computerControlRevocation]);
 			await this.agent.waitForIdle();
-			this.#persistToolResultsEndedWhileDisconnected();
+			this.#persistMessagesEndedWhileDisconnected();
 			// agent_end maintenance can enqueue a retry after the first cancellation.
 			// Keep the abort barrier up until those handlers settle, then cancel
 			// anything they scheduled before making the session revivable. Only

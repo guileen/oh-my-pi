@@ -219,7 +219,9 @@ Threshold, incomplete-output, and overflow recovery advance to the next configur
 ### Manual relay and QA-only modes
 
 - `/compact relay [focus]` generates working memory using the live conversation and cache-aware handoff request, then compacts in the same session. Provider cache hits depend on the request and cache lifetime.
-- `/compact qaonly` locally retains user instructions and final answers without a model call. Deduplicated file, skill and command tips are temporary context after the next instruction; later compaction may discard them. The session journal remains available.
+- `/compact qaonly` locally retains user instructions and final answers plus an operational checkpoint, without a model call. The checkpoint records canonical todo phases, statuses and blockers; the planning/approved-plan reference; an enabled goal; and this session's running jobs and pending-delivery IDs. Existing context notes and eval-state snapshots keep their normal recovery paths.
+- The checkpoint and deduplicated file, skill and command references are immediately available to the next model request, including automatic continuation, and survive session reopen. They are hidden context, not tool calls or new user instructions. Checkpoints describe state at compaction; newer requests and tool state take precedence. Repeating QA-only compaction rebuilds state from current sources; `/clear` excludes earlier conversational state. The original journal remains available, and no missing findings are inferred.
+- Manual compaction still interrupts foreground work and follows `compaction.autoContinue`; the zero-model-call guarantee covers the compaction itself, not the ordinary execution turn it resumes.
 
 ### Snapcompact method
 
