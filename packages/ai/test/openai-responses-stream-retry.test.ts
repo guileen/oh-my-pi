@@ -1,6 +1,9 @@
 import { describe, expect, it, vi } from "bun:test";
 import { streamOpenAIResponses } from "@oh-my-pi/pi-ai/providers/openai-responses";
 import { postOpenAIStream } from "@oh-my-pi/pi-ai/utils/openai-http";
+import { streamSimple } from "@oh-my-pi/pi-ai/stream";
+import { classify, Flag, is, retriable } from "@oh-my-pi/pi-ai/error/flags";
+import { ProviderRequestDeniedError, withProviderRequestError } from "@oh-my-pi/pi-ai/utils/provider-request";
 import type {
 	AssistantMessageEvent,
 	AssistantMessageEventStream,
@@ -714,5 +717,125 @@ describe("OpenAI Responses transient stream retry", () => {
 		expect(fetchMock).toHaveBeenCalledTimes(2);
 		expect(bodies[0]).toHaveProperty("previous_response_id", "resp_from_payload");
 		expect(bodies[1]).toHaveProperty("previous_response_id", "resp_from_payload");
+	});
+});
+
+describe("provider request admission", () => {
+	it("preserves a terminal structured denial independently of the hook's error wording", () => {
+		const denied = new ProviderRequestDeniedError(new Error("429 network timeout, retry your request"));
+		expect(denied.code).toBe("PROVIDER_REQUEST_DENIED");
+		expect(is(classify(denied), Flag.ProviderRequestDenied)).toBe(true);
+		expect(retriable(classify(denied))).toBe(false);
+		const controller = new AbortController();
+		controller.abort(denied);
+		const original = {
+			role: "assistant",
+			content: [],
+			api: model.api,
+			provider: model.provider,
+			model: model.id,
+			stopReason: "aborted",
+			timestamp: 1,
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+		} as const;
+		const result = withProviderRequestError({ ...original, content: [] }, controller.signal);
+		expect(result.stopReason).toBe("aborted");
+		expect(is(result.errorId, Flag.ProviderRequestDenied)).toBe(true);
+		expect(retriable(result.errorId)).toBe(false);
+		expect(result.errorMessage).toBe("Provider request denied by admission hook");
+	});
+
+	const warningContext: Context = {
+		messages: [
+			...context.messages,
+			{ role: "user", content: "Save a checkpoint within three requests.", timestamp: 1_001 },
+		],
+	};
+	const transientResponse = () =>
+		new Response("temporarily unavailable", { status: 503, headers: { "retry-after": "0" } });
+
+	it("charges the warning request and each HTTP retry, never sending a fourth attempt", async () => {
+		let requestsUsed = 0;
+		let admissions = 0;
+		const bodies: string[] = [];
+		const caller = new AbortController();
+		const fetchMock = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+			bodies.push(String(init?.body));
+			return transientResponse();
+		}) as FetchImpl;
+
+		const result = await streamSimple(model, warningContext, {
+			apiKey: "test-key",
+			fetch: fetchMock,
+			signal: caller.signal,
+			beforeProviderRequest: actualModel => {
+				expect(actualModel.id).toBe(model.id);
+				admissions++;
+				if (requestsUsed === 3) throw new Error("allowance exhausted");
+				requestsUsed++;
+			},
+		}).result();
+
+		expect(requestsUsed).toBe(3);
+		expect(admissions).toBe(4);
+		expect(fetchMock).toHaveBeenCalledTimes(3);
+		expect(bodies.every(body => body.includes("Save a checkpoint within three requests."))).toBe(true);
+		expect(result.stopReason).toBe("aborted");
+		expect(caller.signal.aborted).toBe(false);
+	});
+
+	it("accepts a successful third transport attempt without charging streamed deltas", async () => {
+		let requestsUsed = 0;
+		const fetchMock = vi.fn(async () =>
+			requestsUsed < 3 ? transientResponse() : createCompletedTextResponse("checkpoint ready", "resp_allowed"),
+		) as FetchImpl;
+
+		const result = await streamSimple(model, warningContext, {
+			apiKey: "test-key",
+			fetch: fetchMock,
+			beforeProviderRequest: () => {
+				if (requestsUsed === 3) throw new Error("allowance exhausted");
+				requestsUsed++;
+			},
+		}).result();
+
+		expect(requestsUsed).toBe(3);
+		expect(fetchMock).toHaveBeenCalledTimes(3);
+		expect(result.stopReason).toBe("stop");
+	});
+
+	it("fails closed even when a hook error contains transient-provider wording", async () => {
+		let admissions = 0;
+		const fetchMock = vi.fn(async () => createCompletedTextResponse("forbidden", "resp_forbidden")) as FetchImpl;
+		const result = await streamSimple(model, warningContext, {
+			apiKey: "test-key",
+			fetch: fetchMock,
+			beforeProviderRequest: () => {
+				admissions++;
+				throw new Error("429 network timeout, retry your request");
+			},
+		}).result();
+
+		expect(admissions).toBe(1);
+		expect(fetchMock).not.toHaveBeenCalled();
+		expect(result.stopReason).toBe("aborted");
+	});
+
+	it("preserves the normal transport retry budget when no hook is installed", async () => {
+		let attempts = 0;
+		const fetchMock = vi.fn(async () =>
+			++attempts < 6 ? transientResponse() : createCompletedTextResponse("recovered", "resp_without_gate"),
+		) as FetchImpl;
+		const result = await streamSimple(model, context, { apiKey: "test-key", fetch: fetchMock }).result();
+
+		expect(fetchMock).toHaveBeenCalledTimes(6);
+		expect(result.stopReason).toBe("stop");
 	});
 });

@@ -149,7 +149,7 @@ export const cfgCompactionMethodOrder = register({
 		group: "Compaction",
 		label: "Compaction Method Order",
 		description:
-			"Preferred fallback order for automatic context maintenance; unavailable or failed methods advance to the next choice",
+			"Preferred automatic maintenance order; unavailable or failed methods advance only to later choices. QA-only never adds an unconfigured summary fallback",
 		options: COMPACTION_METHOD_CHOICES,
 		ordered: true,
 	},

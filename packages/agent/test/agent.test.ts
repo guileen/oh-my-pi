@@ -1721,6 +1721,50 @@ describe("Agent", () => {
 		expect(mock.calls[0]?.options?.toolChoice).toBeUndefined();
 	});
 
+	it.each([
+		{ additionalCap: undefined, expectedCap: 8_192 },
+		{ additionalCap: 16_384, expectedCap: 8_192 },
+		{ additionalCap: 4_096, expectedCap: 4_096 },
+	])(
+		"preserves final request restrictions through additional model gates (cap=$additionalCap)",
+		async ({ additionalCap, expectedCap }) => {
+			const reportTool: AgentTool = {
+				name: "new_context",
+				label: "Report",
+				description: "Save a structured work report.",
+				parameters: type({}),
+				async execute() {
+					throw new Error("The scripted terminal response must not execute a tool");
+				},
+			};
+			const mock = createMockModel({ responses: [{ content: ["done"] }] });
+			const agent = new Agent({
+				initialState: { model: mock.model, tools: [reportTool], messages: [] },
+				streamFn: mock.stream,
+				getToolChoice: () => "none",
+			});
+			const gates: string[] = [];
+			agent.setBeforeModelCall(() => {
+				gates.push("primary");
+				return { maxTokens: 8_192, toolChoice: { type: "tool", name: "new_context" } };
+			});
+			agent.addBeforeModelCall(() => {
+				gates.push("additional");
+				return additionalCap === undefined ? undefined : { maxTokens: additionalCap };
+			});
+			agent.addBeforeModelCall(() => {
+				gates.push("observer");
+			});
+
+			await agent.prompt("Record the work boundary.");
+
+			expect(gates).toEqual(["primary", "additional", "observer"]);
+			expect(mock.calls).toHaveLength(1);
+			expect(mock.calls[0]?.options?.maxTokens).toBe(expectedCap);
+			expect(mock.calls[0]?.options?.toolChoice).toEqual({ type: "tool", name: "new_context" });
+		},
+	);
+
 	it("re-reads thinking level for each model call within a run", async () => {
 		const toolSchema = type({ value: type("string") });
 		type Details = { value: string };

@@ -1,3 +1,4 @@
+import { admitProviderRequest } from "../utils/provider-request";
 import * as fs from "node:fs/promises";
 import http2 from "node:http2";
 import { cursorModelParameters } from "@oh-my-pi/pi-catalog/compat/behavior";
@@ -1498,8 +1499,10 @@ function streamCursorWithWireMode(
 				}
 				h2Client = client;
 				client.on("error", error => settleH2(mapH2TransportError(error, baseUrl)));
+				await admitProviderRequest(model, options);
 				runTransport = wrapHttp2RunTransport(client.request(requestHeaders));
 			} else {
+				await admitProviderRequest(model, options);
 				runTransport = createHttp1RunTransport({
 					baseUrl,
 					headers: requestHeaders,

@@ -195,6 +195,11 @@ import {
 import type { AuthStorage } from "./session/auth-storage";
 import { CostCapError, type CostGate, guardStreamFn } from "./session/cost-gate";
 import {
+import {
+	canUseRemoteCompaction,
+	resolveCompactionMethodOrder,
+	resolveMethodSettings,
+} from "./session/compaction-methods";
 	CREDENTIAL_DISABLED_NOTICE_SOURCE,
 	formatCredentialDisabledNotice,
 } from "./session/credential-disabled-notice";
@@ -216,6 +221,7 @@ import {
 	dropUnreadableContextImages,
 } from "./session/provider-image-budget";
 import {
+import { qaCheckpointError } from "./session/qa-rollover";
 	expandDefaultRetryFallbackChains,
 	findRetryFallbackCandidates,
 	installRetryFallbackRole,
@@ -410,6 +416,11 @@ import { cfgPlanEnabled } from "./plan-mode/settings";
 import { cfgSecretsEnabled } from "./secrets/settings";
 import {
 	cfgSnapcompactShape,
+	cfgCompaction,
+	cfgCompactionEnabled,
+	cfgCompactionExperimentalContextManagement,
+	cfgCompactionMethodOrder,
+	cfgCompactionMidTurnEnabled,
 	cfgSnapcompactSystemPrompt,
 	cfgSnapcompactToolResults,
 	cfgWorkspaceAdditionalDirectories,
@@ -2639,6 +2650,32 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				if (!model) return undefined;
 				return session.getPromptCacheKeyForModel(model) ?? session.agent.sessionId;
 			},
+			qaRollover: {
+				isEnabled: () =>
+					session
+						? session.isQaRolloverEnabled()
+						: cfgCompactionEnabled.get(settings) &&
+							!cfgCompactionExperimentalContextManagement.get(settings) &&
+							(isSubagentSession || cfgCompactionMidTurnEnabled.get(settings)) &&
+							resolveCompactionMethodOrder(cfgCompactionMethodOrder.get(settings)).find(
+								method =>
+									method !== "remote" ||
+									canUseRemoteCompaction(model, resolveMethodSettings(cfgCompaction.get(settings), "remote")),
+							) === "qaonly" &&
+							typeof model?.contextWindow === "number" &&
+							Number.isFinite(model.contextWindow) &&
+							model.contextWindow > 0,
+				accept: (checkpoint, signal) => {
+					if (!session) {
+						throw qaCheckpointError(
+							"QA_NOT_ACTIVE",
+							"QA rollover is unavailable before session startup.",
+							checkpoint.cycleId,
+						);
+					}
+					return session.acceptQaCheckpoint(checkpoint, signal);
+				},
+			},
 			getToolByName: name => session?.getToolByName(name),
 			getToolForEvalBridge: name => session?.getToolForEvalBridge(name),
 			getEvalBridgeToolNames: () => session?.getEvalBridgeToolNames() ?? [],
@@ -2799,6 +2836,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		// Restricted sessions cannot inherit or discover MCP capabilities.
 		const enableMCP = !restrictToolNames && (options.enableMCP ?? true);
 		let mcpManager: MCPManager | undefined = enableMCP ? options.mcpManager : undefined;
+		let newContextExperimentalMode = cfgCompactionExperimentalContextManagement.get(settings);
 		toolSession.mcpManager = mcpManager;
 		toolSession.enableMCP = enableMCP;
 		const deferMCPDiscoveryForUI = enableMCP && !mcpManager && options.hasUI === true;
@@ -3825,6 +3863,24 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			}
 		}
 		for (const tool of wrappedExtensionTools) {
+		// Model discovery may finish after the initial built-in pass. Install the
+		// QA acknowledgement before building the first provider-facing prompt.
+		if (
+			!toolRegistry.has("new_context") &&
+			!cfgCompactionExperimentalContextManagement.get(settings) &&
+			(!restrictToolNames || normalizeToolNames(options.toolNames ?? []).includes("new_context"))
+		) {
+			const newContextTool = await BUILTIN_TOOLS.new_context(toolSession);
+			if (newContextTool) {
+				const wrapped = wrapToolWithMetaNotice(newContextTool);
+				toolRegistry.set(newContextTool.name, wrapped);
+				builtInToolNames.push(newContextTool.name);
+				builtInRegistryToolNames.add(newContextTool.name);
+				nativeToolsByName.set(newContextTool.name, wrapped);
+				activeToolNames.add(newContextTool.name);
+				newContextExperimentalMode = false;
+			}
+		}
 			toolRegistry.set(tool.name, tool);
 			builtInRegistryToolNames.delete(tool.name);
 		}
@@ -3994,7 +4050,10 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			const removed: string[] = [];
 			for (const name of SETTINGS_GATED_BUILTIN_TOOL_NAMES) {
 				const registered = toolRegistry.has(name);
-				if (!plan.isAllowed(name)) {
+				const replaceNewContext =
+					name === "new_context" &&
+					newContextExperimentalMode !== cfgCompactionExperimentalContextManagement.get(settings);
+				if (!plan.isAllowed(name) || (name === "new_context" && !planned.has(name))) {
 					nativeToolsByName.delete(name);
 					if (!registered || !isBuiltIn(name)) continue;
 					toolRegistry.delete(name);
@@ -4002,22 +4061,32 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					removed.push(name);
 					continue;
 				}
-				if (!planned.has(name) || (registered && (isBuiltIn(name) || nativeToolsByName.has(name)))) continue;
+				if (
+					!planned.has(name) ||
+					(registered && (isBuiltIn(name) || nativeToolsByName.has(name)) && !replaceNewContext)
+				) {
+					continue;
+				}
 				const tool = await logger.time(`createTools:${name}:settings`, BUILTIN_TOOLS[name], toolSession);
 				if (!tool) continue;
 				const native = wrapToolWithMetaNotice(tool);
 				nativeToolsByName.set(name, native);
-				if (registered) continue;
+				if (name === "new_context") {
+					newContextExperimentalMode = cfgCompactionExperimentalContextManagement.get(settings);
+				}
+				if (registered && (!replaceNewContext || !isBuiltIn(name))) continue;
 				toolRegistry.set(name, new ExtensionToolWrapper(native, extensionRunner) as Tool);
 				builtInRegistryToolNames.add(name);
 				// As at construction: explicit lists activate requested names, session-managed
 				// force-includes and the checkpoint/rewind pair; other auto-includes stay inactive.
-				const activate = explicitToolNames
-					? explicitToolNames.has(name) ||
-						SESSION_MANAGED_BUILTIN_TOOL_NAMES.includes(name) ||
-						name === "checkpoint" ||
-						name === "rewind"
-					: native.hidden !== true;
+				const activate = registered
+					? toolSession.isToolActive?.(name) === true
+					: explicitToolNames
+						? explicitToolNames.has(name) ||
+							SESSION_MANAGED_BUILTIN_TOOL_NAMES.includes(name) ||
+							name === "checkpoint" ||
+							name === "rewind"
+						: native.hidden !== true;
 				added.push({ name, builtIn: true, activate });
 			}
 			const custom = await reconcileSettingsGatedCustomTools();
@@ -4983,6 +5052,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			},
 			// Live, not the spread's copy: a rediscovery after a plugin upgrade replaces the primary's list.
 			get skills() {
+			qaRollover: undefined,
 				return toolSession.skills;
 			},
 			hasEditTool: true,
@@ -5258,6 +5328,11 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			const name = registered.definition.name;
 			const liveTool = new ExtensionToolWrapper(wrapToolWithMetaNotice(wrapped), extensionRunner);
 			// Capture ordinary extension precedence while the listener observes this exact registration.
+			disposeCallbacks.add(
+				session.subscribe(event => {
+					if (event.type === "model_changed") void reconcileGatedTools({ refreshPrompt: false });
+				}),
+			);
 			// A later same-name registration may replace the extension map before serialized activation runs.
 			const isEffectiveRegistrant = extensionRunner.getRegisteredTool(name) === registered;
 			const activation = session.runToolRegistryMutation(async () => {

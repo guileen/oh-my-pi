@@ -370,6 +370,7 @@ type ForwardedOptions = Pick<
 	StreamOptions,
 	| "signal"
 	| "fetch"
+	| "beforeProviderRequest"
 	| "credentialId"
 	| "cacheRetention"
 	| "providerSessionState"
@@ -757,6 +758,7 @@ export const streamFactoryDroid: StreamFunction<"factory-droid-agent"> = (
 					apiKey: harnessToken,
 					signal: options?.signal,
 					fetch: options?.fetch,
+					beforeProviderRequest: options?.beforeProviderRequest,
 					credentialId: options?.credentialId,
 					cacheRetention: options?.cacheRetention,
 					providerSessionState: options?.providerSessionState,

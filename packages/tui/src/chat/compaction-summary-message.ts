@@ -5,6 +5,7 @@ import { Markdown } from "../components/markdown";
 import { formatNumber } from "@oh-my-pi/pi-utils";
 import { getMarkdownTheme, getThemeEpoch, theme } from "../theme";
 import { expandKeyHint } from "../render/render-utils";
+import { truncateToWidth } from "../utils";
 import type { BranchSummaryMessage, CompactionSummaryMessage, CustomMessage } from "./messages";
 import type { TspSpan } from "@oh-my-pi/pi-wire";
 import { md, node, span, text } from "../native/describe";
@@ -19,6 +20,7 @@ const COMPACTION_METHOD_LABELS: Record<string, string> = {
 	handoff: "handed-off",
 	snapcompact: "snap-compacted",
 	shake: "shaken",
+	qaonly: "Q&A-compacted",
 };
 
 /** `256K→20K` amount badge, or undefined when the entry predates `tokensAfter`. */
@@ -76,7 +78,7 @@ class DividerSummary implements Component {
 		const remaining = width - plainWidth - 2;
 		if (remaining < 4) {
 			// Too narrow for a framed rule — emit the bare label.
-			return theme.fg("muted", label);
+			return truncateToWidth(theme.fg("muted", label), width);
 		}
 		const left = Math.floor(remaining / 2);
 		const right = remaining - left;
@@ -195,7 +197,7 @@ class SummaryMessageComponent implements Component {
  *   ──────── 📷 remote-compacted · 256K→20K · ctrl+o ────────
  *
  * The label names the maintenance method that fired (remote/soft/handoff/
- * snapcompact; "compacted" for legacy or extension-provided entries) and the
+ * snapcompact/qaonly; "compacted" for legacy or extension-provided entries) and the
  * before → after context amounts when the entry recorded them. The
  * conversation above the divider stays visible (display transcript keeps
  * full history); only the LLM context was reset. Expanding (ctrl+o) reveals

@@ -580,20 +580,29 @@ export class GuestClient {
 				if (!event.success) this.#pushNotice("error", event.finalError ?? "retry failed");
 				break;
 			case "auto_compaction_start":
-				this.#pushNotice("info", `compacting context (${event.reason})`);
+				this.#pushNotice(
+					"info",
+					event.action === "qaonly"
+						? `compacting Q&A locally (${event.reason})`
+						: `compacting context (${event.reason})`,
+				);
 				break;
-			case "auto_compaction_end":
+			case "auto_compaction_end": {
+				const label = event.action === "qaonly" ? "Q&A compaction" : "compaction";
 				if (!event.skipped) {
 					this.#pushNotice(
 						"info",
 						event.aborted
-							? "compaction aborted"
+							? `${label} aborted`
 							: event.errorMessage
-								? `compaction failed: ${event.errorMessage}`
-								: "context compacted",
+								? `${label} failed: ${event.errorMessage}`
+								: event.action === "qaonly"
+									? "Q&A compacted locally"
+									: "context compacted",
 					);
 				}
 				break;
+			}
 			default:
 				// turn_start/turn_end/thinking_level_changed/unknown — ignore
 				break;

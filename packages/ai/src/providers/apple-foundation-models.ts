@@ -28,6 +28,7 @@ import type {
 import { normalizeSystemPrompts } from "../utils";
 import { clearStreamingPartialJson, kStreamingLastParseLen, kStreamingPartialJson } from "../utils/block-symbols";
 import { AssistantMessageEventStream } from "../utils/event-stream";
+import { admitProviderRequest } from "../utils/provider-request";
 import { decodeFoundationModelsArguments, toFoundationModelsSchema, toolWireSchema } from "../utils/schema";
 import { transformMessages } from "./transform-messages";
 import { joinTextWithImagePlaceholder, partitionVisionContent } from "./vision-guard";
@@ -294,6 +295,7 @@ export const streamAppleFoundationModels: StreamFunction<"apple-foundation-model
 			const { request, encodedPaths } = buildRequest(model, context, options);
 			await options.onPayload?.(request, model);
 			stream.push({ type: "start", partial: output });
+			await admitProviderRequest(model, options);
 			for await (const event of generate(request, options.signal)) {
 				switch (event.type) {
 					case "text": {

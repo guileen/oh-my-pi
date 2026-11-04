@@ -437,6 +437,7 @@ import {
 	queueChipText,
 	toRestoredQueuedMessage,
 } from "./queued-messages";
+import { type QaCheckpointInput, type QaCheckpointAcceptance, qaCheckpointError } from "./qa-rollover";
 import { checkCodexBalance, readResetMarker, resetLockPath, withResetFence } from "./reset-fence";
 import type { ServingModel } from "./retry-fallback-chains";
 import {
@@ -2336,6 +2337,7 @@ export class AgentSession implements SettingsScope {
 				let turnError: unknown;
 				const inFlightEpoch = this.#beginInFlight();
 				try {
+					this.#maintenance.resetForNewPrompt();
 					await this.agent.prompt(messages.length === 1 ? first : messages);
 				} catch (error) {
 					turnError = error;
@@ -2737,6 +2739,12 @@ export class AgentSession implements SettingsScope {
 				if (this.#isDisposed) return;
 				this.#experimentalContextNotesReminder = { prompt, generation: this.#promptGeneration };
 			},
+			hasQaRolloverTool: () => this.#tools.getEnabledToolNames().includes("new_context"),
+			pendingQaMessages: () => [
+				...this.agent.peekSteeringQueue(),
+				...this.agent.peekFollowUpQueue(),
+				...this.#pendingNextTurnMessages,
+			],
 			memoryBackendSession: () => this,
 			emitSessionEvent: (event, options) => this.#emitSessionEvent(event, options),
 			emitNotice: (level, message, source) => this.emitNotice(level, message, source),
@@ -2835,6 +2843,16 @@ export class AgentSession implements SettingsScope {
 			abortHandoff: () => this.abortHandoff(),
 		};
 		this.#maintenance = new SessionMaintenance(maintenanceHost);
+		this.addDisposer(
+			this.agent.addBeforeModelCallHook((_signal, context) => {
+				this.#maintenance.prepareQaModelCall(context.messages);
+			}),
+		);
+		this.addDisposer(
+			this.agent.addBeforeModelCall((context, signal) => this.#maintenance.beforeQaModelCall(context, signal)),
+		);
+		this.agent.setBeforeProviderRequest(() => this.#maintenance.beforeQaProviderRequest());
+		this.addDisposer(() => this.agent.setBeforeProviderRequest(undefined));
 		this.addDisposer(
 			this.agent.addBeforeModelCallHook((_signal, context) =>
 				this.#maintenance.renderArchiveForModel(context.messages),
@@ -3161,6 +3179,8 @@ export class AgentSession implements SettingsScope {
 	 *   3. else undefined.
 	 */
 	nextToolChoiceDirective(): ToolChoiceDirective | undefined {
+		const reportChoice = this.#maintenance.qaReportToolChoice();
+		if (reportChoice) return reportChoice;
 		const hard = this.#nextHardToolChoice();
 		if (hard !== undefined) return hard;
 		const head = this.#toolChoiceQueue.peekPendingHead();
@@ -5056,6 +5076,17 @@ export class AgentSession implements SettingsScope {
 
 			let compactionResult = COMPACTION_CHECK_NONE;
 			let checkedCompaction = false;
+			if (this.#maintenance.hasPendingQaReport()) {
+				maintenanceRoute("qa-report-settlement");
+				const compactionTask = this.#maintenance.checkCompaction(msg);
+				this.#trackPostPromptTask(compactionTask);
+				const reportResult = await compactionTask;
+				this.#recovery.resolveRetry();
+				this.#resetSessionStopContinuationState();
+				await emitAgentEndNotification(reportResult.continuationScheduled ? { willContinue: true } : undefined);
+				return;
+			}
+
 			if (activeGoal) {
 				// Payload rejections get a pre-compaction chain consult; checkCompaction()'s overflow path commits a remedy before returning (#9235).
 				if (AIError.isPayloadRejection(msg) && this.#recovery.isHardErrorFallbackEligible(msg)) {
@@ -5367,8 +5398,9 @@ export class AgentSession implements SettingsScope {
 			}
 			for (;;) {
 				try {
+					const queuedInputFirst = !this.agent.state.isStreaming && this.#maintenance.resumeQaForQueuedInput();
 					if (!this.agent.state.isStreaming) onStart?.();
-					await this.agent.continue(signal);
+					await this.agent.continue(signal, { queuedInputFirst });
 					return { status: "completed" };
 				} catch (error) {
 					if (!(error instanceof AgentBusyError)) throw error;
@@ -5516,11 +5548,29 @@ export class AgentSession implements SettingsScope {
 		);
 	}
 
+	isQaRolloverEnabled(): boolean {
+		return this.#maintenance.isQaRolloverEnabled();
+	}
+
+	async acceptQaCheckpoint(input: QaCheckpointInput, signal?: AbortSignal): Promise<QaCheckpointAcceptance> {
+		const assistant = this.#findLastAssistantMessage();
+		const calls = assistant?.content.filter(block => block.type === "toolCall");
+		if (calls?.length !== 1 || calls[0].type !== "toolCall" || calls[0].name !== "new_context") {
+			throw qaCheckpointError(
+				"QA_INVALID_CHECKPOINT",
+				"new_context must be the sole tool call in its response.",
+				input.cycleId,
+			);
+		}
+		return this.#maintenance.acceptQaCheckpoint(input, signal);
+	}
+
 	#scheduleCompactionContinuation(options: {
 		generation: number;
 		autoContinue: boolean;
 		terminalTextAnswer: boolean;
 		suppressContinuation: boolean;
+		checkpointDisposition?: QaCheckpointInput["disposition"];
 	}): boolean {
 		if (options.suppressContinuation) return false;
 		if (this.agent.hasQueuedMessages()) {
@@ -5532,6 +5582,7 @@ export class AgentSession implements SettingsScope {
 			});
 			return true;
 		}
+		if (options.checkpointDisposition && options.checkpointDisposition !== "continue") return false;
 		if (!options.autoContinue) return false;
 		const activeGoal = this.#goalModeState?.enabled === true && this.#goalModeState.goal.status === "active";
 		if (options.terminalTextAnswer && !activeGoal) return false;
@@ -5662,6 +5713,8 @@ export class AgentSession implements SettingsScope {
 	 * execution still emit there).
 	 */
 	async #beforeToolCall(ctx: BeforeToolCallContext, signal?: AbortSignal): Promise<BeforeToolCallResult | undefined> {
+		const qaBlock = this.#maintenance.blockQaToolCall(ctx.assistantMessage, ctx.tool.name);
+		if (qaBlock) return { block: true, reason: qaBlock };
 		const runner = this.#extensionRunner;
 		runner?.markLoopToolCall?.(ctx.toolCall.id, ctx.tool.name);
 		const ttsrResult = await this.#ttsr.beforeToolCall(ctx);

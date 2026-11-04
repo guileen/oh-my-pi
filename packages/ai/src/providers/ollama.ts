@@ -1,6 +1,7 @@
 import { calculateCost } from "@oh-my-pi/pi-catalog/models";
 import { fetchWithRetry, parseStreamingJson, readJsonl } from "@oh-my-pi/pi-utils";
 import * as AIError from "../error";
+import { providerRequestFetch } from "../utils/provider-request";
 import { parseToolCallArguments } from "../utils/tool-call-arguments";
 import { getEnvApiKey } from "../env-api-key";
 import type {
@@ -611,7 +612,7 @@ const streamOllamaOnce = (
 					signal: watchdog.signal,
 					defaultDelayMs: OLLAMA_RETRY_DELAYS_MS,
 					shouldRetryResponse: shouldRetryOllamaResponse,
-					fetch: options.fetch,
+					fetch: providerRequestFetch(model, options),
 					timeout: false,
 				});
 			} finally {

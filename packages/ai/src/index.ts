@@ -71,5 +71,6 @@ export * from "./utils/openrouter-headers";
 export * from "./utils/narration";
 export * from "./utils/schema";
 export * from "./utils/thinking-loop";
+export { ProviderRequestDeniedError } from "./utils/provider-request";
 export * from "./utils/tool-call-loop-guard";
 export * from "./utils/validation";

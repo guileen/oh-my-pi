@@ -168,6 +168,7 @@ export function streamGitLabDuo(
 								onResponse: options.onResponse,
 								onSseEvent: options.onSseEvent,
 								fetch: options.fetch,
+								beforeProviderRequest: options.beforeProviderRequest,
 								thinkingEnabled: Boolean(anthropicReasoningEffort) && model.reasoning,
 								thinkingBudgetTokens: anthropicReasoningEffort
 									? (options.thinkingBudgets?.[anthropicReasoningEffort] ??
@@ -210,6 +211,7 @@ export function streamGitLabDuo(
 									onResponse: options.onResponse,
 									onSseEvent: options.onSseEvent,
 									fetch: options.fetch,
+									beforeProviderRequest: options.beforeProviderRequest,
 									reasoning: reasoningEffort,
 									disableReasoning: options.disableReasoning,
 									forceReasoningOff: options.forceReasoningOff,
@@ -246,6 +248,7 @@ export function streamGitLabDuo(
 									onResponse: options.onResponse,
 									onSseEvent: options.onSseEvent,
 									fetch: options.fetch,
+									beforeProviderRequest: options.beforeProviderRequest,
 									reasoning: reasoningEffort,
 									// OpenAICompletionsOptions carries no forceReasoningOff; fold it
 									// like the azure-openai-responses mapping does.

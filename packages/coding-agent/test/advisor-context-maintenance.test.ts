@@ -21,6 +21,7 @@ import { asGlobalFetch } from "./helpers/fetch-mock";
 import {
 	cfgCompaction,
 	cfgCompactionKeepRecentTokens,
+	cfgCompactionMethodOrder,
 	cfgCompactionThresholdTokens,
 } from "@oh-my-pi/pi-coding-agent/session/context-settings";
 
@@ -252,6 +253,30 @@ describe("AgentSession advisor context maintenance", () => {
 		expect(JSON.stringify(advisorCall.context.messages)).toContain("small current update");
 		expect(JSON.stringify(advisor.state.messages)).not.toContain("prior advisor output");
 		expect(session.getAdvisorCost()).toBeCloseTo(0.5, 8);
+	});
+
+	it("does not turn QA-only selection into an implicit advisor summary request", async () => {
+		const { advisor, advisorMock, modelRegistry, settings } = createHarness();
+		cfgCompactionMethodOrder.override(settings, ["qaonly"]);
+		expect(cfgCompaction.get(settings).methodOrder).toEqual(["qaonly"]);
+		vi.spyOn(modelRegistry, "getApiKey").mockResolvedValue("test-key");
+		const prior = usageAnchor(advisorMock, Date.now() - 1_000);
+		advisor.state.messages.push(
+			{ role: "user", content: "saved advisor evidence", timestamp: Date.now() - 2_000 },
+			prior,
+		);
+		const compact = vi.spyOn(compactionModule, "compact").mockImplementation(async preparation => ({
+			summary: "unconfigured paid summary",
+			firstKeptEntryId: preparation.firstKeptEntryId,
+			tokensBefore: preparation.tokensBefore,
+		}));
+
+		await session.prompt("small update with QA-only configured");
+
+		expect(compact).not.toHaveBeenCalled();
+		expect(advisorMock.calls).toHaveLength(1);
+		expect(JSON.stringify(advisorMock.calls[0].context.messages)).toContain("saved advisor evidence");
+		expect(JSON.stringify(advisor.state.messages)).toContain("saved advisor evidence");
 	});
 
 	it("ignores late context-promotion credentials after a session transition", async () => {

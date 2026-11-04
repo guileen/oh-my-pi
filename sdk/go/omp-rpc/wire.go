@@ -3477,6 +3477,7 @@ const (
 	AutoCompactionActionHandoff     AutoCompactionAction = "handoff"
 	AutoCompactionActionShake       AutoCompactionAction = "shake"
 	AutoCompactionActionSnapcompact AutoCompactionAction = "snapcompact"
+	AutoCompactionActionQaonly      AutoCompactionAction = "qaonly"
 )
 
 func (v *AutoCompactionAction) UnmarshalJSON(data []byte) error {
@@ -3485,7 +3486,7 @@ func (v *AutoCompactionAction) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	switch value := AutoCompactionAction(s); value {
-	case AutoCompactionActionContextFull, AutoCompactionActionRemote, AutoCompactionActionHandoff, AutoCompactionActionShake, AutoCompactionActionSnapcompact:
+	case AutoCompactionActionContextFull, AutoCompactionActionRemote, AutoCompactionActionHandoff, AutoCompactionActionShake, AutoCompactionActionSnapcompact, AutoCompactionActionQaonly:
 		*v = value
 		return nil
 	}

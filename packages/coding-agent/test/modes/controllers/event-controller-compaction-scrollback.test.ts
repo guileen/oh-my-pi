@@ -16,25 +16,26 @@ import type { AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-
 import { CommandController } from "@oh-my-pi/pi-coding-agent/modes/controllers/command-controller";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
 import { initTheme } from "@oh-my-pi/pi-tui/theme";
+import { PREVIEW_LIMITS, TRUNCATE_LENGTHS } from "@oh-my-pi/pi-tui/render/render-utils";
 import { createInteractiveModeContext } from "../../helpers/interactive-mode-context";
 
-function compactionResultEvent(): AgentSessionEvent {
+function compactionResultEvent(action: "snapcompact" | "qaonly" = "snapcompact"): AgentSessionEvent {
 	return {
 		type: "auto_compaction_end",
-		action: "snapcompact",
+		action,
 		result: { summary: "compacted summary", firstKeptEntryId: "entry-1", tokensBefore: 100_000 },
 		aborted: false,
 		willRetry: false,
 	};
 }
 
-async function dispatchCompactionEnd(collapseCompacted: boolean) {
+async function dispatchCompactionEnd(collapseCompacted: boolean, action: "snapcompact" | "qaonly" = "snapcompact") {
 	resetSettingsForTest();
 	await Settings.init({ inMemory: true, overrides: { "display.collapseCompacted": collapseCompacted } });
 	const context = createInteractiveModeContext();
 	const controller = new EventController(context);
 	try {
-		await controller.handleEvent(compactionResultEvent());
+		await controller.handleEvent(compactionResultEvent(action));
 	} finally {
 		controller.dispose();
 	}
@@ -65,6 +66,61 @@ describe("auto compaction-end scrollback pairing", () => {
 
 		expect(context.rebuildChatFromMessages).toHaveBeenCalledWith({ reuseSettledComponents: true });
 		expect(context.ui.requestRender).toHaveBeenCalledWith(true, { clearScrollback: true });
+	});
+
+	it.each([false, true])("rebuilds local QA context with scrollback replacement (collapse %s)", async collapse => {
+		const context = await dispatchCompactionEnd(collapse, "qaonly");
+		expect(context.rebuildChatFromMessages).toHaveBeenCalledWith({ reuseSettledComponents: true });
+		expect(context.ui.requestRender).toHaveBeenCalledWith(true, { clearScrollback: true });
+		expect(context.flushCompactionQueue).toHaveBeenCalledWith({ willRetry: false });
+		expect(context.showWarning).not.toHaveBeenCalled();
+	});
+
+	it("keeps a cancelled QA rewrite from rebuilding the transcript", async () => {
+		const context = createInteractiveModeContext();
+		const controller = new EventController(context);
+		try {
+			await controller.handleEvent({
+				type: "auto_compaction_end",
+				action: "qaonly",
+				result: undefined,
+				aborted: true,
+				willRetry: false,
+			});
+			expect(context.rebuildChatFromMessages).not.toHaveBeenCalled();
+			expect(context.showWarning).not.toHaveBeenCalled();
+			expect(context.showStatus).toHaveBeenCalledTimes(1);
+			expect(context.flushCompactionQueue).toHaveBeenCalledWith({ willRetry: false });
+		} finally {
+			controller.dispose();
+		}
+	});
+
+	it("sanitizes and bounds QA errors without replacing unknown counts with zero", async () => {
+		const context = createInteractiveModeContext();
+		const showWarning = vi.spyOn(context, "showWarning");
+		const controller = new EventController(context);
+		try {
+			await controller.handleEvent({
+				type: "auto_compaction_end",
+				action: "qaonly",
+				result: undefined,
+				aborted: false,
+				willRetry: false,
+				errorMessage: `\x1b[2Jfailed\n${"evidence ".repeat(500)}`,
+			});
+			const warning = showWarning.mock.calls[0]?.[0];
+			expect(typeof warning).toBe("string");
+			expect(warning).not.toContain("\x1b");
+			expect(warning).not.toContain("\n");
+			expect(warning).not.toContain("0 tokens");
+			expect(Bun.stringWidth(warning!, { countAnsiEscapeCodes: false })).toBeLessThanOrEqual(
+				TRUNCATE_LENGTHS.LINE * PREVIEW_LIMITS.COLLAPSED_LINES,
+			);
+			expect(context.rebuildChatFromMessages).not.toHaveBeenCalled();
+		} finally {
+			controller.dispose();
+		}
 	});
 });
 

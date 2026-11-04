@@ -3541,6 +3541,8 @@ pub enum AutoCompactionAction {
 	Shake,
 	#[serde(rename = "snapcompact")]
 	Snapcompact,
+	#[serde(rename = "qaonly")]
+	Qaonly,
 }
 
 impl AutoCompactionAction {
@@ -3552,6 +3554,7 @@ impl AutoCompactionAction {
 			Self::Handoff => "handoff",
 			Self::Shake => "shake",
 			Self::Snapcompact => "snapcompact",
+			Self::Qaonly => "qaonly",
 		}
 	}
 }

@@ -84,6 +84,8 @@ export interface AgentTurnEndContext {
 	additionalMessages?: AgentMessage[];
 	/** True when the current tool-loop batch is continuing without yielding to post-turn steering. */
 	willContinue: boolean;
+	/** Host-owned settled boundary: end this loop before dequeuing more input or asides. */
+	stop?: boolean;
 }
 
 export interface AgentPreModelCallStop {
@@ -93,11 +95,21 @@ export interface AgentPreModelCallStop {
 	reason?: string;
 }
 
-export type AgentPreModelCallResult = AgentPreModelCallStop | undefined;
+/** Per-request restrictions returned after final provider-context accounting. */
+export interface AgentPreModelCallOptions {
+	stop?: false;
+	/** Upper bound for this request's generated tokens, including reasoning. */
+	maxTokens?: number;
+	/** Overrides earlier tool-choice directives for this request only. */
+	toolChoice?: ToolChoice;
+}
+
+export type AgentPreModelCallResult = AgentPreModelCallStop | AgentPreModelCallOptions | undefined;
 
 /**
  * A pre-model-call gate. Return {@link AgentPreModelCallStop} to refuse the
- * request, or nothing to proceed; the signal aborts with the run.
+ * request, per-request restrictions to constrain it, or nothing to proceed.
+ * The signal aborts with the run.
  */
 export type AgentBeforeModelCall = (
 	context: Context,
@@ -1181,8 +1193,12 @@ export interface AgentTool<
 	 * before ordinary dispatch commits its result.
 	 */
 	speculation?: ToolSpeculationPolicy;
-	/** If true, schema validation errors are non-fatal: raw args are passed to execute() instead of returning an error to the LLM, and unknown root keys a closed schema would drop stay on the args. Malformed argument JSON still returns the parse error. */
-	lenientArgValidation?: boolean;
+	/**
+	 * `true`: schema mismatches reach execute() as raw args; preserve unknown root keys.
+	 * `"raw"`: execute() owns all argument validation, without schema healing or coercion.
+	 * Genuine provider JSON parse failures remain errors in both modes.
+	 */
+	lenientArgValidation?: boolean | "raw";
 	/**
 	 * Whether the agent loop may abort this tool mid-execution — or skip it
 	 * before it starts — to deliver a queued steering message. A function

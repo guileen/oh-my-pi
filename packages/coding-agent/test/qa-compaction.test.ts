@@ -12,6 +12,10 @@ import type { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage
 import { parseCompactArgs, QA_STATE_TYPE } from "@oh-my-pi/pi-coding-agent/session/compact-modes";
 import { CONTEXT_NOTES_ENTRY_TYPE } from "@oh-my-pi/pi-coding-agent/session/context-notes";
 import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
+import { prepareQaCompaction } from "@oh-my-pi/pi-coding-agent/session/qa-compaction";
+import { QA_CHECKPOINT_ENTRY_TYPE, type QaCheckpointData } from "@oh-my-pi/pi-coding-agent/session/qa-rollover";
+import { buildSessionContext } from "@oh-my-pi/pi-coding-agent/session/session-context";
+import type { CompactionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { USER_TODO_EDIT_CUSTOM_TYPE } from "@oh-my-pi/pi-coding-agent/tools/todo";
 import type { TodoPhase } from "@oh-my-pi/pi-tui/tools/todo";
@@ -634,4 +638,204 @@ it("checkpoints only owned running jobs and pending deliveries, then drops settl
 	);
 	expect(recorder.requests).toHaveLength(0);
 	expect(summarizer).not.toHaveBeenCalled();
+});
+
+it("projects a durable tool-only checkpoint without mutating live history and replays it once after commit", async () => {
+	const summarizer = forbidSummarizer();
+	const manager = SessionManager.create(temp.path(), temp.join("sessions"));
+	const userId = manager.appendMessage({
+		role: "user",
+		content: "Investigate the release failure",
+		timestamp: Date.now(),
+	});
+	manager.appendMessage({
+		...createAssistantMessage("Working observation, not a terminal answer"),
+		content: [{ type: "toolCall", id: "release-log", name: "read", arguments: { path: "release.log" } }],
+		stopReason: "toolUse",
+	});
+	manager.appendMessage({
+		role: "toolResult",
+		toolCallId: "release-log",
+		toolName: "read",
+		content: [{ type: "text", text: "RAW-LOG-PAYLOAD: the signature expired" }],
+		isError: false,
+		timestamp: Date.now(),
+	});
+	const checkpoint: QaCheckpointData = {
+		version: 1,
+		cycleId: "qa-tool-findings",
+		summary: "release.log confirms an expired signature; no replacement artifact has been built.",
+		disposition: "continue",
+		nextAction: "Inspect the signing configuration before building a replacement.",
+	};
+	const checkpointId = manager.appendCustomEntry(QA_CHECKPOINT_ENTRY_TYPE, checkpoint);
+	await manager.flush();
+	const uncommitted = await SessionManager.open(manager.getSessionFile()!, temp.join("sessions"));
+	readOnlyManagers.push(uncommitted);
+	expect(JSON.stringify(convertToLlm(uncommitted.buildSessionContext().messages))).toContain("RAW-LOG-PAYLOAD");
+	expect(
+		uncommitted
+			.buildSessionContext()
+			.messages.some(message => message.role === "custom" && message.customType === QA_CHECKPOINT_ENTRY_TYPE),
+	).toBe(false);
+
+	const branch = manager.getBranch();
+	const original = structuredClone(branch);
+	const { details, summary } = prepareQaCompaction(branch, {
+		plan: { path: "local://signing-plan.md", mode: "planning" },
+	});
+	expect(details.retainedEntryIds).toEqual([userId]);
+	expect(details.checkpointEntryId).toBe(checkpointId);
+	expect(summary).not.toContain(checkpoint.summary);
+	const candidate: CompactionEntry = {
+		type: "compaction",
+		id: "qa-candidate",
+		parentId: branch.at(-1)!.id,
+		timestamp: new Date().toISOString(),
+		summary,
+		firstKeptEntryId: "",
+		tokensBefore: 0,
+		details,
+	};
+	const projected = buildSessionContext([...branch, candidate]).messages;
+	const projectedText = JSON.stringify(convertToLlm(projected));
+	expect(projectedText).toContain(checkpoint.summary);
+	expect(projectedText).toContain(checkpoint.nextAction!);
+	expect(projectedText).toContain("local://signing-plan.md");
+	expect(projectedText).not.toContain("RAW-LOG-PAYLOAD");
+	expect(projectedText).not.toContain("Working observation");
+	expect(branch).toEqual(original);
+	expect(manager.getBranch()).toEqual(original);
+	manager.appendCompaction(summary, undefined, "", 0, { details });
+	await manager.flush();
+	const reopened = await SessionManager.open(manager.getSessionFile()!, temp.join("sessions"));
+	const recorder = recordRequests();
+	const session = createSession(reopened, recorder.streamFn);
+	expect(recorder.requests).toHaveLength(0);
+	const restored = JSON.stringify(convertToLlm(session.messages));
+	expect(restored).toContain(checkpoint.summary);
+	expect(restored).toContain("local://signing-plan.md");
+	expect(restored).not.toContain("RAW-LOG-PAYLOAD");
+	await session.prompt("Continue with the investigation");
+	await session.waitForIdle();
+	expect(recorder.requests).toHaveLength(1);
+	const request = JSON.stringify(recorder.requests[0]);
+	expect(request.split(checkpoint.summary)).toHaveLength(2);
+	expect(request).toContain(checkpoint.nextAction!);
+	expect(request).not.toContain("RAW-LOG-PAYLOAD");
+	expect(summarizer).not.toHaveBeenCalled();
+});
+
+it("replaces operational checkpoints across repeated QA and reload while reset excludes earlier checkpoints and Q&A", async () => {
+	const manager = SessionManager.create(temp.path(), temp.join("sessions"));
+	seedConversation(manager);
+	const recorder = recordRequests();
+	const session = createSession(manager, recorder.streamFn);
+	const firstId = manager.appendCustomEntry(QA_CHECKPOINT_ENTRY_TYPE, {
+		version: 1,
+		cycleId: "qa-first",
+		summary: "OLD-OPERATIONAL-FINDING",
+		disposition: "continue",
+		nextAction: "OLD-NEXT-ACTION",
+	});
+	await session.compact(undefined, { mode: "qaonly" });
+	expect(JSON.stringify(convertToLlm(session.messages))).toContain("OLD-OPERATIONAL-FINDING");
+	const latestId = manager.appendCustomEntry(QA_CHECKPOINT_ENTRY_TYPE, {
+		version: 1,
+		cycleId: "qa-second",
+		summary: "LATEST-OPERATIONAL-FINDING",
+		disposition: "blocked",
+	});
+	manager.appendCustomEntry(USER_TODO_EDIT_CUSTOM_TYPE, {
+		phases: [{ name: "Canonical state", tasks: [{ content: "Wait for signing approval", status: "blocked" }] }],
+	});
+	manager.appendMessage({ role: "user", content: "Keep the release paused", timestamp: Date.now() });
+	const second = await session.compact(undefined, { mode: "qaonly" });
+	expect(second.details).toHaveProperty("checkpointEntryId", latestId);
+	await session.compact(undefined, { mode: "qaonly" });
+	await manager.flush();
+	const reopened = await SessionManager.open(manager.getSessionFile()!, temp.join("sessions"));
+	readOnlyManagers.push(reopened);
+	const messages = reopened.buildSessionContext().messages;
+	const text = JSON.stringify(convertToLlm(messages));
+	expect(
+		messages.filter(message => message.role === "custom" && message.customType === QA_CHECKPOINT_ENTRY_TYPE),
+	).toHaveLength(1);
+	expect(text.split("LATEST-OPERATIONAL-FINDING")).toHaveLength(2);
+	expect(text).not.toContain("OLD-OPERATIONAL-FINDING");
+	expect(text).not.toContain("OLD-NEXT-ACTION");
+	expect(text).toContain("Continue the release work");
+	expect(text).toContain("The release is underway.");
+	expect(text).toContain("Keep the release paused");
+	expect(text).toContain("Wait for signing approval");
+	expect(manager.getEntries().some(entry => entry.id === firstId)).toBe(true);
+
+	manager.appendResetBoundary();
+	manager.appendMessage({ role: "user", content: "New unrelated request", timestamp: Date.now() });
+	const afterReset = await session.compact(undefined, { mode: "qaonly" });
+	expect(afterReset.details).not.toHaveProperty("checkpointEntryId");
+	const resetText = JSON.stringify(convertToLlm(manager.buildSessionContext().messages));
+	expect(resetText).toContain("New unrelated request");
+	expect(resetText).not.toContain("OPERATIONAL-FINDING");
+	expect(resetText).not.toContain("Continue the release work");
+	expect(resetText).not.toContain("Wait for signing approval");
+	expect(recorder.requests).toHaveLength(0);
+});
+
+it("rejects missing, misplaced and unsupported checkpoint references instead of silently dropping evidence", () => {
+	const manager = SessionManager.inMemory(temp.path());
+	seedConversation(manager);
+	const validId = manager.appendCustomEntry(QA_CHECKPOINT_ENTRY_TYPE, {
+		version: 1,
+		cycleId: "qa-valid",
+		summary: "Retained evidence",
+		disposition: "complete",
+	});
+	const { details, summary } = prepareQaCompaction(manager.getBranch());
+	const branch = manager.getBranch();
+	const candidate: CompactionEntry = {
+		type: "compaction",
+		id: "qa-invalid-candidate",
+		parentId: branch.at(-1)!.id,
+		timestamp: new Date().toISOString(),
+		summary,
+		firstKeptEntryId: "",
+		tokensBefore: 0,
+	};
+	for (const checkpointEntryId of ["missing", branch[0]!.id, "", null, 42]) {
+		expect(() =>
+			buildSessionContext([...branch, { ...candidate, details: { ...details, checkpointEntryId } }]),
+		).toThrow();
+	}
+	const unsupported = branch.map(entry =>
+		entry.id === validId && entry.type === "custom"
+			? { ...entry, data: { ...(entry.data as QaCheckpointData), version: 2 } }
+			: entry,
+	);
+	expect(() => prepareQaCompaction(unsupported)).toThrow();
+	expect(() => buildSessionContext([...unsupported, { ...candidate, details }])).toThrow();
+	for (const invalid of [
+		{ version: 1, cycleId: "qa", summary: " ", disposition: "complete" },
+		{ version: 1, cycleId: "qa", summary: "Finding", disposition: "continue" },
+		{ version: 1, cycleId: "qa", summary: "Finding", disposition: "blocked", nextAction: "Run anyway" },
+	]) {
+		const malformed = branch.map(entry =>
+			entry.id === validId && entry.type === "custom" ? { ...entry, data: invalid } : entry,
+		);
+		expect(() => prepareQaCompaction(malformed)).toThrow();
+	}
+	manager.appendResetBoundary();
+	manager.appendMessage({ role: "user", content: "After reset", timestamp: Date.now() });
+	const resetBranch = manager.getBranch();
+	expect(() =>
+		buildSessionContext([...resetBranch, { ...candidate, parentId: resetBranch.at(-1)!.id, details }]),
+	).toThrow();
+	const futureSource = branch.at(-1)!;
+	expect(() =>
+		buildSessionContext([
+			...branch.slice(0, -1),
+			{ ...candidate, parentId: branch.at(-2)!.id, details },
+			{ ...futureSource, parentId: candidate.id },
+		]),
+	).toThrow();
 });

@@ -33,6 +33,7 @@ import type { ArtifactManager } from "../session/artifacts";
 import type { ClientBridge } from "../session/client-bridge";
 import type { CostGate } from "../session/cost-gate";
 import type { CustomMessage } from "../session/messages";
+import type { QaCheckpointAcceptance, QaCheckpointInput } from "../session/qa-rollover";
 import type { UsageStatistics } from "../session/session-entries";
 import type { SessionManager } from "../session/session-manager";
 import type { ToolChoiceQueue } from "../session/tool-choice-queue";
@@ -229,6 +230,11 @@ export interface ToolSession {
 	tuiTranscript?: boolean;
 	/** Whether this session has begun disposal. */
 	isDisposed?: () => boolean;
+	/** Explicit owner callback; never inherit this from a parent or advisor session. */
+	qaRollover?: {
+		isEnabled(): boolean;
+		accept(checkpoint: QaCheckpointInput, signal?: AbortSignal): Promise<QaCheckpointAcceptance>;
+	};
 	/**
 	 * Suppress the spawn specialization/coordination advisory appended to `task`
 	 * results. Set by internal/programmatic callers (e.g. the commit agent's
@@ -702,6 +708,13 @@ export async function resolveBuiltinToolPlan(session: ToolSession, toolNames?: s
 		}
 		if (goalModeActive && !requestedTools.includes("goal")) {
 			requestedTools.push("goal");
+		if (
+			!cfgCompactionExperimentalContextManagement.get(session.settings) &&
+			NewContextTool.isSupported(session) &&
+			!requestedTools.includes("new_context")
+		) {
+			requestedTools.push("new_context");
+		}
 		}
 		if (
 			requestedTools.includes("grep") &&
@@ -772,8 +785,8 @@ export async function resolveBuiltinToolPlan(session: ToolSession, toolNames?: s
 		if (name === "security_scan") return cfgSecurityEnabled.get(session.settings);
 		if (name === "think") return externalThinkingActive;
 		if (name === "ask") return cfgAskEnabled.get(session.settings);
-		if (name === "context_notes" || name === "new_context")
-			return cfgCompactionExperimentalContextManagement.get(session.settings);
+		if (name === "context_notes") return cfgCompactionExperimentalContextManagement.get(session.settings);
+		if (name === "new_context") return NewContextTool.isSupported(session);
 		if (name === "checkpoint" || name === "rewind")
 			return (
 				cfgCheckpointEnabled.get(session.settings) &&

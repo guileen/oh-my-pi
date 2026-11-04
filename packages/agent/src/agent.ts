@@ -510,6 +510,7 @@ export class Agent {
 	#onTurnEnd?: (messages: AgentMessage[], signal?: AbortSignal, context?: AgentTurnEndContext) => Promise<void> | void;
 	#onModelCallSystemPrompt?: (systemPrompt: string[]) => void;
 	#beforeModelCall?: AgentBeforeModelCall;
+	#beforeProviderRequest?: AgentLoopConfig["beforeProviderRequest"];
 	#additionalBeforeModelCalls = new Set<AgentBeforeModelCall>();
 	#asideMessageProvider?: (boundary: AsideBoundary) => AsideMessage[] | Promise<AsideMessage[]>;
 	#telemetry?: AgentLoopConfig["telemetry"];
@@ -1239,6 +1240,11 @@ export class Agent {
 		};
 	}
 
+	/** Replaces the live admission hook used by every actual inference attempt, including retries. */
+	setBeforeProviderRequest(fn: AgentLoopConfig["beforeProviderRequest"]): void {
+		this.#beforeProviderRequest = fn;
+	}
+
 	/**
 	 * Provide a source of non-interrupting "aside" messages (e.g. background-job
 	 * completions, late LSP diagnostics) drained at each step boundary. Never
@@ -1710,12 +1716,12 @@ export class Agent {
 		return signals.length === 1 ? signals[0] : AbortSignal.any(signals);
 	}
 
-	continue(signal?: AbortSignal): Promise<void> {
+	continue(signal?: AbortSignal, options?: { queuedInputFirst?: boolean }): Promise<void> {
 		// Queued-message hooks run before the loop and are this agent's work too.
-		return this.#inLogContext(() => this.#continue(signal));
+		return this.#inLogContext(() => this.#continue(signal, options?.queuedInputFirst === true));
 	}
 
-	async #continue(signal?: AbortSignal) {
+	async #continue(signal?: AbortSignal, queuedInputFirst = false) {
 		if (this.#state.isStreaming) {
 			throw new AgentBusyError();
 		}
@@ -1732,7 +1738,7 @@ export class Agent {
 		try {
 			const dequeueSignal = this.#continuationDequeueSignal(signal) ?? continuationAbortController.signal;
 			const messages = this.#state.messages;
-			if (messages.length === 0) {
+			if (messages.length === 0 || (queuedInputFirst && !unpairedToolCallTail(messages))) {
 				// An empty transcript has nothing to resume, but a queued steer/follow-up
 				// must still be delivered as the opening turn — mirroring the assistant-tail
 				// branch below. Throwing here leaves the message undeliverable, and idle-drain
@@ -1751,7 +1757,7 @@ export class Agent {
 					await this.#runLoop(queuedFollowUp, undefined, signal, true);
 					return;
 				}
-				throw new Error("No messages to continue from");
+				if (messages.length === 0) throw new Error("No messages to continue from");
 			}
 			if (messages[messages.length - 1].role === "assistant") {
 				// A tail with unpaired runnable tool calls resumes by re-executing
@@ -1958,6 +1964,7 @@ export class Agent {
 			transformContext: this.#transformContext,
 			onPayload: this.#onPayload,
 			onResponse: this.#onResponse,
+			beforeProviderRequest: (requestModel, signal) => this.#beforeProviderRequest?.(requestModel, signal),
 			onSseEvent: this.#onSseEvent,
 			getApiKey: this.getApiKey,
 			getToolContext: this.#getToolContext,
@@ -1973,13 +1980,27 @@ export class Agent {
 			beforeModelCall:
 				this.#beforeModelCall || this.#additionalBeforeModelCalls.size > 0
 					? async (context, signal) => {
-							const result = (await this.#beforeModelCall?.(context, signal)) || undefined;
+							let result = (await this.#beforeModelCall?.(context, signal)) || undefined;
 							if (result?.stop) return result;
 							for (const callback of this.#additionalBeforeModelCalls) {
 								const callbackResult = (await callback(context, signal)) || undefined;
 								if (callbackResult?.stop) return callbackResult;
+								if (callbackResult) {
+									const maxTokens: number | undefined =
+										result?.maxTokens === undefined
+											? callbackResult.maxTokens
+											: callbackResult.maxTokens === undefined
+												? result.maxTokens
+												: Math.min(result.maxTokens, callbackResult.maxTokens);
+									result = {
+										...result,
+										...callbackResult,
+										maxTokens,
+										toolChoice: callbackResult.toolChoice ?? result?.toolChoice,
+									};
+								}
 							}
-							return undefined;
+							return result;
 						}
 					: undefined,
 			cursorExecHandlers: this.#cursorExecHandlers,
