@@ -1,0 +1,1 @@
+Concrete next operation after rollover. You MUST supply a nonempty nextAction when disposition is continue, including the next verification step if requested verification remains. You MUST omit this field for complete or blocked.

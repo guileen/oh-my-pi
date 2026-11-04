@@ -1,3 +1,4 @@
+import { providerRequestFetch } from "../utils/provider-request";
 /**
  * Google Gemini CLI / Antigravity provider.
  * Shared implementation for both google-gemini-cli and google-antigravity providers.
@@ -972,7 +973,7 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 							maxAttempts: isLastEndpoint ? MAX_RETRIES + 1 : 1,
 							defaultDelayMs: attempt => BASE_DELAY_MS * 2 ** attempt,
 							maxDelayMs: options?.maxRetryDelayMs ?? RATE_LIMIT_BUDGET_MS,
-							fetch: options?.fetch,
+							fetch: providerRequestFetch(model, options),
 							timeout: false,
 						});
 					} finally {
@@ -1021,7 +1022,7 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 								throw new AIError.ConfigurationError("Missing request URL");
 							}
 
-							currentResponse = await (options?.fetch ?? fetch)(requestUrl, {
+							currentResponse = await providerRequestFetch(model, options)(requestUrl, {
 								method: "POST",
 								headers: requestHeaders,
 								body: requestBodyJson,

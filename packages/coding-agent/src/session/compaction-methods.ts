@@ -36,10 +36,19 @@ export const COMPACTION_METHOD_CHOICES = [
 		label: "Shake",
 		description: "Drop recoverable heavy content in place without an LLM call",
 	},
+	{
+		value: "qaonly",
+		label: "Q&A only",
+		description:
+			"Locally retain Q&A and checkpointed work without a summary-model call; pauses if no later configured method can recover enough context",
+	},
 ] as const;
 
 /** One selectable automatic context-maintenance method. */
 export type CompactionMethod = (typeof COMPACTION_METHOD_CHOICES)[number]["value"];
+
+/** Methods the generic compaction engine can execute; QA is session-local. */
+export type EngineCompactionMethod = Exclude<CompactionMethod, "qaonly">;
 
 /** Default fallback order: server-native first, portable summary last. */
 export const DEFAULT_COMPACTION_METHOD_ORDER: CompactionMethod[] = [
@@ -56,6 +65,7 @@ const COMPACTION_METHODS: Record<CompactionMethod, true> = {
 	handoff: true,
 	soft: true,
 	shake: true,
+	qaonly: true,
 };
 
 /** Whether an unknown configuration value names a supported compaction method. */
@@ -77,7 +87,10 @@ export function resolveCompactionMethodOrder(value: unknown): CompactionMethod[]
 	return methods;
 }
 
-const STRATEGY_BY_COMPACTION_METHOD: Record<CompactionMethod, "context-full" | "handoff" | "shake" | "snapcompact"> = {
+const STRATEGY_BY_COMPACTION_METHOD: Record<
+	EngineCompactionMethod,
+	"context-full" | "handoff" | "shake" | "snapcompact"
+> = {
 	remote: "context-full",
 	snapcompact: "snapcompact",
 	handoff: "handoff",
@@ -92,8 +105,11 @@ const STRATEGY_BY_COMPACTION_METHOD: Record<CompactionMethod, "context-full" | "
  */
 export function resolveMethodSettings(
 	settings: CompactionSettings,
-	method: CompactionMethod,
+	method: EngineCompactionMethod,
 ): EngineCompactionSettings {
+	if (!Object.hasOwn(STRATEGY_BY_COMPACTION_METHOD, method)) {
+		throw new Error(`Compaction method "${method}" must be handled locally, not by the summary engine`);
+	}
 	return {
 		...settings,
 		strategy: STRATEGY_BY_COMPACTION_METHOD[method],
@@ -111,7 +127,7 @@ export function canUseRemoteCompaction(model: Model | null | undefined, settings
 
 /**
  * First configured method a threshold pass would run, or undefined when it is
- * local (snapcompact/shake) — local methods are effectively instant, so there
+ * local (snapcompact/shake/qaonly) — local methods do not use a summary request, so there
  * is nothing to speculate. Shared by the maintenance loop's speculation gate
  * and the status line's annotated context gauge (speculation marker).
  * `skipRemote` passes over native compaction, e.g. after it failed for good.

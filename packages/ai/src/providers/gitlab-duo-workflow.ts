@@ -1,3 +1,4 @@
+import { admitProviderRequest } from "../utils/provider-request";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import {
@@ -1072,7 +1073,16 @@ async function runGitLabDuoWorkflow(
 		pendingSession.pendingActions = undefined;
 		const resumeResult = await resumeGitLabDuoWorkflowSocket(
 			{ fetchImpl, baseUrl, apiKey, workflowId: pendingSession.workflowId, state, providerSessionState },
-			() => runGitLabDuoWorkflowSocket(pendingSession.ws, pendingSession.startPayload, state, options, responses),
+			() =>
+				runGitLabDuoWorkflowSocket(
+					pendingSession.ws,
+					pendingSession.startPayload,
+					state,
+					options,
+					responses,
+					undefined,
+					() => admitProviderRequest(model, options),
+				),
 		);
 		// A stall on the resumed socket means the server-side turn stopped advancing even
 		// after the tool result was returned. The helper already stopped that workflow and
@@ -1385,7 +1395,15 @@ async function runGitLabDuoWorkflow(
 					},
 				};
 			}
-			lastSocketResult = await runGitLabDuoWorkflowSocket(ws, startPayload, state, options);
+			lastSocketResult = await runGitLabDuoWorkflowSocket(
+				ws,
+				startPayload,
+				state,
+				options,
+				undefined,
+				undefined,
+				() => admitProviderRequest(model, options),
+			);
 			if (lastSocketResult === "approval") {
 				startPayload = buildGitLabDuoWorkflowApprovalStartRequest(startPayload);
 				state.lastApprovalStatus = undefined;
@@ -1916,6 +1934,7 @@ export function runGitLabDuoWorkflowSocket(
 	options: GitLabDuoWorkflowOptions,
 	resumeResponse?: GitLabDuoWorkflowActionResponse | readonly GitLabDuoWorkflowActionResponse[],
 	replayMessages?: readonly unknown[],
+	beforeRequest?: () => Promise<void>,
 ): Promise<GitLabDuoWorkflowSocketResult> {
 	const { promise, resolve, reject } = Promise.withResolvers<GitLabDuoWorkflowSocketResult>();
 	let settled = false;
@@ -2086,22 +2105,27 @@ export function runGitLabDuoWorkflowSocket(
 		// inline flow only ever has one.) DWS matches it by requestID to the awaiting
 		// outbox future and the workflow continues on the same connection.
 		const responses = Array.isArray(resumeResponse) ? resumeResponse : [resumeResponse];
-		for (const response of responses) {
-			ws.send(JSON.stringify(response));
-		}
+		void (async () => {
+			await beforeRequest?.();
+			if (settled || options.signal?.aborted) return;
+			for (const response of responses) ws.send(JSON.stringify(response));
+		})().catch(error => settle("closed", error));
 	} else {
-		ws.onopen = () => {
-			traceGitLabDuoWorkflow("websocket.open", {
-				workflowId: startPayload.workflowID,
-				workflowDefinition: startPayload.workflowDefinition,
-				flowConfigId: startPayload.flowConfigId,
-				flowVersion: startPayload.flowVersion,
-				flowConfigSchemaVersion: startPayload.flowConfigSchemaVersion,
-				mcpTools: startPayload.mcpTools.length,
-				preapprovedTools: startPayload.preapproved_tools.length,
-			});
-			ws.send(JSON.stringify({ startRequest: startPayload }));
-		};
+		ws.onopen = () =>
+			void (async () => {
+				await beforeRequest?.();
+				if (settled || options.signal?.aborted) return;
+				traceGitLabDuoWorkflow("websocket.open", {
+					workflowId: startPayload.workflowID,
+					workflowDefinition: startPayload.workflowDefinition,
+					flowConfigId: startPayload.flowConfigId,
+					flowVersion: startPayload.flowVersion,
+					flowConfigSchemaVersion: startPayload.flowConfigSchemaVersion,
+					mcpTools: startPayload.mcpTools.length,
+					preapprovedTools: startPayload.preapproved_tools.length,
+				});
+				ws.send(JSON.stringify({ startRequest: startPayload }));
+			})().catch(error => settle("closed", error));
 	}
 	resetIdleTimer();
 	return promise.finally(() => {

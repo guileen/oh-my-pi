@@ -18,6 +18,7 @@
 import * as os from "node:os";
 import { getAppName, getInstallId, readSseJson } from "@oh-my-pi/pi-utils";
 import * as AIError from "../error";
+import { providerRequestFetch } from "../utils/provider-request";
 import type {
 	Api,
 	AssistantMessage,
@@ -181,7 +182,7 @@ export function streamPiNative<TApi extends Api>(
 
 		try {
 			const url = resolveStreamUrl(model as Model<Api>);
-			const fetchImpl = options?.fetch ?? globalThis.fetch;
+			const fetchImpl = providerRequestFetch(model, options);
 			const headers = buildHeaders(
 				model as Model<Api>,
 				typeof options?.apiKey === "string" ? options.apiKey : undefined,

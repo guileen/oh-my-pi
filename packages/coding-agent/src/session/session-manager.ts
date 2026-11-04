@@ -1753,14 +1753,14 @@ export class SessionManager {
 	 * synchronous rewrite from being overwritten by the stale body serialized
 	 * before it ran.
 	 */
-	async #rewriteAtomically(): Promise<void> {
+	async #rewriteAtomically(commitGuard?: () => boolean): Promise<void> {
 		if (!this.#persist || !this.#sessionFile) return;
 		if (this.#released) return;
 
 		const startEpoch = this.#diskEpoch;
 		await this.#scheduleDiskWork(
 			async () => {
-				if (await this.#runFencedAtomicRewrite(startEpoch)) {
+				if (await this.#runFencedAtomicRewrite(startEpoch, commitGuard)) {
 					this.#fileIsCurrent = true;
 					this.#materializeBreadcrumb();
 					this.#rewriteRequired = false;
@@ -1780,7 +1780,7 @@ export class SessionManager {
 	 * moved so callers skip current-marking updates; a body that landed before
 	 * that change still advances the durable byte record after readback.
 	 */
-	async #runFencedAtomicRewrite(epoch: number): Promise<boolean> {
+	async #runFencedAtomicRewrite(epoch: number, commitGuard?: () => boolean): Promise<boolean> {
 		if (this.#released) return false;
 		this.#atomicRewriteFenceEpoch = epoch;
 		let recoveries = 0;
@@ -1795,7 +1795,10 @@ export class SessionManager {
 				const body = this.#serializeBody();
 				const options = {
 					expectedSize: this.#expectedDiskSize,
-					commitGuard: () => !this.#released && this.#diskEpoch === epoch,
+					commitGuard: () => {
+						if (commitGuard && !commitGuard()) throw new Error("Atomic session batch was superseded.");
+						return !this.#released && this.#diskEpoch === epoch;
+					},
 				};
 				try {
 					await (this.#storage.writeLinesAtomic
@@ -2785,11 +2788,12 @@ export class SessionManager {
 	 *
 	 * The callback MUST be synchronous.
 	 */
-	appendEntriesAtomically<T>(append: () => T): Promise<T> {
-		return this.#withAtomicPersistenceLock(() => this.#appendEntriesAtomicallyLocked(append));
+	appendEntriesAtomically<T>(append: () => T, options?: { commitGuard?: () => boolean }): Promise<T> {
+		return this.#withAtomicPersistenceLock(() => this.#appendEntriesAtomicallyLocked(append, options?.commitGuard));
 	}
 
-	async #appendEntriesAtomicallyLocked<T>(append: () => T): Promise<T> {
+	async #appendEntriesAtomicallyLocked<T>(append: () => T, commitGuard?: () => boolean): Promise<T> {
+		if (commitGuard && !commitGuard()) throw new Error("Atomic session batch was superseded.");
 		if (!this.#persist || !this.#sessionFile) return append();
 		if (this.#atomicEntryBatch) throw new Error("Atomic persistence lock ownership was violated.");
 		try {
@@ -2818,7 +2822,7 @@ export class SessionManager {
 			} finally {
 				batch.collecting = false;
 			}
-			await this.#rewriteAtomically();
+			await this.#rewriteAtomically(commitGuard);
 			if (!this.#fileIsCurrent || this.#rewriteRequired) {
 				throw new Error("Atomic session batch was superseded before commit.");
 			}

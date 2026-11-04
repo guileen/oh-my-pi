@@ -3,11 +3,18 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { AuthStorage } from "@oh-my-pi/pi-ai";
+import { validateToolCall } from "@oh-my-pi/pi-ai/utils/validation";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import {
+	cfgCompactionEnabled,
+	cfgCompactionExperimentalContextManagement,
+	cfgCompactionMethodOrder,
+	cfgCompactionMidTurnEnabled,
+} from "@oh-my-pi/pi-coding-agent/session/context-settings";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { removeSyncWithRetries, Snowflake } from "@oh-my-pi/pi-utils";
 
@@ -104,5 +111,88 @@ describe("settings-gated tools in a live session", () => {
 		await settle(session);
 		expect(session.getActiveToolNames()).not.toContain("bash");
 		expect(session.getActiveToolNames()).toContain("read");
+	});
+
+	it("replaces new_context schemas on experimental/QA mode switches and follows live QA eligibility", async () => {
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"compaction.methodOrder": ["qaonly"],
+		});
+		const session = await startSession(settings, ["read", "grep"]);
+		expect(session.getToolByName("new_context")).toBeUndefined();
+
+		cfgCompactionEnabled.override(settings, true);
+		await settle(session);
+		const qaTool = session.getToolByName("new_context");
+		if (!qaTool) throw new Error("expected QA acknowledgement tool");
+		expect(() =>
+			validateToolCall([qaTool], {
+				type: "toolCall",
+				id: "qa-empty",
+				name: "new_context",
+				arguments: {},
+			}),
+		).toThrow();
+		const qaCheckpoint = {
+			checkpoint: { cycleId: "qa:wire-only", summary: "Saved work; awaiting approval.", disposition: "blocked" },
+		};
+		expect(() =>
+			validateToolCall([qaTool], {
+				type: "toolCall",
+				id: "qa-checkpoint",
+				name: "new_context",
+				arguments: qaCheckpoint,
+			}),
+		).not.toThrow();
+
+		cfgCompactionExperimentalContextManagement.override(settings, true);
+		await settle(session);
+		const experimentalTool = session.getToolByName("new_context");
+		if (!experimentalTool) throw new Error("expected experimental rollover tool");
+		expect(session.getActiveToolNames()).toContain("context_notes");
+		expect(() =>
+			validateToolCall([experimentalTool], {
+				type: "toolCall",
+				id: "experimental-empty",
+				name: "new_context",
+				arguments: {},
+			}),
+		).not.toThrow();
+		await expect(experimentalTool.execute("wrong-mode", qaCheckpoint)).rejects.toMatchObject({
+			context: { code: "QA_NOT_ACTIVE" },
+		});
+
+		cfgCompactionExperimentalContextManagement.override(settings, false);
+		await settle(session);
+		const restoredQaTool = session.getToolByName("new_context");
+		if (!restoredQaTool) throw new Error("expected restored QA acknowledgement tool");
+		expect(() =>
+			validateToolCall([restoredQaTool], {
+				type: "toolCall",
+				id: "restored-empty",
+				name: "new_context",
+				arguments: {},
+			}),
+		).toThrow();
+
+		cfgCompactionMidTurnEnabled.override(settings, false);
+		await settle(session);
+		expect(session.getActiveToolNames()).not.toContain("new_context");
+		cfgCompactionMidTurnEnabled.override(settings, true);
+		await settle(session);
+		expect(session.getActiveToolNames()).toContain("new_context");
+		cfgCompactionMethodOrder.override(settings, ["soft"]);
+		await settle(session);
+		expect(session.getToolByName("new_context")).toBeUndefined();
+	});
+
+	it("removes a QA force-inclusion when experimental mode would not grant that tool list", async () => {
+		const settings = Settings.isolated({ "compaction.methodOrder": ["qaonly"] });
+		const session = await startSession(settings, ["read"]);
+		expect(session.getActiveToolNames()).toContain("new_context");
+		cfgCompactionExperimentalContextManagement.override(settings, true);
+		await settle(session);
+		expect(session.getToolByName("new_context")).toBeUndefined();
+		expect(session.getActiveToolNames()).not.toContain("context_notes");
 	});
 });

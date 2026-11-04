@@ -12,6 +12,7 @@ import {
 	iterateWithIdleTimeout,
 } from "../../utils/idle-iterator";
 import { notifyProviderResponse } from "../../utils/provider-response";
+import { providerRequestFetch } from "../../utils/provider-request";
 import { dereferenceJsonSchema, normalizeSchemaForFactoryDroid, toolWireSchema } from "../../utils/schema";
 import {
 	extractGoogleErrorMessage,
@@ -351,7 +352,7 @@ export function streamFactoryDroidGemini(
 				firstEventTimer.unref?.();
 			}
 
-			const response = await (options.fetch ?? fetch)(`${options.baseUrl}/generate`, {
+			const response = await providerRequestFetch(model, options)(`${options.baseUrl}/generate`, {
 				method: "POST",
 				headers: {
 					"Content-Type": "application/json",

@@ -2,6 +2,8 @@ import { isRetryableError, isUnexpectedSocketCloseMessage } from "@oh-my-pi/pi-u
 import {
 	ALIYUN_MM_GATEWAY_PATTERN,
 	CODEX_HTTP_BODY_READ_ERROR_PATTERN,
+	Flag,
+	is,
 	isRetryableStreamEnvelopeError,
 	isTransientStreamDropError,
 	isTransientStreamParseError,
@@ -44,6 +46,9 @@ function isTransientTransportMessage(message: string): boolean {
  */
 export function isProviderRetryableError(error: unknown): boolean {
 	if (!(error instanceof Error)) return false;
+	if ("errorId" in error && typeof error.errorId === "number" && is(error.errorId, Flag.ProviderRequestDenied)) {
+		return false;
+	}
 	if (isUsageLimit(error)) return false;
 	const httpStatus = status(error);
 	if (httpStatus !== undefined && httpStatus >= 400 && httpStatus < 500 && httpStatus !== 408 && httpStatus !== 429) {

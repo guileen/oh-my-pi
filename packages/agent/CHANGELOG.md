@@ -6,6 +6,11 @@
 
 - Deprecated `createFileOps`, `computeFileLists`, `formatFileOperations`, `upsertFileOperations`, `isUrlSchemePath` and `FileOperations` in `@oh-my-pi/pi-agent-core/compaction`; they now re-export `@oh-my-pi/snapcompact`, which callers should import directly
 
+### Added
+
+- Tools can opt into `lenientArgValidation: "raw"` to validate parsed arguments themselves without schema healing or coercion; malformed provider JSON remains rejected.
+- Agents can gate every provider attempt with `setBeforeProviderRequest`, including retries, and park a settled tool loop with `AgentTurnEndContext.stop` without consuming queued input or background deliveries.
+
 ## [18.15.0] - 2026-11-01
 
 ### Fixed

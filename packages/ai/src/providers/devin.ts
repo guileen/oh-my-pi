@@ -1,3 +1,4 @@
+import { providerRequestFetch } from "../utils/provider-request";
 import { promisify } from "node:util";
 import { gunzipSync, gzip } from "node:zlib";
 
@@ -285,7 +286,11 @@ export const streamDevin: StreamFunction<"devin-agent"> = (
 			});
 			const frame = frameConnectMessage(chatBody, compress ? CONNECT_COMPRESSED_FLAG : 0);
 
-			const response = await fetchImpl(chatBaseUrl + CHAT_MESSAGE_PATH, {
+			const response = await providerRequestFetch(
+				model,
+				options,
+				fetchImpl,
+			)(chatBaseUrl + CHAT_MESSAGE_PATH, {
 				method: "POST",
 				headers: {
 					"content-type": "application/connect+proto",

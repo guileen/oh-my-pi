@@ -1,7 +1,18 @@
 import { combine, register } from "../config/registry";
 import { cfgAutolearnEnabled } from "../autolearn/settings";
 import { cfgBashEnabled } from "../exec/settings";
-import { cfgCompactionExperimentalContextManagement } from "../session/context-settings";
+import {
+	cfgCompactionEnabled,
+	cfgCompactionExperimentalContextManagement,
+	cfgCompactionMethodOrder,
+	cfgCompactionMidTurnEnabled,
+	cfgCompactionModelThresholds,
+	cfgCompactionModelThresholdsEnabled,
+	cfgCompactionRemoteEndpoint,
+	cfgCompactionReserveTokens,
+	cfgCompactionThresholdPercent,
+	cfgCompactionThresholdTokens,
+} from "../session/context-settings";
 import { cfgEvalJs, cfgEvalPy } from "../eval/settings";
 import { cfgIdaAvailable } from "../ida/install";
 import { cfgLspEnabled } from "../lsp/settings";
@@ -1133,6 +1144,15 @@ export const cfgBuiltinToolGates = combine({
 	autolearn: cfgAutolearnEnabled,
 	bash: cfgBashEnabled,
 	checkpoint: cfgCheckpointEnabled,
+	compactionEnabled: cfgCompactionEnabled,
+	compactionMethodOrder: cfgCompactionMethodOrder,
+	compactionMidTurn: cfgCompactionMidTurnEnabled,
+	compactionModelThresholds: cfgCompactionModelThresholds,
+	compactionModelThresholdsEnabled: cfgCompactionModelThresholdsEnabled,
+	compactionRemoteEndpoint: cfgCompactionRemoteEndpoint,
+	compactionReserve: cfgCompactionReserveTokens,
+	compactionThresholdPercent: cfgCompactionThresholdPercent,
+	compactionThresholdTokens: cfgCompactionThresholdTokens,
 	contextManagement: cfgCompactionExperimentalContextManagement,
 	debug: cfgDebugEnabled,
 	evalJs: cfgEvalJs,

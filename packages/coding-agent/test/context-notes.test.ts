@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
+import { validateAgentToolArguments } from "@oh-my-pi/pi-agent-core";
 import { convertOpenAICodexResponsesTools } from "@oh-my-pi/pi-ai/providers/openai-codex-responses";
 import { isJsonSchemaValueValid } from "@oh-my-pi/pi-ai/utils/schema";
 import { validateToolCall } from "@oh-my-pi/pi-ai/utils/validation";
@@ -13,8 +14,14 @@ import {
 import type { ContextNotesEntry } from "@oh-my-pi/pi-coding-agent/session/context-notes";
 import type { CustomEntry, ResetBoundaryEntry, SessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
-import { ContextNotesTool, NewContextTool } from "@oh-my-pi/pi-coding-agent/tools/context-notes";
-import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools/index";
+import {
+	type QaCheckpointAcceptance,
+	type QaCheckpointInput,
+	qaCheckpointError,
+} from "@oh-my-pi/pi-coding-agent/session/qa-rollover";
+import { ContextNotesTool, NewContextTool, type NewContextParams } from "@oh-my-pi/pi-coding-agent/tools/context-notes";
+import { createTools, type ToolSession } from "@oh-my-pi/pi-coding-agent/tools/index";
+import { wrapToolWithMetaNotice } from "@oh-my-pi/pi-coding-agent/tools/output-meta";
 import { TempDir } from "@oh-my-pi/pi-utils";
 
 import { cfgCompactionExperimentalContextManagement } from "@oh-my-pi/pi-coding-agent/session/context-settings";
@@ -225,5 +232,200 @@ describe("experimental context notes", () => {
 		} finally {
 			ensureSpy.mockRestore();
 		}
+	});
+});
+
+describe("QA new_context checkpoint contracts", () => {
+	const checkpoint: QaCheckpointInput = {
+		cycleId: "qa:session:1",
+		summary: "Parser edits saved; smoke failed on empty input. Integration not run.",
+		disposition: "continue",
+		nextAction: "Inspect the empty-input parser failure.",
+	};
+
+	function qaSession(accept: NonNullable<ToolSession["qaRollover"]>["accept"]): ToolSession {
+		return {
+			...toolSession(Settings.isolated({}), SessionManager.inMemory()),
+			skipPythonPreflight: true,
+			qaRollover: { isEnabled: () => true, accept },
+		};
+	}
+
+	function requireTool(session: ToolSession): NewContextTool {
+		const tool = NewContextTool.createIf(session);
+		if (!tool) throw new Error("expected QA new_context tool");
+		return tool;
+	}
+
+	it("advertises every disposition without forcing a nullable next action", () => {
+		const tool = requireTool(
+			qaSession(async () => {
+				throw new Error("schema validation must not execute acceptance");
+			}),
+		);
+		const [wireTool] = convertOpenAICodexResponsesTools([tool], codexModel());
+		if (wireTool?.type !== "function") throw new Error("expected function schema");
+		const valid = [
+			{ checkpoint },
+			{ checkpoint: { cycleId: checkpoint.cycleId, summary: checkpoint.summary, disposition: "complete" } },
+			{ checkpoint: { cycleId: checkpoint.cycleId, summary: checkpoint.summary, disposition: "blocked" } },
+		];
+		for (const arguments_ of valid) {
+			expect(isJsonSchemaValueValid(wireTool.parameters, arguments_)).toBe(true);
+			expect(() =>
+				validateToolCall([tool], {
+					type: "toolCall",
+					id: "wire",
+					name: tool.name,
+					arguments: arguments_,
+				}),
+			).not.toThrow();
+		}
+		for (const arguments_ of [
+			{},
+			{ checkpoint: { ...checkpoint, nextAction: null } },
+			{ checkpoint: { ...checkpoint, timestamp: NOW } },
+			{ checkpoint, extra: true },
+		]) {
+			expect(isJsonSchemaValueValid(wireTool.parameters, arguments_)).toBe(false);
+		}
+	});
+
+	it("rejects malformed checkpoints before invoking the owning persistence callback", async () => {
+		const accept = vi.fn(async (): Promise<QaCheckpointAcceptance> => {
+			throw new Error("malformed checkpoints must not reach persistence");
+		});
+		const tool = requireTool(qaSession(accept));
+		const invalid: unknown[] = [
+			{},
+			null,
+			[],
+			{ checkpoint: null },
+			{ checkpoint: { ...checkpoint, cycleId: " " } },
+			{ checkpoint: { ...checkpoint, summary: "\n\t" } },
+			{ checkpoint: { cycleId: checkpoint.cycleId, summary: checkpoint.summary, disposition: "continue" } },
+			{ checkpoint: { ...checkpoint, nextAction: null } },
+			{ checkpoint: { ...checkpoint, disposition: "complete" } },
+			{ checkpoint: { ...checkpoint, disposition: "complete", nextAction: undefined } },
+			{ checkpoint: { ...checkpoint, nextAction: "" } },
+			{ checkpoint: { ...checkpoint, nextAction: " \n" } },
+			{ checkpoint: { ...checkpoint, disposition: "unknown" } },
+			{ checkpoint: { ...checkpoint, disposition: "blocked" } },
+			{ checkpoint: { ...checkpoint, version: 1 } },
+			{ checkpoint, text: "ignored data is unsafe" },
+		];
+		for (const params of invalid) {
+			const args = validateAgentToolArguments(tool, {
+				type: "toolCall",
+				id: "invalid",
+				name: tool.name,
+				arguments: params as Record<string, unknown>,
+			});
+			await expect(tool.execute("invalid", args as NewContextParams)).rejects.toMatchObject({
+				context: { code: "QA_INVALID_CHECKPOINT" },
+			});
+		}
+		expect(accept).not.toHaveBeenCalled();
+	});
+
+	it("does not acknowledge a checkpoint until the owner has durably accepted it", async () => {
+		const persisted = Promise.withResolvers<QaCheckpointAcceptance>();
+		const accept = vi.fn((_input: QaCheckpointInput, _signal?: AbortSignal) => persisted.promise);
+		const tool = requireTool(qaSession(accept));
+		const controller = new AbortController();
+		let acknowledged = false;
+		const result = tool.execute("persist", { checkpoint }, controller.signal).then(value => {
+			acknowledged = true;
+			return value;
+		});
+		await Promise.resolve();
+		expect(accept).toHaveBeenCalledWith(checkpoint, controller.signal);
+		expect(acknowledged).toBe(false);
+		persisted.resolve({
+			requested: true,
+			checkpoint: { cycleId: checkpoint.cycleId, entryId: "durable-entry", status: "accepted" },
+		});
+		await result;
+		expect(acknowledged).toBe(true);
+	});
+
+	it("preserves typed owner errors instead of reporting a recorded checkpoint", async () => {
+		for (const code of ["QA_STALE_CYCLE", "QA_CHECKPOINT_CONFLICT", "QA_PERSIST_FAILED"] as const) {
+			const error = qaCheckpointError(code, "owner rejected checkpoint", checkpoint.cycleId);
+			const tool = requireTool(
+				qaSession(async () => {
+					throw error;
+				}),
+			);
+			await expect(tool.execute("owner-error", { checkpoint })).rejects.toBe(error);
+			await expect(wrapToolWithMetaNotice(tool).execute("wrapped-owner-error", { checkpoint })).rejects.toBe(error);
+		}
+	});
+
+	it("requires an enabled live journal owner and rechecks eligibility when an existing tool executes", async () => {
+		const accept = vi.fn(async (): Promise<QaCheckpointAcceptance> => {
+			throw new Error("unavailable owners must not receive checkpoints");
+		});
+		const session = qaSession(accept);
+		const tool = requireTool(session);
+		session.qaRollover = { isEnabled: () => false, accept };
+		expect(NewContextTool.createIf(session)).toBeNull();
+		await expect(tool.execute("disabled", { checkpoint })).rejects.toMatchObject({
+			context: { code: "QA_NOT_ACTIVE", cycleId: checkpoint.cycleId },
+		});
+		for (const overrides of [
+			{ isDisposed: () => true },
+			{ getSessionId: () => "advisor-or-parent-session" },
+			{ sessionManager: undefined },
+			{ qaRollover: undefined },
+		]) {
+			expect(NewContextTool.createIf({ ...qaSession(accept), ...overrides })).toBeNull();
+		}
+		expect(accept).not.toHaveBeenCalled();
+	});
+
+	it("preserves experimental empty-object precedence and refuses QA data rather than ignoring it", async () => {
+		const accept = vi.fn(async (): Promise<QaCheckpointAcceptance> => {
+			throw new Error("experimental notes mode must not invoke QA");
+		});
+		const session = qaSession(accept);
+		cfgCompactionExperimentalContextManagement.override(session.settings, true);
+		const tool = requireTool(session);
+		expect((await tool.execute("experimental", {})).details).toEqual({ requested: true });
+		await expect(tool.execute("wrong-mode", { checkpoint })).rejects.toMatchObject({
+			context: { code: "QA_NOT_ACTIVE", cycleId: checkpoint.cycleId },
+		});
+		await expect(tool.execute("unknown-data", { text: "must not be discarded" })).rejects.toThrow(
+			"accepts only an empty object",
+		);
+		expect(accept).not.toHaveBeenCalled();
+	});
+
+	it("registers the owner tool for TUI and headless sessions without widening restricted tool grants", async () => {
+		for (const hasUI of [true, false]) {
+			const session = qaSession(async () => {
+				throw new Error("registration must not accept a checkpoint");
+			});
+			session.hasUI = hasUI;
+			session.taskDepth = hasUI ? 0 : 1;
+			expect((await createTools(session, ["read"])).map(tool => tool.name)).toContain("new_context");
+			expect(
+				(await createTools({ ...session, restrictToolNames: true }, ["read"])).map(tool => tool.name),
+			).not.toContain("new_context");
+			expect(
+				(await createTools({ ...session, restrictToolNames: true }, ["new_context"])).map(tool => tool.name),
+			).toEqual(["new_context"]);
+		}
+	});
+
+	it("does not invoke acceptance for an already aborted tool execution", async () => {
+		const accept = vi.fn(async (): Promise<QaCheckpointAcceptance> => {
+			throw new Error("aborted execution must not reach persistence");
+		});
+		const tool = requireTool(qaSession(accept));
+		const controller = new AbortController();
+		controller.abort();
+		await expect(tool.execute("aborted", { checkpoint }, controller.signal)).rejects.toThrow();
+		expect(accept).not.toHaveBeenCalled();
 	});
 });

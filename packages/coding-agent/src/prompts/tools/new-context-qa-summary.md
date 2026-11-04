@@ -1,0 +1,1 @@
+Nonempty factual checkpoint: saved changes, decisions, observed evidence/results and locations, unverified claims, remaining requested work, and blockers. No required headings. You MUST distinguish completed steps from unrun verification. Summary plus nextAction MUST fit 4,096 tokens and remaining headroom.

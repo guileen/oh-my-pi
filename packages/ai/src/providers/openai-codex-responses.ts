@@ -1,3 +1,4 @@
+import { admitProviderRequest, providerRequestFetch } from "../utils/provider-request";
 import { scheduler } from "node:timers/promises";
 import { type } from "@oh-my-pi/omptype";
 import { getSupportedEfforts } from "@oh-my-pi/pi-catalog/model-thinking";
@@ -1937,6 +1938,7 @@ async function openCodexWebSocketTransport(
 		requestSetup.requestSignal,
 		onSseEvent,
 		onOwned,
+		() => admitProviderRequest(model, options),
 	);
 	return {
 		eventStream,
@@ -2002,7 +2004,7 @@ async function openCodexSseTransport(
 				requestSetup.firstEventTimeoutMs,
 				options?.codexSseMaxAttempts,
 				event => options?.onSseEvent?.(event, model),
-				wrapFetchForRequestCompression(options?.fetch ?? fetch, model),
+				wrapFetchForRequestCompression(providerRequestFetch(model, options), model),
 			),
 		);
 	};
@@ -3857,6 +3859,7 @@ class CodexWebSocketConnection {
 	#connectPromise?: Promise<void>;
 	#activeRequest = false;
 	#streamObserver?: (event: RawSseEvent) => void;
+	#beforeRequest?: () => Promise<void>;
 	#heartbeatInterval: NodeJS.Timeout | undefined;
 	#removePongListener?: () => void;
 	#handshakeHeaders?: Headers;
@@ -4095,6 +4098,7 @@ class CodexWebSocketConnection {
 		signal?: AbortSignal,
 		onSseEvent?: (event: RawSseEvent) => void,
 		onOwned?: () => void,
+		beforeRequest?: () => Promise<void>,
 	): AsyncGenerator<Record<string, unknown>> {
 		if (!this.#socket || this.#socket.readyState !== WebSocket.OPEN) {
 			throw new CodexWebSocketTransportError(`websocket connection is unavailable`);
@@ -4108,6 +4112,7 @@ class CodexWebSocketConnection {
 		this.#activeRequest = true;
 		onOwned?.();
 		this.#streamObserver = onSseEvent;
+		this.#beforeRequest = beforeRequest;
 		// Drain any non-error frames left over from a prior request before sending.
 		// An attach reads exactly those frames: the successor the server started
 		// from accepted steering while no request was reading.
@@ -4149,6 +4154,7 @@ class CodexWebSocketConnection {
 					: undefined;
 
 				const requestPayload = JSON.stringify(request);
+				await beforeRequest?.();
 				notifyCodexWebSocketOutbound(onSseEvent, request, requestPayload);
 				// Re-check liveness: the debug-session await above can outlive the socket.
 				// Preserve the abort cause: onAbort already queued a caused error, but this
@@ -4289,6 +4295,7 @@ class CodexWebSocketConnection {
 		} finally {
 			this.#activeRequest = false;
 			this.#streamObserver = undefined;
+			this.#beforeRequest = undefined;
 			this.#attachSteerIds = undefined;
 			if (signal) {
 				signal.removeEventListener("abort", onAbort);
@@ -4303,7 +4310,8 @@ class CodexWebSocketConnection {
 	 * Submit `response.steer` for `previousResponseId`, which must be streaming
 	 * on this socket. Resolves on the server's acknowledgement.
 	 */
-	steer(previousResponseId: string, input: InputItem[]): Promise<CodexSteerAck> {
+	async steer(previousResponseId: string, input: InputItem[]): Promise<CodexSteerAck> {
+		await this.#beforeRequest?.();
 		const socket = this.#socket;
 		if (!socket || socket.readyState !== WebSocket.OPEN) {
 			return Promise.reject(new CodexWebSocketTransportError(`websocket connection is unavailable`));

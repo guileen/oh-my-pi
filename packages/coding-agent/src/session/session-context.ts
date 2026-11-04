@@ -28,6 +28,8 @@ import {
 	type SessionMessageEntry,
 } from "./session-entries";
 import { QA_STATE_TYPE, QA_TOOL_TIP_TYPE } from "./compact-modes";
+import { renderQaCompactionCheckpoint, resolveQaCompactionCheckpoint } from "./qa-compaction";
+import { QA_CHECKPOINT_ENTRY_TYPE } from "./qa-rollover";
 
 // #4470 crash artifacts had legacy frames (no shape metadata) with 17 frames,
 // ~306k archive chars, and ~1.5M truncated chars. Current snapcompact frames
@@ -511,6 +513,10 @@ export function buildSessionContext(
 	) {
 		const compactionIdx = path.findIndex(entry => entry.id === compaction.id);
 		const retained = new Set(compaction.details.retainedEntryIds);
+		const checkpoint =
+			!options?.transcript && "checkpointEntryId" in compaction.details
+				? resolveQaCompactionCheckpoint(path.slice(0, compactionIdx), compaction.details.checkpointEntryId)
+				: undefined;
 		for (let i = resetBoundaryIdx + 1; i < compactionIdx; i++) {
 			const entry = path[i];
 			if (!retained.has(entry.id)) continue;
@@ -520,6 +526,17 @@ export function buildSessionContext(
 			} else {
 				appendMessage(entry);
 			}
+		}
+		if (checkpoint) {
+			pushMessage(
+				createCustomMessage(
+					QA_CHECKPOINT_ENTRY_TYPE,
+					renderQaCompactionCheckpoint(checkpoint.data),
+					false,
+					undefined,
+					checkpoint.timestamp,
+				),
+			);
 		}
 		if (!options?.transcript && typeof compaction.details.state === "string" && compaction.details.state) {
 			pushMessage(

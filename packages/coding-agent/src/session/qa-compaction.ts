@@ -2,10 +2,12 @@ import { isUserRequestEntry } from "@oh-my-pi/pi-tui/chat/transcript-entry";
 import { isRecord, prompt } from "@oh-my-pi/pi-utils";
 import type { GoalModeState } from "../goals/state";
 import qaCompactionActivityPrompt from "../prompts/system/qa-compaction-activity.md" with { type: "text" };
+import qaCompactionCheckpointPrompt from "../prompts/system/qa-compaction-checkpoint.md" with { type: "text" };
 import qaCompactionStatePrompt from "../prompts/system/qa-compaction-state.md" with { type: "text" };
 import { getLatestTodoPhasesFromEntries } from "../tools/todo";
 import type { AsyncJobSnapshot } from "./agent-session-types";
-import type { SessionEntry } from "./session-entries";
+import type { CustomEntry, SessionEntry } from "./session-entries";
+import { QA_CHECKPOINT_ENTRY_TYPE, type QaCheckpointData } from "./qa-rollover";
 import { isTerminalTextAssistantAnswer } from "./queued-messages";
 
 export interface QaCompactionDetails {
@@ -13,12 +15,56 @@ export interface QaCompactionDetails {
 	retainedEntryIds: string[];
 	toolTip: string;
 	state?: string;
+	checkpointEntryId?: string;
 }
 
 export interface QaCompactionRuntimeState {
 	plan?: { path: string; mode: "planning" | "approved" };
 	goal?: GoalModeState["goal"];
 	jobs?: AsyncJobSnapshot;
+}
+
+/** Resolve only journal-owned checkpoint data from the active reset boundary. */
+export function resolveQaCompactionCheckpoint(
+	entries: readonly SessionEntry[],
+	checkpointEntryId: unknown,
+): CustomEntry<QaCheckpointData> & { data: QaCheckpointData } {
+	if (typeof checkpointEntryId !== "string" || !checkpointEntryId) {
+		throw new Error("Invalid QA checkpoint reference");
+	}
+	const boundary = entries.reduce((last, entry, i) => (entry.type === "reset_boundary" ? i : last), -1);
+	const index = entries.findIndex(entry => entry.id === checkpointEntryId);
+	const entry = entries[index];
+	if (index <= boundary || !entry || entry.type !== "custom" || entry.customType !== QA_CHECKPOINT_ENTRY_TYPE) {
+		throw new Error(`QA checkpoint reference is unavailable: ${checkpointEntryId}`);
+	}
+	const data = entry.data;
+	if (
+		!isRecord(data) ||
+		data.version !== 1 ||
+		typeof data.cycleId !== "string" ||
+		!data.cycleId.trim() ||
+		typeof data.summary !== "string" ||
+		!data.summary.trim() ||
+		(data.disposition !== "continue" && data.disposition !== "complete" && data.disposition !== "blocked") ||
+		(data.disposition === "continue"
+			? typeof data.nextAction !== "string" || !data.nextAction.trim()
+			: data.nextAction !== undefined)
+	) {
+		throw new Error(`Invalid or unsupported QA checkpoint: ${checkpointEntryId}`);
+	}
+	return entry as CustomEntry<QaCheckpointData> & { data: QaCheckpointData };
+}
+
+export function renderQaCompactionCheckpoint(checkpoint: QaCheckpointData): string {
+	return prompt
+		.render(qaCompactionCheckpointPrompt, {
+			cycleId: checkpoint.cycleId,
+			summary: checkpoint.summary,
+			disposition: checkpoint.disposition,
+			nextAction: checkpoint.nextAction,
+		})
+		.trim();
 }
 
 /** Recover user turns from the journal, not a previous lossy summary. */
@@ -28,6 +74,10 @@ export function prepareQaCompaction(
 ): { details: QaCompactionDetails; summary: string } {
 	const boundary = entries.reduce((last, entry, i) => (entry.type === "reset_boundary" ? i : last), -1);
 	const active = entries.slice(boundary + 1);
+	const latestCheckpoint = active.findLast(
+		entry => entry.type === "custom" && entry.customType === QA_CHECKPOINT_ENTRY_TYPE,
+	);
+	const checkpoint = latestCheckpoint ? resolveQaCompactionCheckpoint(active, latestCheckpoint.id) : undefined;
 	const activityStart = active.reduce((last, entry, i) => (entry.type === "compaction" ? i + 1 : last), 0);
 	const retainedEntryIds: string[] = [];
 	const summaryParts: string[] = [];
@@ -163,6 +213,7 @@ export function prepareQaCompaction(
 		details: {
 			kind: "qaonly",
 			retainedEntryIds,
+			...(checkpoint ? { checkpointEntryId: checkpoint.id } : {}),
 			toolTip: activitySections.length
 				? prompt.render(qaCompactionActivityPrompt, { sections: activitySections }).trim()
 				: "",
