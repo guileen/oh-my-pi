@@ -10,9 +10,10 @@ import {
 } from "@oh-my-pi/pi-agent-core";
 import { generateHandoffFromContext, renderHandoffPrompt } from "@oh-my-pi/pi-agent-core/compaction";
 import type { Message, Model, ServiceTier, SimpleStreamOptions } from "@oh-my-pi/pi-ai";
-import { logger, Snowflake } from "@oh-my-pi/pi-utils";
+import { logger, prompt, Snowflake } from "@oh-my-pi/pi-utils";
 import type { ModelRegistry } from "../config/model-registry";
 import type { Settings } from "../config/settings";
+import relayCompactionPrompt from "../prompts/session/relay-compaction.md" with { type: "text" };
 import { obfuscateProviderContext } from "../secrets/message-transform";
 import type { SecretObfuscator } from "../secrets/obfuscator";
 import type { HandoffResult, SessionHandoffOptions } from "./agent-session-types";
@@ -24,12 +25,6 @@ function createHandoffFileName(date = new Date()): string {
 	const fileTimestamp = date.toISOString().replace(/[:.]/g, "-");
 	return `handoff-${fileTimestamp}.md`;
 }
-
-const RELAY_PROMPT = `Create concise working memory for continuing this same session after its context is compacted.
-Preserve the user's goal and constraints, current state and decisions, relevant files and identifiers,
-work completed, outstanding work and immediate next steps, and any important errors or evidence.
-Distinguish facts from uncertainty. Omit irrelevant history and do not invent details.
-Write only the working memory, with enough detail to continue without asking the user to repeat themselves.`;
 
 function throwIfHandoffAborted(signal: AbortSignal): void {
 	if (!signal.aborted) return;
@@ -148,7 +143,7 @@ export class SessionHandoff {
 			const handoffPromptCacheKey = this.#host.getPromptCacheKeyForModel(model) ?? this.#host.agent.sessionId;
 			const focus = this.#host.obfuscateTextForProvider(customInstructions);
 			const handoffPromptText = options?.relay
-				? `${RELAY_PROMPT}${focus ? `\n\nAdditional focus:\n${focus}` : ""}`
+				? prompt.render(relayCompactionPrompt, { additionalFocus: focus })
 				: renderHandoffPrompt(focus);
 			const handoffSnapshot: AgentMessage[] = [
 				...this.#host.agent.state.messages,

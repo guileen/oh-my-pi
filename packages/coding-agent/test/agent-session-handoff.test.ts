@@ -179,7 +179,7 @@ describe("AgentSession handoff", () => {
 			.spyOn(compactionModule, "generateHandoffFromContext")
 			.mockResolvedValue("## Working memory\nContinue the task");
 
-		await session.compact(`keep ${HANDOFF_SECRET}`, { mode: "relay" });
+		await session.compact(`keep ${HANDOFF_SECRET} && preserve <tag>`, { mode: "relay" });
 
 		const call = generateHandoffSpy.mock.calls[0];
 		if (!call) throw new Error("Expected relay handoff generation");
@@ -187,8 +187,7 @@ describe("AgentSession handoff", () => {
 		const text = typeof trailing?.content === "string"
 			? trailing.content
 			: (trailing?.content ?? []).map(block => (block.type === "text" ? block.text : "")).join("");
-		expect(text).toContain("working memory");
-		expect(text).toContain(`keep ${placeholder}`);
+		expect(text).toContain(`keep ${placeholder} && preserve <tag>`);
 		expect(text).not.toContain(HANDOFF_SECRET);
 		expect(call[0].systemPrompt).toEqual(["Test"]);
 		expect(call[2].streamOptions.sessionId).toStartWith(`${previousSessionId}:side:`);

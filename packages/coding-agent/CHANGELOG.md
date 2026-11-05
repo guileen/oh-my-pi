@@ -10,6 +10,7 @@
 
 ### Changed
 
+- `/compact relay` now preserves task intent, decisions, evidence, unfinished work and blockers as structured working memory for continuation.
 - `/compact qaonly` now preserves task progress, plan references, goals and background-job state without a model call, and makes its checkpoint and file references available immediately on automatic continuation and session reopen.
 
 ### Fixed
