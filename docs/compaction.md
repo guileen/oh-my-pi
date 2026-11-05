@@ -218,7 +218,7 @@ Threshold, incomplete-output, and overflow recovery advance to the next configur
 
 ### Manual relay and QA-only modes
 
-- `/compact relay [focus]` generates working memory using the live conversation and cache-aware handoff request, then compacts in the same session. Provider cache hits depend on the request and cache lifetime.
+- `/compact relay [focus]` compiles the live conversation into working memory: current intent and scope, decisions and evidence, verified and unfinished work, blockers, and the next action. It uses a cache-aware handoff request and compacts in the same session; provider cache hits depend on the request and cache lifetime. The optional focus guides the summary without replacing its continuity requirements.
 - `/compact qaonly` locally retains user instructions and final answers without a model call. Deduplicated file, skill and command tips are temporary context after the next instruction; later compaction may discard them. The session journal remains available.
 
 ### Snapcompact method
