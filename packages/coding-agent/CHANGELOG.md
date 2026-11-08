@@ -11,6 +11,7 @@
 
 ### Changed
 
+- Compaction handoffs now direct long-running work to the next actionable TODO, preserve all outstanding goals and verification, and discourage repeated exploration, checks, and job launches.
 - `/compact qaonly` now preserves task progress, plan references, goals and background-job state without a model call, and makes its checkpoint and file references available immediately on automatic continuation and session reopen.
 
 ### Fixed
