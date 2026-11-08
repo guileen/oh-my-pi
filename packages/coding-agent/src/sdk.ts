@@ -220,8 +220,8 @@ import {
 	clampProviderContextImages,
 	dropUnreadableContextImages,
 } from "./session/provider-image-budget";
-import {
 import { qaCheckpointError } from "./session/qa-rollover";
+import {
 	expandDefaultRetryFallbackChains,
 	findRetryFallbackCandidates,
 	installRetryFallbackRole,
@@ -5052,9 +5052,9 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			},
 			// Live, not the spread's copy: a rediscovery after a plugin upgrade replaces the primary's list.
 			get skills() {
-			qaRollover: undefined,
 				return toolSession.skills;
 			},
+			qaRollover: undefined,
 			hasEditTool: true,
 			requireYieldTool: false,
 			getSessionId: () => {
