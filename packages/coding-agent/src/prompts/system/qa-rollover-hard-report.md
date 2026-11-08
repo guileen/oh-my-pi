@@ -7,11 +7,12 @@ QA rollover cycle: `{{cycleId}}`.
 Ordinary-work limit: {{hardTokens}} input-context tokens.
 
 - You MUST use `checkpoint.cycleId: "{{cycleId}}"`.
-- You MUST report saved work, evidence locations/results, uncertainty, unfinished work, and blockers in `checkpoint.summary`.
-- Any requested work remains? You MUST set `disposition: "continue"` and a concrete `nextAction` for after compaction.
+- You MUST report all outstanding user goals, saved work, evidence locations/results, uncertainty, unfinished verification, and blockers in `checkpoint.summary`.
+- Canonical TODOs and job state are preserved separately. Record missing continuation context, not whole TODO lists or transcripts. Preserve still-relevant facts from prior checkpoints; this checkpoint must stand on its own.
+- Any actionable work or verification remains? You MUST set `disposition: "continue"` and `nextAction` naming the next concrete operation, its target, and completion check, aligned with the next actionable TODO.
 - The ENTIRE user task is complete? You MUST set `disposition: "complete"` and omit `nextAction`.
-- User approval or another blocker prevents continuation? You MUST set `disposition: "blocked"`, explain the blocker, and omit `nextAction`.
-- You MUST keep summary plus next action within 4,096 tokens.
+- All remaining work requires external input with no actionable alternative? You MUST set `disposition: "blocked"`, explain blockers and release conditions, and omit `nextAction`. One blocked goal does not block independent goals.
+- You MUST keep summary plus next action within 4,096 tokens; this is a ceiling, not a target. Keep only facts needed to resume without repeating work.
 - You MUST use existing evidence only; unverified work remains unverified.
 - You NEVER wait for synchronous tools or background jobs in this response; settled tool results and current job state are preserved by the session.
 
