@@ -195,11 +195,11 @@ import {
 import type { AuthStorage } from "./session/auth-storage";
 import { CostCapError, type CostGate, guardStreamFn } from "./session/cost-gate";
 import {
-import {
 	canUseRemoteCompaction,
 	resolveCompactionMethodOrder,
 	resolveMethodSettings,
 } from "./session/compaction-methods";
+import {
 	CREDENTIAL_DISABLED_NOTICE_SOURCE,
 	formatCredentialDisabledNotice,
 } from "./session/credential-disabled-notice";
