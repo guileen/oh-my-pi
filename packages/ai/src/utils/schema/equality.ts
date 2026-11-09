@@ -2,7 +2,7 @@ import type { JsonObject } from "./types";
 import { isJsonObject } from "./types";
 
 export function areJsonValuesEqual(left: unknown, right: unknown): boolean {
-	if (Object.is(left, right)) {
+	if (Object.is(left, right) || (left === 0 && right === 0)) {
 		return true;
 	}
 	if (Array.isArray(left) || Array.isArray(right)) {
@@ -19,14 +19,12 @@ export function areJsonValuesEqual(left: unknown, right: unknown): boolean {
 	if (!isJsonObject(left) || !isJsonObject(right)) {
 		return false;
 	}
-	let rightLen = 0;
-	for (const _ in right) rightLen++;
-	let leftLen = 0;
-	for (const key in left) {
-		leftLen++;
-		if (!(key in right) || !areJsonValuesEqual(left[key], right[key])) return false;
+	const leftKeys = Object.keys(left);
+	if (leftKeys.length !== Object.keys(right).length) return false;
+	for (const key of leftKeys) {
+		if (!Object.hasOwn(right, key) || !areJsonValuesEqual(left[key], right[key])) return false;
 	}
-	return leftLen === rightLen;
+	return true;
 }
 
 export function mergeCompatibleEnumSchemas(existing: unknown, incoming: unknown): JsonObject | null {

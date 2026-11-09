@@ -11,6 +11,8 @@ export const BLOB_BROKER_WORKER_ARG = "__omp_worker_blob_broker";
 export const COMPUTER_WORKER_ARG = "__omp_worker_computer";
 /** Daemon-broker selector shared by the CLI dispatcher and worker launcher. */
 export const DAEMON_BROKER_WORKER_ARG = "__omp_worker_daemon_broker";
+/** Per-generation native child-owner selector; never imports the normal command graph. */
+export const OWNED_SUPERVISOR_WORKER_ARG = "__omp_worker_owned_supervisor";
 /** IDA-host selector shared by the CLI dispatcher and the broker daemon spec. */
 export const IDA_HOST_WORKER_ARG = "__omp_worker_ida_host";
 /** Mnemopi shared embedding-server selector shared by the CLI dispatcher and `embed-client.ts`. */

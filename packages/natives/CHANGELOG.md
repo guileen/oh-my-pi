@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added Unix owned-child supervision with explicit environments, bounded stdin and log capture; signals never adopt a saved PID.
+
 ## [18.15.0] - 2026-11-01
 
 ### Fixed

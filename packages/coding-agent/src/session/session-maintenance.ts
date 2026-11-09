@@ -116,6 +116,7 @@ import {
 	type QaCheckpointAcceptance,
 	qaCheckpointError,
 } from "./qa-rollover";
+import qaRolloverHintPrompt from "../prompts/system/qa-rollover-hint.md" with { type: "text" };
 import qaRolloverWarningPrompt from "../prompts/system/qa-rollover-warning.md" with { type: "text" };
 import qaRolloverHardReportPrompt from "../prompts/system/qa-rollover-hard-report.md" with { type: "text" };
 import {
@@ -569,8 +570,12 @@ interface QaRolloverCycle {
 	phase: "warning-pending" | "draining" | "hard-report" | "ready" | "compacting" | "blocked";
 	reportRequestsUsed: number;
 	reportPromptDelivered?: boolean;
+	/** Highest advisory stage delivered: 0 none, 1 hint, 2 warning, 3 final warning. */
+	advisoryStage: number;
 	hard: number;
+	hint: number;
 	warning: number;
+	finalWarning: number;
 	recovery: number;
 	reportInputLimit: number;
 	checkpoint?: QaCheckpointInput;
@@ -683,7 +688,17 @@ export class SessionMaintenance {
 		this.#host = host;
 	}
 
-	#qaPolicy(): { key: string; hard: number; warning: number; recovery: number; reportInputLimit: number } | undefined {
+	#qaPolicy():
+		| {
+				key: string;
+				hard: number;
+				hint: number;
+				warning: number;
+				finalWarning: number;
+				recovery: number;
+				reportInputLimit: number;
+		  }
+		| undefined {
 		const settings = this.#compactionSettings;
 		const model = this.#model;
 		const window = model?.contextWindow ?? 0;
@@ -700,12 +715,14 @@ export class SessionMaintenance {
 			isCompactionMethodUsable(candidate, "threshold", model, settings),
 		);
 		if (selected !== "qaonly") return;
-		// Work stops before the model safety boundary, retaining room for a bounded report.
+		// Only the model safety boundary forces a stop; earlier stages are advisory.
 		const reportInputLimit = Math.min(promptBudgetTokens(window, settings), window - 8192);
-		const hard = Math.min(200_000, reportInputLimit - 4096);
-		const warning = Math.min(120_000, Math.floor(hard * 0.9));
-		const recovery = Math.floor(warning * COMPACTION_RECOVERY_BAND);
-		if (!(0 < recovery && recovery < warning && warning < hard)) return;
+		const hard = reportInputLimit - 4096;
+		const hint = Math.min(100_000, Math.floor(hard * 0.5));
+		const warning = Math.floor(hard * 0.6);
+		const finalWarning = Math.floor(hard * 0.85);
+		const recovery = Math.floor(hint * COMPACTION_RECOVERY_BAND);
+		if (!(0 < recovery && recovery < hint && hint < warning && warning < finalWarning && finalWarning < hard)) return;
 		const branch = this.#host.sessionManager.getBranchView();
 		const boundary = branch.findLast(entry => entry.type === "compaction" || entry.type === "reset_boundary");
 		const key = JSON.stringify([
@@ -717,7 +734,7 @@ export class SessionMaintenance {
 			boundary?.id,
 			hard,
 		]);
-		return { key, hard, warning, recovery, reportInputLimit };
+		return { key, hard, hint, warning, finalWarning, recovery, reportInputLimit };
 	}
 
 	isQaRolloverEnabled(): boolean {
@@ -759,7 +776,7 @@ export class SessionMaintenance {
 		}
 		let cycle = this.#currentQaCycle();
 		const tokens = this.#estimatePrePromptContextTokens([], this.#model?.contextWindow ?? 0);
-		if (!cycle && tokens >= policy.warning) {
+		if (!cycle && tokens >= policy.hint) {
 			this.cancelSpeculation();
 			cycle = this.#qaCycle = {
 				...policy,
@@ -767,30 +784,50 @@ export class SessionMaintenance {
 				generation: this.#host.promptGeneration(),
 				phase: "warning-pending",
 				reportRequestsUsed: 0,
+				advisoryStage: 0,
 			};
 		}
 		if (!cycle) return;
 		if (tokens >= policy.hard && cycle.phase !== "ready") cycle.phase = "hard-report";
 		const hardReport = cycle.phase === "hard-report";
-		if (hardReport ? cycle.reportPromptDelivered : cycle.phase !== "warning-pending") return;
+		const stage = tokens >= cycle.finalWarning ? 3 : tokens >= cycle.warning ? 2 : 1;
+		if (hardReport) {
+			if (cycle.reportPromptDelivered) return;
+		} else if ((cycle.phase !== "warning-pending" && cycle.phase !== "draining") || stage <= cycle.advisoryStage) {
+			return;
+		}
+		const vars = {
+			cycleId: cycle.cycleId,
+			currentTokens: tokens,
+			headroomTokens: Math.max(0, cycle.hard - tokens),
+			hardTokens: cycle.hard,
+			final: stage === 3,
+		};
 		messages.push({
 			role: "custom",
-			customType: hardReport ? "qa-rollover-hard-report" : "qa-rollover-warning",
+			customType: hardReport ? "qa-rollover-hard-report" : stage === 1 ? "qa-rollover-hint" : "qa-rollover-warning",
 			display: false,
 			timestamp: Date.now(),
-			content: prompt.render(hardReport ? qaRolloverHardReportPrompt : qaRolloverWarningPrompt, {
-				cycleId: cycle.cycleId,
-				headroomTokens: Math.max(0, cycle.hard - tokens),
-				hardTokens: cycle.hard,
-			}),
+			content: prompt.render(
+				hardReport ? qaRolloverHardReportPrompt : stage === 1 ? qaRolloverHintPrompt : qaRolloverWarningPrompt,
+				vars,
+			),
 		});
-		if (hardReport) cycle.reportPromptDelivered = true;
-		else cycle.phase = "draining";
+		if (hardReport) {
+			cycle.reportPromptDelivered = true;
+		} else {
+			cycle.advisoryStage = stage;
+			cycle.phase = "draining";
+		}
 		this.#host.emitNotice(
 			"info",
 			hardReport
-				? "QA work limit reached: reporting saved work before context rollover."
-				: "QA context warning: choose an appropriate nearby milestone for a checkpoint.",
+				? "QA context limit reached: reporting saved work before context rollover."
+				: stage === 1
+					? "QA context hint: checkpoint available to denoise context."
+					: stage === 2
+						? "QA context warning: context is large; checkpoint when output is secured."
+						: "QA final context warning: secure output and checkpoint before the limit.",
 			"compaction",
 		);
 	}
@@ -3452,12 +3489,9 @@ export class SessionMaintenance {
 			const scheduled = this.#host.scheduleCompactionContinuation({
 				generation: qaOutcome.generation,
 				autoContinue:
-					autoContinue &&
-					this.#compactionSettings.autoContinue !== false &&
-					checkpoint?.disposition === "continue",
-				terminalTextAnswer: checkpoint?.disposition !== "continue",
+					autoContinue && this.#compactionSettings.autoContinue !== false && checkpoint?.disposition === "continue",
+				terminalTextAnswer: false,
 				suppressContinuation: false,
-				checkpointDisposition: checkpoint?.disposition,
 			});
 			return scheduled ? COMPACTION_CHECK_CONTINUATION : COMPACTION_CHECK_BLOCK_AUTOMATIC_CONTINUATION;
 		}
@@ -5613,7 +5647,7 @@ export class SessionMaintenance {
 				cycle?.recovery ??
 				this.#qaPolicy()?.recovery ??
 				Math.floor(
-					Math.min(120_000, promptBudgetTokens(this.#model?.contextWindow ?? 0, compactionSettings) * 0.9) *
+					promptBudgetTokens(this.#model?.contextWindow ?? 0, compactionSettings) * 0.6 *
 						COMPACTION_RECOVERY_BAND,
 				);
 			const activeWork =

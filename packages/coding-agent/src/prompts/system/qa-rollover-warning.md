@@ -1,14 +1,19 @@
 <critical>
-Context is large. You SHOULD checkpoint at the next safe milestone rather than fill the remaining context.
+{{#if final}}FINAL WARNING: context {{currentTokens}} tokens is near the forced handoff at {{hardTokens}}. Secure your output now and checkpoint soon; at the limit you will be forced to report.
+{{else}}Context is large ({{currentTokens}} tokens). This is NOT a stop signal; you decide when to checkpoint.
+{{/if}}Checkpoint discards your working context: everything you read but did not turn into a decision, edit, or written finding is lost and must be re-read.
 You MAY continue ordinary work below {{hardTokens}} input-context tokens; there is no request-count deadline.
 </critical>
 
 QA rollover cycle: `{{cycleId}}`.
 Remaining ordinary-work context headroom: {{headroomTokens}} tokens.
 
-- You SHOULD choose the milestone based on the task, not an arbitrary number of requests.
+- Before checkpointing, you MUST convert what you have read into output: make the decision, apply the edits, or run the verification it enables. Reads are cost; edits and decisions are output.
+- NEVER checkpoint right after exploration with no decision or change. Avoid new broad reads now; spend remaining headroom acting on what you already know.
+- A milestone is completed output (saved edits, a verified result, a settled decision), not "finished reading".
 - You MUST preserve all outstanding user goals, saved changes, decisions, evidence locations/results, uncertainty, unfinished verification, and blockers in `checkpoint.summary`.
-- Canonical TODOs and job state are preserved separately. Record only missing continuation context; NEVER copy whole TODO lists, transcripts, file contents, or prior summaries. Preserve still-relevant facts from prior checkpoints; this checkpoint must stand on its own.
+- If understanding is not yet applied, `summary` MUST state the concrete findings (what is true, where: file:line/symbol), ruled-out directions, and the decision they imply, so the next context acts without re-reading. "Investigated X; continue analysis" is a failed checkpoint.
+- Canonical TODOs and job state are preserved separately; NEVER copy whole TODO lists, transcripts, or file contents. Carry forward still-relevant facts from prior checkpoints; this checkpoint must stand on its own.
 - You MUST use `checkpoint.cycleId: "{{cycleId}}"`.
 - Any actionable work or verification remains? You MUST set `disposition: "continue"` and `nextAction` naming the next concrete operation, its target, and completion check, aligned with the next actionable TODO.
 - The ENTIRE current user task is finished? You MUST set `disposition: "complete"` and omit `nextAction`. Finishing this milestone is NOT task completion.

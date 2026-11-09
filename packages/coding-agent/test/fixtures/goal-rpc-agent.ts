@@ -26,6 +26,7 @@ const settings = await Settings.init({ inMemory: true, cwd });
 cfgAsyncEnabled.set(settings, false);
 cfgGoalContinuationModes.set(settings, Bun.env.GOAL_RPC_CONTINUATION === "1" ? ["rpc"] : ["interactive"]);
 const slowTurnRelease = Promise.withResolvers<void>();
+const slowTurnStarted = Promise.withResolvers<void>();
 const { session } = await createAgentSession({
 	cwd,
 	agentDir: cwd,
@@ -50,6 +51,9 @@ const { session } = await createAgentSession({
 			pi.registerCommand("goaltest-new-session", {
 				description: "start a new session from an extension; any argument text is then sent as a prompt",
 				handler: async (args, ctx) => {
+					// agent_start precedes provider dispatch. Ensure the old run has
+					// consumed the stalled response before replacing its session.
+					if (Bun.env.GOAL_RPC_SCRIPT === "slow") await slowTurnStarted.promise;
 					await ctx.newSession();
 					if (args.trim()) pi.sendUserMessage(args.trim());
 				},
@@ -90,6 +94,7 @@ const mock = createMockModel({
 	handler: async (_context, options) => {
 		if (!slowTurnPending) return turns.shift() ?? { content: ["Nothing left to do."] };
 		slowTurnPending = false;
+		slowTurnStarted.resolve();
 		const signal = options?.signal;
 		const stalled = Promise.withResolvers<void>();
 		void slowTurnRelease.promise.then(stalled.resolve);

@@ -3,6 +3,7 @@ export * from "./async";
 export * from "./binary";
 export * from "./bytes";
 export * from "./color";
+export * from "./decimal";
 export * from "./dirs";
 export * from "./env";
 export * from "./executable";

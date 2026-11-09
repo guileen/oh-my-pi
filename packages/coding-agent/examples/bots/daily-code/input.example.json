@@ -1,0 +1,18 @@
+{
+	"task": "在指定范围内实现任务并补充回归测试源码",
+	"facts": "已确认事实、已有改动及不可修改范围",
+	"userWords": "逐字粘贴用户原始请求",
+	"workspace": "/absolute/path/to/trusted/workspace",
+	"coder": { "model": "terra", "thinking": "low" },
+	"reviewer": { "model": "sol", "thinking": "high" },
+	"bindings": {
+		"terra": { "provider": "openai-codex", "model": "gpt-6.1-terra" },
+		"sol": { "provider": "openai-codex", "model": "gpt-6.1-sol" },
+		"astra": { "provider": "openai-codex", "model": "gpt-6-astra" }
+	},
+	"read": ["**"],
+	"write": ["src/**", "test/**"],
+	"checks": ["test", "typecheck"],
+	"maxRounds": 3,
+	"timeoutMs": 1800000
+}

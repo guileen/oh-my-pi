@@ -1,5 +1,6 @@
 import * as path from "node:path";
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
+import { canonicalJson } from "@oh-my-pi/pi-wire/canonical-json";
 import { validateAgentToolArguments } from "./tool-arguments";
 import type {
 	AgentContext,
@@ -106,40 +107,6 @@ function normalizeResources(value: unknown): readonly SpeculativeResourceAccess[
 		resources.push(Object.freeze({ scheme: "file", path: item.path, access: "read" }));
 	}
 	return Object.freeze(resources);
-}
-
-/** JSON canonicalization shared by assessment and final reconciliation. */
-export function canonicalJson(value: unknown, ancestors = new Set<object>()): string {
-	if (value === null || typeof value === "string" || typeof value === "boolean") return JSON.stringify(value);
-	if (typeof value === "number") {
-		if (!Number.isFinite(value)) throw new Error("Non-finite numbers are not JSON values");
-		return JSON.stringify(value);
-	}
-	if (Array.isArray(value)) {
-		if (ancestors.has(value)) throw new Error("Circular values are not JSON values");
-		ancestors.add(value);
-		try {
-			const entries: string[] = [];
-			for (let index = 0; index < value.length; index++) {
-				if (!(index in value)) throw new Error("Sparse arrays are not JSON values");
-				entries.push(canonicalJson(value[index], ancestors));
-			}
-			return `[${entries.join(",")}]`;
-		} finally {
-			ancestors.delete(value);
-		}
-	}
-	if (!isPlainRecord(value)) throw new Error("Non-JSON value");
-	if (ancestors.has(value)) throw new Error("Circular values are not JSON values");
-	ancestors.add(value);
-	try {
-		return `{${Object.keys(value)
-			.sort()
-			.map(key => `${JSON.stringify(key)}:${canonicalJson(value[key], ancestors)}`)
-			.join(",")}}`;
-	} finally {
-		ancestors.delete(value);
-	}
 }
 
 export function createExecutionFingerprint(

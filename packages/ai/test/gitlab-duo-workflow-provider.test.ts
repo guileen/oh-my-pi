@@ -1027,6 +1027,11 @@ describe("GitLab Duo Workflow WebSocket state machine", () => {
 				send(data) {
 					const parsed = JSON.parse(data) as { startRequest?: { workflowID?: string } };
 					if (parsed.startRequest?.workflowID) startedWorkflowIds.push(parsed.startRequest.workflowID);
+					if (index >= 1) {
+						queueMicrotask(() =>
+							socket.onmessage?.(new MessageEvent("message", { data: JSON.stringify({ status: "INPUT_REQUIRED" }) })),
+						);
+					}
 				},
 				close() {
 					closedCount++;
@@ -1037,12 +1042,7 @@ describe("GitLab Duo Workflow WebSocket state machine", () => {
 			// frame, so only the idle timeout can settle it. inline-flow same-id reconnect
 			// is server-side broken, so recovery MUST be a fresh workflow; the second
 			// socket (on the new id) reaches the terminal status.
-			queueMicrotask(() => {
-				socket.onopen?.(new Event("open"));
-				if (index >= 1) {
-					socket.onmessage?.(new MessageEvent("message", { data: JSON.stringify({ status: "INPUT_REQUIRED" }) }));
-				}
-			});
+			queueMicrotask(() => socket.onopen?.(new Event("open")));
 			return socket;
 		};
 
@@ -2108,6 +2108,7 @@ describe("GitLab Duo Workflow WebSocket state machine", () => {
 		let capturedHeaders: Record<string, string> | undefined;
 		let startRequestMetadata: Record<string, unknown> | undefined;
 		const socketReady = Promise.withResolvers<GitLabDuoWorkflowWebSocketLike>();
+		const startSent = Promise.withResolvers<void>();
 		const parseBody = (body: unknown): Record<string, unknown> => {
 			if (typeof body !== "string") return {};
 			return JSON.parse(body) as Record<string, unknown>;
@@ -2122,6 +2123,7 @@ describe("GitLab Duo Workflow WebSocket state machine", () => {
 				if (payload.startRequest?.workflowMetadata) {
 					startRequestMetadata = JSON.parse(payload.startRequest.workflowMetadata) as Record<string, unknown>;
 				}
+				startSent.resolve();
 			},
 			close() {},
 		};
@@ -2179,6 +2181,7 @@ describe("GitLab Duo Workflow WebSocket state machine", () => {
 		expect(capturedHeaders?.["x-gitlab-namespace-id"]).toBe("1");
 		expect(wsUrl.searchParams.get("user_selected_model_identifier")).toBe("claude_sonnet_4_6_vertex");
 		socket.onopen?.(new Event("open"));
+		await startSent.promise;
 		expect(startRequestMetadata).toMatchObject({
 			environment: "ide",
 			client_type: "node-websocket",
@@ -2199,6 +2202,7 @@ describe("GitLab Duo Workflow WebSocket state machine", () => {
 		let capturedHeaders: Record<string, string> | undefined;
 		let startRequest: { workflowMetadata?: string; additional_context?: unknown } | undefined;
 		const socketReady = Promise.withResolvers<GitLabDuoWorkflowWebSocketLike>();
+		const startSent = Promise.withResolvers<void>();
 		const parseBody = (body: unknown): Record<string, unknown> => {
 			if (typeof body !== "string") return {};
 			return JSON.parse(body) as Record<string, unknown>;
@@ -2213,6 +2217,7 @@ describe("GitLab Duo Workflow WebSocket state machine", () => {
 					startRequest?: { workflowMetadata?: string; additional_context?: unknown };
 				};
 				startRequest = payload.startRequest;
+				startSent.resolve();
 			},
 			close() {},
 		};
@@ -2257,6 +2262,7 @@ describe("GitLab Duo Workflow WebSocket state machine", () => {
 		expect(capturedHeaders?.["x-gitlab-namespace-id"]).toBe("1");
 		expect(capturedHeaders?.["x-gitlab-root-namespace-id"]).toBe("1");
 		socket.onopen?.(new Event("open"));
+		await startSent.promise;
 		const metadata = JSON.parse(startRequest?.workflowMetadata ?? "{}") as Record<string, unknown>;
 		expect(metadata).toMatchObject({
 			environment: "ide",
@@ -2410,6 +2416,7 @@ describe("GitLab Duo Workflow WebSocket state machine", () => {
 		let capturedUrl = "";
 		let startRequest: { workflowMetadata?: string } | undefined;
 		const socketReady = Promise.withResolvers<GitLabDuoWorkflowWebSocketLike>();
+		const startSent = Promise.withResolvers<void>();
 		const socket: GitLabDuoWorkflowWebSocketLike = {
 			onopen: null,
 			onmessage: null,
@@ -2418,6 +2425,7 @@ describe("GitLab Duo Workflow WebSocket state machine", () => {
 			send(data) {
 				const payload = JSON.parse(data) as { startRequest?: { workflowMetadata?: string } };
 				startRequest = payload.startRequest;
+				startSent.resolve();
 			},
 			close() {},
 		};
@@ -2468,6 +2476,7 @@ describe("GitLab Duo Workflow WebSocket state machine", () => {
 		const wsUrl = new URL(capturedUrl);
 		expect(wsUrl.searchParams.get("user_selected_model_identifier")).toBe("pinned_model");
 		socket.onopen?.(new Event("open"));
+		await startSent.promise;
 		const metadata = JSON.parse(startRequest?.workflowMetadata ?? "{}") as Record<string, unknown>;
 		expect(metadata.selectedModelIdentifier).toBe("pinned_model");
 		socket.onmessage?.(new MessageEvent("message", { data: JSON.stringify({ status: "INPUT_REQUIRED" }) }));
@@ -3832,6 +3841,8 @@ describe("GitLab Duo Workflow WebSocket state machine", () => {
 
 	it("resumes the preserved GitLab socket with the Agent-produced tool result", async () => {
 		const sent: string[] = [];
+		const startSent = Promise.withResolvers<void>();
+		const responseSent = Promise.withResolvers<void>();
 		const providerSessionState = new Map<string, ProviderSessionState>();
 		let socket: GitLabDuoWorkflowWebSocketLike | undefined;
 		let socketCount = 0;
@@ -3868,6 +3879,8 @@ describe("GitLab Duo Workflow WebSocket state machine", () => {
 				onclose: null,
 				send(data) {
 					sent.push(data);
+					startSent.resolve();
+					if (sent.length === 2) responseSent.resolve();
 				},
 				close() {},
 			};
@@ -3886,6 +3899,7 @@ describe("GitLab Duo Workflow WebSocket state machine", () => {
 		}
 		expect(socket).toBeDefined();
 		socket?.onopen?.(new Event("open"));
+		await startSent.promise;
 		socket?.onmessage?.(
 			new MessageEvent("message", {
 				data: JSON.stringify({
@@ -3937,9 +3951,7 @@ describe("GitLab Duo Workflow WebSocket state machine", () => {
 				webSocketFactory,
 			},
 		);
-		for (let attempt = 0; attempt < 10 && sent.length < 2; attempt++) {
-			await Bun.sleep(0);
-		}
+		await responseSent.promise;
 		expect(socketCount).toBe(1);
 		expect(JSON.parse(sent[1] ?? "{}")).toEqual({
 			actionResponse: { requestID: "req-read-1", plainTextResponse: { response: "README file text" } },
@@ -4358,8 +4370,10 @@ describe("GitLab Duo Workflow WebSocket state machine", () => {
 		};
 		const sockets: GitLabDuoWorkflowWebSocketLike[] = [];
 		const sent: string[][] = [];
+		const startSent = [Promise.withResolvers<void>(), Promise.withResolvers<void>()];
 		const webSocketFactory: GitLabDuoWorkflowWebSocketFactory = () => {
 			const mySent: string[] = [];
+			const index = sent.length;
 			sent.push(mySent);
 			const socket: GitLabDuoWorkflowWebSocketLike = {
 				onopen: null,
@@ -4368,6 +4382,7 @@ describe("GitLab Duo Workflow WebSocket state machine", () => {
 				onclose: null,
 				send(data) {
 					mySent.push(data);
+					startSent[index]?.resolve();
 				},
 				close() {},
 			};
@@ -4387,6 +4402,7 @@ describe("GitLab Duo Workflow WebSocket state machine", () => {
 			await Bun.sleep(0);
 		}
 		sockets[0]?.onopen?.(new Event("open"));
+		await startSent[0]?.promise;
 		sockets[0]?.onmessage?.(
 			new MessageEvent("message", {
 				data: JSON.stringify({
@@ -4427,6 +4443,7 @@ describe("GitLab Duo Workflow WebSocket state machine", () => {
 			await Bun.sleep(0);
 		}
 		sockets[1]?.onopen?.(new Event("open"));
+		await startSent[1]?.promise;
 		sockets[1]?.onmessage?.(new MessageEvent("message", { data: JSON.stringify({ status: "INPUT_REQUIRED" }) }));
 		await secondStream.result();
 
@@ -4482,8 +4499,10 @@ describe("GitLab Duo Workflow WebSocket state machine", () => {
 		};
 		const sockets: GitLabDuoWorkflowWebSocketLike[] = [];
 		const sent: string[][] = [];
+		const startSent = [Promise.withResolvers<void>(), Promise.withResolvers<void>()];
 		const webSocketFactory: GitLabDuoWorkflowWebSocketFactory = () => {
 			const mySent: string[] = [];
+			const index = sent.length;
 			sent.push(mySent);
 			const socket: GitLabDuoWorkflowWebSocketLike = {
 				onopen: null,
@@ -4492,6 +4511,7 @@ describe("GitLab Duo Workflow WebSocket state machine", () => {
 				onclose: null,
 				send(data) {
 					mySent.push(data);
+					startSent[index]?.resolve();
 				},
 				close() {},
 			};
@@ -4511,6 +4531,7 @@ describe("GitLab Duo Workflow WebSocket state machine", () => {
 			await Bun.sleep(0);
 		}
 		sockets[0]?.onopen?.(new Event("open"));
+		await startSent[0]?.promise;
 		sockets[0]?.onmessage?.(
 			new MessageEvent("message", {
 				data: JSON.stringify({
@@ -4552,6 +4573,7 @@ describe("GitLab Duo Workflow WebSocket state machine", () => {
 			await Bun.sleep(0);
 		}
 		sockets[1]?.onopen?.(new Event("open"));
+		await startSent[1]?.promise;
 		sockets[1]?.onmessage?.(new MessageEvent("message", { data: JSON.stringify({ status: "INPUT_REQUIRED" }) }));
 		await secondStream.result();
 
@@ -4608,6 +4630,7 @@ describe("GitLab Duo Workflow WebSocket state machine", () => {
 		};
 		let socket: GitLabDuoWorkflowWebSocketLike | undefined;
 		const sent: string[] = [];
+		const startSent = Promise.withResolvers<void>();
 		const webSocketFactory: GitLabDuoWorkflowWebSocketFactory = () => {
 			socket = {
 				onopen: null,
@@ -4616,6 +4639,7 @@ describe("GitLab Duo Workflow WebSocket state machine", () => {
 				onclose: null,
 				send(data) {
 					sent.push(data);
+					startSent.resolve();
 				},
 				close() {},
 			};
@@ -4687,10 +4711,11 @@ describe("GitLab Duo Workflow WebSocket state machine", () => {
 				webSocketFactory,
 			},
 		);
-		for (let attempt = 0; attempt < 20 && sent.length < 1; attempt++) {
+		for (let attempt = 0; attempt < 20 && !socket; attempt++) {
 			await Bun.sleep(0);
 		}
 		socket?.onopen?.(new Event("open"));
+		await startSent.promise;
 		socket?.onmessage?.(new MessageEvent("message", { data: JSON.stringify({ status: "INPUT_REQUIRED" }) }));
 		await stream.result();
 

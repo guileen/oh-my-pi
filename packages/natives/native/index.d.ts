@@ -446,6 +446,32 @@ export declare class NativeOAuthCallback {
 }
 
 /**
+ * Native-owned child in a fresh Unix session, not a descendant sandbox.
+ * Unsupported platforms reject spawn rather than adopting numeric PIDs.
+ */
+export declare class OwnedChild {
+  /** Spawn with explicit environment and append stdout/stderr to outputPath. */
+  static spawn(options: OwnedChildSpawnOptions): OwnedChild
+  /** Operating-system PID; never usable to reconstruct ownership. */
+  get pid(): number
+  /**
+   * Poll and reap under the same lock used for all signals.
+   * Terminal completion waits for queued leader output, not descendant EOF.
+   */
+  poll(): OwnedChildPollResult
+  /**
+   * Signal only while the owned leader is unreaped. An optional group signal
+   * reaches the original group, not descendants that escaped that group.
+   */
+  signal(signal: number, group?: boolean | undefined | null): boolean
+  /**
+   * Queue UTF-8 stdin without blocking. Throws above 64 KiB pending input,
+   * or when the child has exited or its input has closed.
+   */
+  write(data: string): void
+}
+
+/**
  * The bytes crossing one shell run's pipeline pipes, during and after the run.
  *
  * For `cargo build 2>&1 | tail -5`, stream 1 holds what `cargo` has written
@@ -2960,6 +2986,26 @@ export interface OpenedApplication {
   running: boolean
   pid?: number
   window?: DesktopWindow
+}
+
+/** Status is cached after native ownership has reaped the application. */
+export interface OwnedChildPollResult {
+  running: boolean
+  exitCode: number | null
+  signal: number | null
+}
+
+/** Explicit application configuration. No supervisor environment is inherited. */
+export interface OwnedChildSpawnOptions {
+  application: string
+  args: Array<string>
+  cwd: string
+  env: Record<string, string>
+  outputPath: string
+  /** Optional positive byte cap, paired with previousOutputPath. */
+  maxOutputBytes?: number
+  /** Previous rotated log path, paired with maxOutputBytes. */
+  previousOutputPath?: string
 }
 
 /** Check syntax through the shared parse cache without constructing a summary. */

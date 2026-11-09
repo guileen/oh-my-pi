@@ -5,6 +5,7 @@
 ### Changed
 
 - Deprecated `createFileOps`, `computeFileLists`, `formatFileOperations`, `upsertFileOperations`, `isUrlSchemePath` and `FileOperations` in `@oh-my-pi/pi-agent-core/compaction`; they now re-export `@oh-my-pi/snapcompact`, which callers should import directly
+- Moved `canonicalJson` to `@oh-my-pi/pi-wire/canonical-json`; the agent barrel and former serializer leaf no longer export it.
 
 ### Added
 

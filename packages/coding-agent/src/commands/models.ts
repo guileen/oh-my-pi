@@ -25,6 +25,10 @@ export default class Models extends Command {
 
 	static flags = {
 		json: Flags.boolean({ description: "Output JSON" }),
+		compact: Flags.boolean({
+			char: "c",
+			description: "One borderless line per model (default when stdout is not a TTY)",
+		}),
 		kind: Flags.string({
 			description: "Catalog kind to list",
 			options: MODEL_KIND_OPTIONS,
@@ -37,6 +41,9 @@ export default class Models extends Command {
 		}),
 		"no-extensions": Flags.boolean({
 			description: "Disable extension discovery (explicit -e paths still work)",
+		}),
+		full: Flags.boolean({
+			description: "Bare `omp models`: list every model instead of the provider index",
 		}),
 		config: Flags.string({
 			description: "Load an extra config.yml-style overlay for this run (repeatable)",
@@ -51,17 +58,23 @@ export default class Models extends Command {
 		`# Find models by substring\n  ${APP_NAME} models find minimax`,
 		`# Force a fresh catalog fetch (replaces rm -rf ~/.omp/models.db)\n  ${APP_NAME} models refresh`,
 		`# Machine-readable output\n  ${APP_NAME} models --json`,
+		`# One line per model, no table borders (automatic for pipes)\n  ${APP_NAME} models openai-codex --compact`,
 	];
 
 	async run(): Promise<void> {
 		const { args, flags } = await this.parse(Models);
 		const { action, pattern } = resolveModelsArgs(args.action, args.pattern);
 		const kind = MODEL_KIND_OPTIONS.find(option => option === flags.kind) ?? "chat";
+		// A bare `omp models` is an orientation screen; `--full` or a provider name asks
+		// for the catalog. Piped stdout drops the box table so agents read one row each.
+		const bare = args.action === undefined;
 		await runModelsCommand({
 			action,
 			pattern,
 			flags: {
 				json: flags.json,
+				compact: flags.compact,
+				index: bare && !flags.full && !flags.json,
 				kind,
 				extensions: flags.extension,
 				noExtensions: flags["no-extensions"],

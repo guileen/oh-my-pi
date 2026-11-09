@@ -27,6 +27,26 @@ export const DAEMON_IDLE_GRACE_ENV = "OMP_DAEMON_IDLE_GRACE_MS";
 /** Signals accepted by daemon input operations. */
 export type DaemonSignal = "SIGINT" | "SIGTERM" | "SIGHUP" | "SIGQUIT" | "SIGKILL";
 
+/** Durable Bot launch identity; omitted by ordinary interactive service callers. */
+export interface DaemonLaunchMetadata {
+	launch_intent_id: string;
+	session_owner_id: string;
+	owner_epoch: string;
+}
+
+export interface LaunchDisposition {
+	launch_intent_id: string;
+	state: "pending" | "running" | "terminal" | "cancelled_before_launch" | "unknown";
+	service: { id: string; generation: string } | null;
+	outcome: "ok" | "error" | "cancelled" | null;
+	final: boolean;
+	error: { code: "cleanup_failed"; message: string; retryable: boolean } | null;
+}
+
+/** Retained separately from service-name directories, including after name reuse. */
+export const DAEMON_LAUNCH_LEDGER_FILE = "launch-ledger.sqlite";
+export const DAEMON_LAUNCH_LEDGER_MARKER = "launch-ledger.retained";
+
 /** Typed broker operation sent over the authenticated socket. */
 export type DaemonOperation =
 	| { op: "ping" }
@@ -37,7 +57,10 @@ export type DaemonOperation =
 			replace?: boolean;
 			/** `false` answers once the process launches; follow with a `wait` for readiness. Legacy brokers ignore it and wait. */
 			awaitReady?: boolean;
+			launch?: DaemonLaunchMetadata;
 	  }
+	| { op: "fence_owner"; session_owner_id: string; through_epoch: string }
+	| ({ op: "reconcile_launch"; mode: "inspect" | "cancel" } & DaemonLaunchMetadata)
 	| { op: "list" }
 	| {
 			op: "logs";
@@ -59,6 +82,17 @@ export type DaemonOperation =
 			timeoutMs: number;
 			/** Stop only this generation (`DaemonSnapshot.id`); another one is left running. Legacy brokers ignore it. */
 			id?: string;
+			/** Exact startedAt generation; unlike id, changes on service restart. */
+			generation?: string;
+	  }
+	| {
+			op: "stop_owned";
+			name: string;
+			timeoutMs: number;
+			id: string;
+			generation: string;
+			session_owner_id: string;
+			through_epoch: string;
 	  }
 	| { op: "restart"; name: string }
 	| { op: "mode"; name: string; mode: "persist" | "session" | "detached" }
@@ -71,6 +105,8 @@ export type DaemonOperation =
 export type DaemonRpcResult =
 	| { op: "ping"; projectDir: string }
 	| { op: "start"; daemon: DaemonSnapshot; readyTimedOut: boolean }
+	| { op: "fence_owner"; fenced_through_epoch: string }
+	| { op: "reconcile_launch"; disposition: LaunchDisposition }
 	| { op: "list"; daemons: DaemonSnapshot[] }
 	| {
 			op: "logs";
@@ -87,6 +123,7 @@ export type DaemonRpcResult =
 	| { op: "wait"; daemon: DaemonSnapshot; matched?: string; timedOut: boolean }
 	| { op: "send"; daemon: DaemonSnapshot }
 	| { op: "stop"; daemon: DaemonSnapshot }
+	| { op: "stop_owned"; daemon: DaemonSnapshot }
 	| { op: "restart"; daemon: DaemonSnapshot }
 	| { op: "mode"; daemon: DaemonSnapshot }
 	| { op: "describe"; daemon: DaemonSnapshot; spec: DaemonSpec }
@@ -176,7 +213,7 @@ function stringRecord(value: unknown, label: string): Record<string, string> {
 function daemonState(value: unknown): DaemonState {
 	const state = stringValue(value, "daemon state");
 	if (state === "starting" || state === "running" || state === "ready" || state === "restarting") return state;
-	if (state === "stopping" || state === "exited" || state === "failed") return state;
+	if (state === "stopping" || state === "unknown" || state === "exited" || state === "failed") return state;
 	throw new Error(`Unknown daemon state: ${state}`);
 }
 
@@ -211,6 +248,60 @@ function readySpec(value: unknown): DaemonReadySpec {
 	const timeoutMs = numberValue(source.timeoutMs, "ready.timeoutMs");
 	if (!log && port === undefined) throw new Error("ready requires log or port");
 	return { log, port, host, timeoutMs };
+}
+
+function epochValue(value: unknown, label: string): string {
+	const epoch = stringValue(value, label);
+	if (!/^(0|[1-9][0-9]*)$/.test(epoch)) throw new Error(`${label} must be a canonical unsigned decimal`);
+	return epoch;
+}
+
+export function parseDaemonLaunchMetadata(value: unknown): DaemonLaunchMetadata {
+	const source = record(value, "launch metadata");
+	return {
+		launch_intent_id: stringValue(source.launch_intent_id, "launch.launch_intent_id"),
+		session_owner_id: stringValue(source.session_owner_id, "launch.session_owner_id"),
+		owner_epoch: epochValue(source.owner_epoch, "launch.owner_epoch"),
+	};
+}
+
+export function parseLaunchDisposition(value: unknown): LaunchDisposition {
+	const source = record(value, "launch disposition");
+	const state = stringValue(source.state, "launch.state");
+	if (!["pending", "running", "terminal", "cancelled_before_launch", "unknown"].includes(state))
+		throw new Error("Invalid launch disposition state");
+	const service = source.service === null ? null : record(source.service, "launch.service");
+	const outcome = source.outcome;
+	if (outcome !== null && outcome !== "ok" && outcome !== "error" && outcome !== "cancelled")
+		throw new Error("Invalid launch disposition outcome");
+	const error = source.error === null ? null : record(source.error, "launch.error");
+	if (error && error.code !== "cleanup_failed") throw new Error("Invalid launch disposition error");
+	const disposition: LaunchDisposition = {
+		launch_intent_id: stringValue(source.launch_intent_id, "launch.launch_intent_id"),
+		state: state as LaunchDisposition["state"],
+		service: service
+			? {
+					id: stringValue(service.id, "launch.service.id"),
+					generation: epochValue(service.generation, "launch.service.generation"),
+				}
+			: null,
+		outcome,
+		final: booleanValue(source.final, "launch.final"),
+		error: error
+			? {
+					code: "cleanup_failed",
+					message: stringValue(error.message, "launch.error.message"),
+					retryable: booleanValue(error.retryable, "launch.error.retryable"),
+				}
+			: null,
+	};
+	if (disposition.final !== (state === "terminal" || state === "cancelled_before_launch"))
+		throw new Error("Invalid launch finality");
+	if (state === "terminal" && (!disposition.service || outcome === null))
+		throw new Error("Terminal launch requires an exact generation and outcome");
+	if (state === "cancelled_before_launch" && (disposition.service !== null || outcome !== null))
+		throw new Error("Cancelled-before-launch cannot contain a service or outcome");
+	return disposition;
 }
 
 /** Decode and validate a daemon launch specification. */
@@ -325,7 +416,19 @@ function parseDaemonOperation(value: unknown): DaemonOperation {
 				replace: source.replace === undefined ? undefined : booleanValue(source.replace, "operation.replace"),
 				awaitReady:
 					source.awaitReady === undefined ? undefined : booleanValue(source.awaitReady, "operation.awaitReady"),
+				launch: source.launch === undefined ? undefined : parseDaemonLaunchMetadata(source.launch),
 			};
+		case "fence_owner":
+			return {
+				op,
+				session_owner_id: stringValue(source.session_owner_id, "operation.session_owner_id"),
+				through_epoch: epochValue(source.through_epoch, "operation.through_epoch"),
+			};
+		case "reconcile_launch": {
+			const mode = stringValue(source.mode, "operation.mode");
+			if (mode !== "inspect" && mode !== "cancel") throw new Error("operation.mode must be inspect or cancel");
+			return { op, ...parseDaemonLaunchMetadata(source), mode };
+		}
 		case "logs":
 			return {
 				op,
@@ -365,6 +468,18 @@ function parseDaemonOperation(value: unknown): DaemonOperation {
 				name: stringValue(source.name, "operation.name"),
 				timeoutMs: numberValue(source.timeoutMs, "operation.timeoutMs"),
 				id: optionalString(source.id, "operation.id"),
+				generation:
+					source.generation === undefined ? undefined : epochValue(source.generation, "operation.generation"),
+			};
+		case "stop_owned":
+			return {
+				op,
+				name: stringValue(source.name, "operation.name"),
+				timeoutMs: numberValue(source.timeoutMs, "operation.timeoutMs"),
+				id: stringValue(source.id, "operation.id"),
+				generation: epochValue(source.generation, "operation.generation"),
+				session_owner_id: stringValue(source.session_owner_id, "operation.session_owner_id"),
+				through_epoch: epochValue(source.through_epoch, "operation.through_epoch"),
 			};
 		case "restart":
 		case "describe":
@@ -388,6 +503,13 @@ export function parseDaemonRpcResult(operation: DaemonOperation, value: unknown)
 	switch (operation.op) {
 		case "ping":
 			return { op: "ping", projectDir: stringValue(source.projectDir, "result.projectDir") };
+		case "fence_owner":
+			return {
+				op: "fence_owner",
+				fenced_through_epoch: epochValue(source.fenced_through_epoch, "result.fenced_through_epoch"),
+			};
+		case "reconcile_launch":
+			return { op: "reconcile_launch", disposition: parseLaunchDisposition(source.disposition) };
 		case "start":
 			return {
 				op: "start",
@@ -422,6 +544,8 @@ export function parseDaemonRpcResult(operation: DaemonOperation, value: unknown)
 			return { op: "send", daemon: parseDaemonSnapshot(source.daemon) };
 		case "stop":
 			return { op: "stop", daemon: parseDaemonSnapshot(source.daemon) };
+		case "stop_owned":
+			return { op: "stop_owned", daemon: parseDaemonSnapshot(source.daemon) };
 		case "restart":
 			return { op: "restart", daemon: parseDaemonSnapshot(source.daemon) };
 		case "mode":

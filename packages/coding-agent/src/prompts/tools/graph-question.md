@@ -1,0 +1,1 @@
+As the consulted member, ask a follow-up in the existing Graph consultation. Supply `conversation_id`, its latest `reply_to` message ID, `text`, and a stable `request_key`; include shareable `artifact_refs` when needed. The call waits for the reply or timeout; it does not create a separate consultation.

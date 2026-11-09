@@ -18,7 +18,10 @@ import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { computeNonMessageTokens } from "@oh-my-pi/pi-tui/status-line/context-usage";
 import * as snapcompact from "@oh-my-pi/snapcompact";
+import { withOfficialAnthropicEndpoint } from "./helpers/anthropic-endpoint";
 import { rejectionOf } from "./helpers/rejection";
+
+withOfficialAnthropicEndpoint();
 
 const SHARE = 0.5;
 const TARGET = 0.6;

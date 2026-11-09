@@ -11,6 +11,35 @@ const CR = 0x0d;
 // so one oversized frame does not pin its peak buffer for the stream's life.
 const CONCAT_SINK_RETAIN_BYTES = 1024 * 1024;
 
+export class TextReadError extends Error {
+	constructor(readonly code: "too_large" | "invalid_utf8") {
+		super(code === "too_large" ? "Text input exceeds byte limit" : "Text input is not valid UTF-8");
+		this.name = "TextReadError";
+	}
+}
+
+/** Read complete UTF-8 without truncation or replacement; cancel the source on rejection. */
+export async function readBoundedUtf8(stream: ReadableStream<Uint8Array>, maxBytes: number): Promise<string> {
+	if (!Number.isSafeInteger(maxBytes) || maxBytes < 0) throw new RangeError("Invalid text byte limit");
+	const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
+	const parts: string[] = [];
+	let size = 0;
+	const decode = (chunk?: Uint8Array): string => {
+		try {
+			return decoder.decode(chunk, { stream: chunk !== undefined });
+		} catch {
+			throw new TextReadError("invalid_utf8");
+		}
+	};
+	for await (const chunk of abortableSource(stream)) {
+		if (chunk.byteLength > maxBytes - size) throw new TextReadError("too_large");
+		size += chunk.byteLength;
+		parts.push(decode(chunk));
+	}
+	parts.push(decode());
+	return parts.join("");
+}
+
 /**
  * Split a byte stream on LF boundaries.
  *

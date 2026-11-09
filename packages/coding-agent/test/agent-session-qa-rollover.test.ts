@@ -27,12 +27,12 @@ import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { TempDir, withTimeout } from "@oh-my-pi/pi-utils";
 import { createInMemoryAuthStorage } from "./helpers/agent-session-setup";
 
-// Billed occupancy opens the warning band while the smaller raw tool result
-// makes the local rewrite useful. A 300K window leaves reporting capacity beyond
-// the fixed 200K ordinary stop; the configured 100K trigger must not replace it.
-const HARD = 200_000;
-const WARNING = 120_000;
-const WARNED_INPUT = 120_500;
+// The 300K fixture has a 255K report budget and a 4,096-token safety gap.
+// The configured general compaction trigger must not replace QA's boundaries.
+const HARD = 250_904;
+const HINT = 100_000;
+const WARNING = 150_542;
+const WARNED_INPUT = 151_000;
 const RAW_MARKER = "QA_RAW_TOOL_PAYLOAD_ONLY";
 const RAW_RESULT = `${RAW_MARKER}\n${"working observation 17; ".repeat(600)}`;
 const SUMMARY = "Parser changes saved in src/parser.ts. Empty-input check passed. Integration remains unverified.";
@@ -143,12 +143,14 @@ function warningMessages(request: Request): AgentMessage[] {
 	return request.messages.filter(message => message.role === "custom" && message.customType === "qa-rollover-warning");
 }
 
-/** Read the cycle correlation from either a soft warning or a direct hard report. */
+/** Read the cycle correlation from any advisory or a direct hard report. */
 function cycleId(request: Request): string {
 	const warning = request.messages.findLast(
 		message =>
 			message.role === "custom" &&
-			(message.customType === "qa-rollover-warning" || message.customType === "qa-rollover-hard-report"),
+			(message.customType === "qa-rollover-hint" ||
+				message.customType === "qa-rollover-warning" ||
+				message.customType === "qa-rollover-hard-report"),
 	);
 	const text = warning && "content" in warning ? String(warning.content) : "";
 	const id = text.match(/\bqa:[\w:.-]+/)?.[0];
@@ -446,9 +448,15 @@ describe("AgentSession cooperative QA rollover", () => {
 		const baseline = fixed + tokenizer.countMessages([earlierUser, earlierWork, resultBase]) + pending;
 		// Test-mode counting is bytes/4. Four ASCII bytes advance exactly one
 		// token, including the real tool envelope, fixed instructions and input.
+		// Keep each persisted text block under the journal's truncation limit.
+		const padding = "x".repeat(4 * (target - baseline));
 		const result = {
 			...resultBase,
-			content: [{ type: "text" as const, text: RAW_MARKER + "x".repeat(4 * (target - baseline)) }],
+			content: [
+				{ type: "text" as const, text: RAW_MARKER + padding.slice(0, 400_000) },
+				{ type: "text" as const, text: padding.slice(400_000, 800_000) },
+				{ type: "text" as const, text: padding.slice(800_000) },
+			],
 		};
 		const history = [earlierUser, earlierWork, result];
 		const actual = fixed + tokenizer.countMessages(history) + pending;
@@ -917,6 +925,37 @@ describe("AgentSession cooperative QA rollover", () => {
 	});
 
 	it.each([
+		{ occupancy: HINT - 1, hints: 0 },
+		{ occupancy: HINT, hints: 1 },
+	])("starts its optional hint exactly at H (occupancy=$occupancy)", async ({ occupancy, hints }) => {
+		const h = await createHarness(hints ? [checkpoint(), () => finalAnswer()] : [() => finalAnswer()]);
+		await seedExactOccupancy(h, occupancy);
+		await run(h.session);
+
+		expect(h.calls[0]!.messages.filter(message => message.role === "custom" && message.customType === "qa-rollover-hint"))
+			.toHaveLength(hints);
+		expect(warningMessages(h.calls[0]!)).toHaveLength(0);
+		expect(h.calls[0]!.toolChoice).toBeUndefined();
+		expect(h.calls).toHaveLength(hints ? 2 : 1);
+		expect(checkpoints(await h.durableEntries())).toHaveLength(hints);
+	});
+
+	it("escalates a hint to a warning in the same cycle without restricting ordinary work", async () => {
+		const h = await createHarness([() => work(), checkpoint(), () => finalAnswer()]);
+		await seedExactOccupancy(h, HINT);
+		await run(h.session);
+
+		expect(h.calls).toHaveLength(3);
+		expect(cycleId(h.calls[0]!)).toBe(cycleId(h.calls[1]!));
+		expect(warningMessages(h.calls[0]!)).toHaveLength(0);
+		expect(warningMessages(h.calls[1]!)).toHaveLength(1);
+		expect(h.calls[0]!.toolChoice).toBeUndefined();
+		expect(h.calls[1]!.toolChoice).toBeUndefined();
+		expect(h.executions).toHaveLength(1);
+		expect(checkpoints(await h.durableEntries())).toHaveLength(1);
+	});
+
+	it.each([
 		{ occupancy: WARNING - 1, warnings: 0 },
 		{ occupancy: WARNING, warnings: 1 },
 	])("starts its warning exactly at W, not below it (occupancy=$occupancy)", async ({ occupancy, warnings }) => {
@@ -1088,8 +1127,8 @@ describe("AgentSession cooperative QA rollover", () => {
 	);
 
 	it.each([
-		{ occupancy: 71_567, warnings: 0 },
-		{ occupancy: 71_568, warnings: 1 },
+		{ occupancy: 47_711, warnings: 0 },
+		{ occupancy: 47_712, warnings: 1 },
 	])(
 		"clamps the warning below 120K for a smaller safe window (occupancy=$occupancy)",
 		async ({ occupancy, warnings }) => {

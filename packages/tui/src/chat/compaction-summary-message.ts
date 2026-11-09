@@ -31,6 +31,8 @@ function compactionAmount(message: CompactionSummaryMessage): string | undefined
 
 interface SummaryDividerOptions {
 	label: () => string;
+	/** Label without decorative or secondary content for narrow viewports. */
+	narrowLabel?: () => string;
 	/** Themed spans of the label for native terminals. */
 	nativeLabel: () => TspSpan[];
 	detailMarkdown: () => string;
@@ -46,10 +48,12 @@ interface SummaryDividerOptions {
  */
 class DividerSummary implements Component {
 	readonly #label: () => string;
+	readonly #narrowLabel: (() => string) | undefined;
 	#cache: { width: number; lines: readonly string[] } | undefined;
 
-	constructor(label: () => string) {
+	constructor(label: () => string, narrowLabel?: () => string) {
 		this.#label = label;
+		this.#narrowLabel = narrowLabel;
 	}
 
 	invalidate(): void {
@@ -77,8 +81,10 @@ class DividerSummary implements Component {
 		// ` label hint ` framed by rules on both sides.
 		const remaining = width - plainWidth - 2;
 		if (remaining < 4) {
-			// Too narrow for a framed rule — emit the bare label.
-			return truncateToWidth(theme.fg("muted", label), width);
+			// Keep the meaningful label when decoration or metadata would clip it.
+			const narrowLabel = this.#narrowLabel?.() ?? label;
+			const text = Bun.stringWidth(label, { countAnsiEscapeCodes: false }) <= width ? label : narrowLabel;
+			return truncateToWidth(theme.fg("muted", text), width);
 		}
 		const left = Math.floor(remaining / 2);
 		const right = remaining - left;
@@ -173,7 +179,7 @@ class SummaryMessageComponent implements Component {
 
 	#createDisclosure(expanded: boolean): Disclosure {
 		return new Disclosure({
-			summary: new DividerSummary(this.#options.label),
+			summary: new DividerSummary(this.#options.label, this.#options.narrowLabel),
 			body: () => this.#detailBox(),
 			expanded,
 		});
@@ -209,6 +215,7 @@ export class CompactionSummaryMessageComponent extends SummaryMessageComponent {
 			// A dead-end warning stamped by the progress guard badges the bar;
 			// the full text lives in the ctrl+o detail block below.
 			label: () => compactionLabel(message),
+			narrowLabel: () => (message.method && COMPACTION_METHOD_LABELS[message.method]) || "compacted",
 			nativeLabel: () => compactionNativeLabel(message),
 			nativeDetail: () => compactionNativeDetail(message),
 			detailMarkdown: () => compactionDetailMarkdown(message),

@@ -8,6 +8,12 @@
 - Added `singleLine` and `finiteWidth` to `utils` for row-confined text and cell widths
 - `Editor.onPredictionAccepted` and `Editor.onPredictionShown` report when Tab or Right inserts the rest of the composer prediction and when a frame paints it (at least one cell in the terminal, or the ghost on a native editor node) ([#17739](https://github.com/can1357/oh-my-pi/pull/17739) by [@wolfiesch](https://github.com/wolfiesch))
 
+### Fixed
+
+- Tmux capability queries allow the same two-second timeout as terminal identification, avoiding false negatives when starting a tmux client is slow on a loaded host.
+- Narrow compaction dividers retain the compaction label rather than clipping it behind the decorative icon.
+- Process monitoring now shows unknown ownership separately from running or stopped processes, without a misleading uptime.
+
 ## [18.15.0] - 2026-11-01
 
 ### Breaking Changes

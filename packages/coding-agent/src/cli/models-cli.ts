@@ -44,6 +44,10 @@ export interface ModelsCommandArgs {
 		noExtensions?: boolean;
 		/** Extra `config.yml` overlays to apply for this invocation. */
 		config?: string[];
+		/** One borderless line per model; implied for non-TTY stdout. */
+		compact?: boolean;
+		/** Bare `omp models`: print one provider/count line instead of every model. */
+		index?: boolean;
 	};
 }
 
@@ -179,6 +183,30 @@ function boxTable(columns: BoxColumn[], rows: string[][]): string[] {
 	return lines;
 }
 
+/** Borderless variant of {@link boxTable}: two-space columns, one dim header row. */
+function plainTable(columns: BoxColumn[], rows: string[][]): string[] {
+	const widths = columns.map((column, index) =>
+		Math.max(Bun.stringWidth(column.header), ...rows.map(row => Bun.stringWidth(row[index] ?? ""))),
+	);
+	const renderRow = (cells: string[], bold: boolean): string =>
+		columns
+			.map((column, index) => {
+				const cell = padCell(cells[index] ?? "", widths[index]!, column.align);
+				return bold ? chalk.bold(cell) : cell;
+			})
+			.join("  ")
+			.trimEnd();
+	return [
+		chalk.dim(
+			renderRow(
+				columns.map(column => column.header),
+				false,
+			),
+		),
+		...rows.map(row => renderRow(row, false)),
+	];
+}
+
 /**
  * The two registry reads the listing performs. Structural so the renderer can be
  * exercised without booting a full {@link ModelRegistry}.
@@ -199,6 +227,8 @@ export function renderProviderModels(
 	pattern: string | undefined,
 	json: boolean,
 	kind: ModelKind | "all" = "chat",
+	compact = false,
+	index = false,
 ): void {
 	const available = source.getAvailable(kind);
 	const needle = pattern?.toLowerCase();
@@ -250,6 +280,20 @@ export function renderProviderModels(
 		return;
 	}
 
+	if (index && !needle) {
+		const counts = new Map<string, number>();
+		for (const model of filtered) counts.set(model.provider, (counts.get(model.provider) ?? 0) + 1);
+		for (const provider of [...counts.keys()].sort()) {
+			writeLine(`${chalk.bold.cyan(provider)} ${chalk.dim(`(${counts.get(provider)})`)}`);
+		}
+		writeLine(
+			chalk.dim(
+				`${counts.size} provider(s), ${filtered.length} model(s). \`omp models <provider>\` for details, \`omp models --full\` for all.`,
+			),
+		);
+		return;
+	}
+
 	// One section per provider: bold heading + a box table of that provider's models.
 	const byProvider = new Map<string, Model<Api>[]>();
 	for (const model of filtered.slice().sort(byProviderThenId)) {
@@ -275,7 +319,7 @@ export function renderProviderModels(
 			// models the catalog marks text-only (`compat.stripImageInput`, #9697).
 			sendsImageInputOnWire(model) ? "yes" : "no",
 		]);
-		for (const line of boxTable(
+		for (const line of (compact ? plainTable : boxTable)(
 			[
 				{ header: "model" },
 				{ header: "context", align: "right" },
@@ -304,6 +348,10 @@ export interface RunModelsListingOptions {
 	json?: boolean;
 	/** Catalog kind to list; defaults to chat models. */
 	kind?: ModelKind | "all";
+	/** Borderless one-line-per-model rendering, for pipes and agents. */
+	compact?: boolean;
+	/** Provider/count summary instead of every model; bare `omp models` sets this. */
+	index?: boolean;
 	/** CLI-supplied extension paths (e.g. from `-e <path>`). */
 	additionalExtensionPaths?: string[];
 	/** Extension paths configured under `extensions:` in user settings. */
@@ -322,6 +370,8 @@ export async function runModelsListing(options: RunModelsListingOptions): Promis
 		pattern,
 		json = false,
 		kind = "chat",
+		compact = false,
+		index = false,
 		additionalExtensionPaths = [],
 		settingsExtensions = [],
 		disabledExtensionIds = [],
@@ -369,7 +419,7 @@ export async function runModelsListing(options: RunModelsListingOptions): Promis
 		for (const warning of modelRegistry.drainConfigWarnings()) {
 			process.stderr.write(`${chalk.yellow(`Warning: ${warning}`)}\n`);
 		}
-		renderProviderModels(modelRegistry, action, pattern, json, kind);
+		renderProviderModels(modelRegistry, action, pattern, json, kind, compact, index);
 	} finally {
 		await emitSessionShutdownEvent(extensionRunner);
 	}
@@ -413,6 +463,8 @@ export async function runModelsCommand(command: ModelsCommandArgs): Promise<void
 			pattern,
 			json,
 			kind,
+			compact: command.flags.compact ?? !process.stdout.isTTY,
+			index: command.flags.index ?? false,
 			additionalExtensionPaths: cliExtensionPaths,
 			settingsExtensions: cfgExtensions.get(settings),
 			disabledExtensionIds: cfgDisabledExtensions.get(settings),

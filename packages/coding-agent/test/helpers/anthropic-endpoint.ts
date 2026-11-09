@@ -1,27 +1,21 @@
 import { afterEach, beforeEach } from "bun:test";
 
 /**
- * Neutralize `ANTHROPIC_BASE_URL` for the calling test file.
- *
- * The variable reroutes the effective Anthropic endpoint, and every
- * "official endpoint" behavior — eager tool-input streaming, long cache
- * retention, the Cowork TLS profile, the Claude Code session header — switches
- * off once it points elsewhere. A contributor running a gateway, or running the
- * suite from inside another agent, otherwise sees these tests fail on a clean
- * checkout. Tests that exercise gateway routing set the variable explicitly
- * with `withEnv` inside the test body, which still wins over this reset.
+ * Neutralize Anthropic gateway and Foundry routing for the calling test file.
+ * Tests that exercise rerouting can set the variables explicitly inside the test.
  */
 export function withOfficialAnthropicEndpoint(): void {
-	let previous: string | undefined;
+	const keys = ["ANTHROPIC_BASE_URL", "CLAUDE_CODE_USE_FOUNDRY"] as const;
+	let previous: (string | undefined)[];
 	beforeEach(() => {
-		previous = Bun.env.ANTHROPIC_BASE_URL;
-		delete Bun.env.ANTHROPIC_BASE_URL;
+		previous = keys.map(key => Bun.env[key]);
+		for (const key of keys) delete Bun.env[key];
 	});
 	afterEach(() => {
-		if (previous === undefined) {
-			delete Bun.env.ANTHROPIC_BASE_URL;
-		} else {
-			Bun.env.ANTHROPIC_BASE_URL = previous;
+		for (const [index, key] of keys.entries()) {
+			const value = previous[index];
+			if (value === undefined) delete Bun.env[key];
+			else Bun.env[key] = value;
 		}
 	});
 }

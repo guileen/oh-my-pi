@@ -37,6 +37,7 @@ export const LineMatcher = nativeBindings.LineMatcher;
 export const LiveWebRtcPeer = nativeBindings.LiveWebRtcPeer;
 export const MacAppearanceObserver = nativeBindings.MacAppearanceObserver;
 export const NativeOAuthCallback = nativeBindings.NativeOAuthCallback;
+export const OwnedChild = nativeBindings.OwnedChild;
 export const PipeStreams = nativeBindings.PipeStreams;
 export const PowerAssertion = nativeBindings.PowerAssertion;
 export const Process = nativeBindings.Process;

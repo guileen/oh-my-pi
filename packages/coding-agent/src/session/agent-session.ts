@@ -2859,8 +2859,8 @@ export class AgentSession implements SettingsScope {
 			),
 		);
 		// A request past the cap mid-run stops the run before it is sent: no turn opens, nothing is billed.
-		// The gate is registered only while a cap is set: any before-model-call gate also turns a user abort
-		// before the next request into a clean stop, which leaves no interrupted turn for `/retry`.
+		// The gate is registered only while a cap is set, avoiding an unnecessary
+		// admission check on every provider request.
 		let removeCostCapGate: (() => void) | undefined;
 		const syncCostCapGate = () => {
 			if (this.#costGate.capped) {
@@ -5586,6 +5586,8 @@ export class AgentSession implements SettingsScope {
 		if (!options.autoContinue) return false;
 		const activeGoal = this.#goalModeState?.enabled === true && this.#goalModeState.goal.status === "active";
 		if (options.terminalTextAnswer && !activeGoal) return false;
+		// A queued background completion will start the next turn itself.
+		if (this.agent.hasBackgroundCompletions?.()) return true;
 		return this.#scheduleAutoContinuePrompt(options.generation);
 	}
 

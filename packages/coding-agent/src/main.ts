@@ -26,6 +26,7 @@ import * as postmortem from "@oh-my-pi/pi-utils/postmortem";
 import { fuzzyFilter } from "@oh-my-pi/pi-tui/fuzzy";
 import chalk from "@oh-my-pi/pi-utils/chalk";
 import { reset as resetCapabilities } from "./capability";
+import { createLocalGraphToolOptions } from "./graph/local-policy";
 import {
 	type Args,
 	reportInvalidFlagValues,
@@ -2366,6 +2367,13 @@ export async function runRootCommand(
 			options.telemetry = startupTelemetry;
 			options.extensions = startupExtensions;
 			options.onPrewalkWarning = startupWarning;
+			// The CLI session runs as the local profile owner. Embedded hosts must supply
+			// their own principal-scoped policy instead of inheriting this one.
+			// The default root is <agent dir>/graphs; passing the agent dir itself opens a
+			// second, empty store and silently hides every imported Graph.
+			options.graph = createLocalGraphToolOptions({
+				cwd: options.cwd ?? process.cwd(),
+			});
 			return options;
 		};
 		let sessionOptions = await buildStartupSessionOptions(sessionManager);

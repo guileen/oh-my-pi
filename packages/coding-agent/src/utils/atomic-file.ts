@@ -1,4 +1,5 @@
 import * as fs from "node:fs";
+import * as path from "node:path";
 import { hasFsCode, isEexist, isEnoent, logger, toError } from "@oh-my-pi/pi-utils";
 
 /**
@@ -68,8 +69,15 @@ async function replaceAfterWindowsRenameFailure(
  * The staged file is created with `mode` (0600 by default) and published with
  * that mode, so the destination stays readable only by its owner even when it
  * carries a secret.
+ * `syncDirectory` also flushes the published directory entry on Unix. Windows
+ * does not support opening directories for fsync through node:fs.
  */
-export async function writeFileAtomically(filePath: string, content: string, mode: number = 0o600): Promise<void> {
+export async function writeFileAtomically(
+	filePath: string,
+	content: string,
+	mode: number = 0o600,
+	syncDirectory = false,
+): Promise<void> {
 	const tempPath = `${filePath}.${process.pid}.${crypto.randomUUID()}.tmp`;
 	let removeTemp = false;
 	try {
@@ -85,6 +93,14 @@ export async function writeFileAtomically(filePath: string, content: string, mod
 		await fs.promises.chmod(tempPath, mode);
 		await replaceFileAtomically(tempPath, filePath);
 		removeTemp = false;
+		if (syncDirectory && process.platform !== "win32") {
+			const directory = await fs.promises.open(path.dirname(filePath), "r");
+			try {
+				await directory.sync();
+			} finally {
+				await directory.close();
+			}
+		}
 	} finally {
 		if (removeTemp) {
 			await fs.promises.rm(tempPath, { force: true }).catch(() => {});
@@ -96,7 +112,12 @@ export async function writeFileAtomically(filePath: string, content: string, mod
  * Synchronous sibling of {@link writeFileAtomically} for callers that cannot
  * await, such as the boot-time config migration.
  */
-export function writeFileAtomicallySync(filePath: string, content: string, mode: number = 0o600): void {
+export function writeFileAtomicallySync(
+	filePath: string,
+	content: string,
+	mode: number = 0o600,
+	syncDirectory = false,
+): void {
 	const tempPath = `${filePath}.${process.pid}.${crypto.randomUUID()}.tmp`;
 	let fd: number | undefined;
 	try {
@@ -108,6 +129,14 @@ export function writeFileAtomicallySync(filePath: string, content: string, mode:
 		// The umask narrows the mode passed to open(); restore it explicitly.
 		fs.chmodSync(tempPath, mode);
 		fs.renameSync(tempPath, filePath);
+		if (syncDirectory && process.platform !== "win32") {
+			const directory = fs.openSync(path.dirname(filePath), "r");
+			try {
+				fs.fsyncSync(directory);
+			} finally {
+				fs.closeSync(directory);
+			}
+		}
 	} catch (error) {
 		if (fd !== undefined) {
 			try {

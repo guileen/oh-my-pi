@@ -7,6 +7,10 @@
 - `acp` runtime validators (`zNewSessionResponse`, `zSessionNotification`, …) now report each failing field's path and reason in `error.issues` instead of a single `Invalid <label>`; `ValidationError` issue paths are typed `PropertyKey[]` ([#17699](https://github.com/can1357/oh-my-pi/pull/17699))
 ### Added
 
+- Added strict YAML frontmatter parsing that preserves Markdown body text and rejects duplicate keys and recursive aliases.
+- Added exact decimal cost addition and comparison without floating-point rounding; unknown amounts retain only known subtotals.
+- Added bounded UTF-8 stream reading that preserves original text and cancels oversized or malformed input instead of truncating or repairing it.
+
 - Added `isPidAlive` (signal-0 liveness probe) and `asStrictBytes` (a `Uint8Array` narrowed to its own `ArrayBuffer` for WebCrypto)
 
 ## [18.15.0] - 2026-11-01

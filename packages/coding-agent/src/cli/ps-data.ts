@@ -29,6 +29,7 @@ import {
 	type PsTarget,
 } from "@oh-my-pi/pi-tui/apps/ps-data";
 import { parseDaemonSnapshot, parseDaemonSpec } from "../launch/protocol";
+import { type OwnedSupervisorRef, parseOwnedSupervisorRef, queryOwnedSupervisor } from "../launch/owned-supervisor";
 
 const PROJECT_SCOPE_KEY = /^[0-9a-f]{16}$/;
 /** Hard SIGTERM->SIGKILL grace used by `kill`; effectively immediate. */
@@ -136,14 +137,18 @@ export async function scopeClient(scope: PsScope): Promise<DaemonBrokerClient> {
 }
 
 /**
- * Persisted `{snapshot, spec}` pairs from `<runtimeDir>/daemons/<name>/`: the
- * spec lives in `spec.json`, or inside `meta.json` for records written by
- * older brokers.
+ * Persisted snapshot/spec pairs and private recovery intent from
+ * `<runtimeDir>/daemons/<name>/`: the spec lives in `spec.json`, or inside
+ * `meta.json` for records written by older brokers.
  */
-async function readPersistedDaemons(
-	runtimeDir: string,
-): Promise<Map<string, { snapshot: DaemonSnapshot; spec: DaemonSpec }>> {
-	const persisted = new Map<string, { snapshot: DaemonSnapshot; spec: DaemonSpec }>();
+interface PersistedDaemon {
+	snapshot: DaemonSnapshot;
+	spec: DaemonSpec;
+	stopRequested: boolean;
+	supervisor?: OwnedSupervisorRef;
+}
+async function readPersistedDaemons(runtimeDir: string): Promise<Map<string, PersistedDaemon>> {
+	const persisted = new Map<string, PersistedDaemon>();
 	const root = path.join(runtimeDir, "daemons");
 	for (const entry of await readdirQuiet(root)) {
 		if (!entry.isDirectory()) continue;
@@ -151,7 +156,22 @@ async function readPersistedDaemons(
 			const stored = await readStoredDaemonRecord(path.join(root, entry.name));
 			if (!stored) continue;
 			const snapshot = parseDaemonSnapshot(stored.meta.daemon);
-			persisted.set(snapshot.name, { snapshot, spec: parseDaemonSpec(stored.spec) });
+			let supervisor: OwnedSupervisorRef | undefined;
+			if ("supervisor" in stored.meta && stored.meta.supervisor !== undefined) {
+				try {
+					const ref = parseOwnedSupervisorRef(stored.meta.supervisor);
+					if (
+						ref.dir === path.join(root, entry.name, `owned-${snapshot.id}-${snapshot.startedAt}`) &&
+						ref.generation === `${snapshot.id}:${snapshot.startedAt}`
+					)
+						supervisor = ref;
+				} catch {
+					// Keep the record visible, but never trust malformed process authority.
+				}
+			}
+			const stopRequested =
+				("stopRequested" in stored.meta && stored.meta.stopRequested === true) || snapshot.state === "stopping";
+			persisted.set(snapshot.name, { snapshot, spec: parseDaemonSpec(stored.spec), supervisor, stopRequested });
 		} catch {
 			// Malformed or torn metadata is skipped; the broker rewrites it on next start.
 		}
@@ -159,21 +179,9 @@ async function readPersistedDaemons(
 	return persisted;
 }
 
-function processAlive(pid: number | undefined): boolean {
-	if (pid === undefined) return false;
-	try {
-		process.kill(pid, 0);
-		return true;
-	} catch {
-		return false;
-	}
-}
-
 /**
- * Collect daemons for one scope. Live brokers are authoritative; dead scopes
- * fall back to persisted snapshots, downgrading non-detached "running" records
- * to exited (their broker took them down with it) and flagging detached
- * survivors as unsupervised.
+ * Collect daemons for one scope. Live brokers are authoritative; offline state
+ * comes only from an authenticated supervisor, never a PID liveness guess.
  */
 export async function collectScope(scope: PsScope): Promise<PsScopeReport> {
 	const persisted = await readPersistedDaemons(scope.runtimeDir);
@@ -204,13 +212,33 @@ export async function collectScope(scope: PsScope): Promise<PsScopeReport> {
 		}
 	}
 	const daemons: PsDaemonRow[] = [];
-	for (const { snapshot, spec } of persisted.values()) {
+	for (const { snapshot, spec, supervisor, stopRequested } of persisted.values()) {
 		const row: PsDaemonRow = { snapshot, command: formatCommand(spec), cwd: spec.cwd, supervised: false };
 		if (!TERMINAL_STATES[snapshot.state]) {
-			const survivor = spec.detached && snapshot.state !== "stopping" && processAlive(snapshot.pid);
-			if (!survivor) {
-				// The broker died and took its non-detached children with it.
-				row.snapshot = { ...snapshot, state: "exited", exitReason: snapshot.exitReason ?? "broker exited" };
+			row.snapshot = { ...snapshot, state: "unknown", exitReason: "Process ownership is unavailable" };
+			if (supervisor) {
+				try {
+					const status = await queryOwnedSupervisor(supervisor, 250);
+					if (status.state === "running")
+						row.snapshot = {
+							...snapshot,
+							state: snapshot.state === "unknown" ? "running" : snapshot.state,
+							pid: status.pid ?? undefined,
+							exitReason: undefined,
+						};
+					else if (status.state === "exited") {
+						const code = status.exitCode ?? (status.signal === null ? undefined : 128 + status.signal);
+						row.snapshot = {
+							...snapshot,
+							state: stopRequested || code === 0 ? "exited" : "failed",
+							exitCode: code,
+							pid: undefined,
+							exitReason: status.error,
+						};
+					}
+				} catch {
+					// Missing configuration is uncertainty, not proof of application exit.
+				}
 			}
 		}
 		daemons.push(row);

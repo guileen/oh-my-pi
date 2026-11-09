@@ -14,7 +14,7 @@ import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { $ } from "bun";
-import { dlopen, FFIType, ptr } from "bun:ffi";
+import { dlopen, FFIType, type Pointer, ptr } from "bun:ffi";
 import { COMPRESS_SCRATCH_PREFIX } from "@oh-my-pi/omp-stats/parser";
 import { isEnoent } from "@oh-my-pi/pi-utils";
 import { FileSessionStorage } from "../session/session-storage";
@@ -295,6 +295,29 @@ function unchangedSinceSelection(candidate: CompressCandidate): boolean {
 	);
 }
 
+/** Restore the exact timestamp on the copy; ditto may truncate it to whole seconds. */
+function restoreMtime(
+	copyPath: string,
+	mtimeNs: bigint,
+	futimens: (fd: number, times: Pointer) => number,
+): void {
+	const fd = fsSync.openSync(copyPath, "r");
+	try {
+		const atimeNs = fsSync.fstatSync(fd, { bigint: true }).atimeNs;
+		const split = (ns: bigint): [bigint, bigint] => {
+			const seconds = ns / 1_000_000_000n;
+			const remainder = ns % 1_000_000_000n;
+			return remainder < 0n ? [seconds - 1n, remainder + 1_000_000_000n] : [seconds, remainder];
+		};
+		const times = new BigInt64Array([...split(atimeNs), ...split(mtimeNs)]);
+		if (futimens(fd, ptr(times)) !== 0 || fsSync.fstatSync(fd, { bigint: true }).mtimeNs !== mtimeNs) {
+			throw new Error("could not preserve compressed copy mtime");
+		}
+	} finally {
+		fsSync.closeSync(fd);
+	}
+}
+
 /**
  * Rename `copyPath` over `candidate.path` if the original is unchanged, checked
  * immediately before the rename. Transcripts swap under the session publish
@@ -344,24 +367,31 @@ async function compressBatch(
 			result.errors.push(`${dir}: ditto exited ${copy.exitCode}: ${copy.stderr.toString().trim()}`);
 			return;
 		}
-		const storage = new FileSessionStorage();
-		for (const [index, candidate] of batch.entries()) {
-			const copyPath = path.join(scratch, path.basename(candidate.path));
-			try {
-				const copied = await fs.lstat(copyPath);
-				if (copied.size !== candidate.bytes || (await sha256File(copyPath)) !== digests[index]) {
-					result.errors.push(`${candidate.path}: compressed copy does not match the original`);
-					continue;
+		const libc = dlopen("/usr/lib/libSystem.B.dylib", {
+			futimens: { args: [FFIType.i32, FFIType.ptr], returns: FFIType.i32 },
+		});
+		try {
+			const storage = new FileSessionStorage();
+			for (const [index, candidate] of batch.entries()) {
+				const copyPath = path.join(scratch, path.basename(candidate.path));
+				try {
+					const copied = await fs.lstat(copyPath);
+					if (copied.size !== candidate.bytes || (await sha256File(copyPath)) !== digests[index]) {
+						result.errors.push(`${candidate.path}: compressed copy does not match the original`);
+						continue;
+					}
+					// Incompressible: APFS stored the copy uncompressed, so the original stays.
+					if (copied.blocks * 512 >= candidate.allocated) continue;
+					restoreMtime(copyPath, candidate.mtimeNs, libc.symbols.futimens);
+					if (!swapIfUnchanged(storage, candidate, copyPath, transcripts.has(candidate.path))) continue;
+					result.compressed += 1;
+					result.allocatedAfter += copied.blocks * 512 - candidate.allocated;
+				} catch (error) {
+					result.errors.push(`${candidate.path}: ${errorMessage(error)}`);
 				}
-				// Incompressible: APFS stored the copy uncompressed, so the original stays.
-				if (copied.blocks * 512 >= candidate.allocated) continue;
-				// ditto copied the nanosecond mtime; the rename keeps it.
-				if (!swapIfUnchanged(storage, candidate, copyPath, transcripts.has(candidate.path))) continue;
-				result.compressed += 1;
-				result.allocatedAfter += copied.blocks * 512 - candidate.allocated;
-			} catch (error) {
-				result.errors.push(`${candidate.path}: ${errorMessage(error)}`);
 			}
+		} finally {
+			libc.close();
 		}
 	} catch (error) {
 		result.errors.push(`${dir}: ${errorMessage(error)}`);

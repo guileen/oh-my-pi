@@ -29,6 +29,10 @@ export const benchHelp = {
 		"Benchmark models: TTFT/prefill vs decode throughput with p50/p95, across chat, prefill, generation, and prompt-cache workloads, or single-user vs parallel load (--detailed)",
 } satisfies CommandMetadata;
 
+export const botHelp = {
+	description: "Create restricted named Bots, submit Jobs, and observe or control their durable execution",
+} satisfies CommandMetadata;
+
 export const browserRelayHelp = {
 	description: "Run the local CDP relay that lets the browser prelude drive your own Chrome tabs",
 } satisfies CommandMetadata;
@@ -75,6 +79,10 @@ export const ifBenchHelp = {
 } satisfies CommandMetadata;
 export const gitHelp = {
 	description: "Interactive fullscreen git UI: split diff viewer, staging sidebar, and commit composer",
+} satisfies CommandMetadata;
+
+export const graphHelp = {
+	description: "Author Graph definitions or run supported bounded local Graphs. Detached execution requires a trusted embedding.",
 } satisfies CommandMetadata;
 
 export const findHelp = {

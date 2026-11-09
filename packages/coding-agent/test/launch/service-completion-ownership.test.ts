@@ -15,6 +15,7 @@ import {
 import { listServices, sendService, startService, waitForOwnedServiceCompletion } from "../../src/launch/services";
 import type { ToolSession } from "../../src/tools";
 import { BashTool } from "../../src/tools/bash";
+import * as atomicFiles from "../../src/utils/atomic-file";
 
 interface EmbeddedBroker {
 	/** Settles once this in-process broker has shut down and flushed its metadata. */
@@ -48,6 +49,69 @@ async function startBroker(projectDir: string, runtimeDir: string): Promise<Embe
 }
 
 describe("session-owned supervised services", () => {
+	it("awaits durable launch admission and subscribes completions using its authoritative owner", async () => {
+		using tempDir = TempDir.createSync("@omp-service-durable-owner-");
+		const projectDir = path.join(tempDir.path(), "project");
+		const runtimeDir = path.join(tempDir.path(), "runtime");
+		await fs.mkdir(projectDir);
+		const client = await brokerClients.createDaemonBrokerClient(projectDir, { runtimeDir, idleGraceMs: 5_000 });
+		const previousTitle = process.title;
+		const broker = await startBroker(projectDir, runtimeDir);
+		const entered = Promise.withResolvers<void>();
+		const persisted = Promise.withResolvers<void>();
+		const delivered = Promise.withResolvers<DaemonCompletionNotification>();
+		const session: ToolSession = {
+			cwd: projectDir,
+			hasUI: false,
+			settings: Settings.isolated(),
+			getSessionFile: () => null,
+			getSessionSpawns: () => "*",
+			getAgentId: () => "Main",
+			getSessionId: () => "transient-session",
+			prepareServiceLaunch: async operation => {
+				expect(operation.owner).toBe("transient-session");
+				entered.resolve();
+				await persisted.promise;
+				return { launch_intent_id: "durable-owner-intent", session_owner_id: "durable-owner", owner_epoch: "1" };
+			},
+			queueLaunchCompletion: async notification => {
+				delivered.resolve(notification);
+			},
+		};
+		let started: Promise<unknown> | undefined;
+		try {
+			vi.spyOn(brokerClients, "daemonClientForProject").mockResolvedValue(client);
+			// This subscribes the old session identity before launch returns a durable owner.
+			await listServices(session);
+			started = startService(session, {
+				name: "durable-owner-service",
+				command: "echo service-ready; read answer; exit 3",
+				pty: false,
+				ready: { log: "service-ready", timeout: 5 },
+			});
+			await entered.promise;
+			expect(await client.request({ op: "list" })).toEqual({ op: "list", daemons: [] });
+			persisted.resolve();
+			const result = await started;
+			expect(result).toMatchObject({ daemon: { owner: "durable-owner", state: "ready" } });
+			const completed = waitForOwnedServiceCompletion(session);
+			await sendService(session, "durable-owner-service", "go\n");
+			expect(await delivered.promise).toMatchObject({
+				owner: "durable-owner",
+				daemon: { state: "failed", exitCode: 3 },
+			});
+			await completed;
+		} finally {
+			persisted.resolve();
+			await started?.catch(() => undefined);
+			vi.restoreAllMocks();
+			await client.request({ op: "shutdown" }).catch(() => undefined);
+			client.close();
+			await broker.finished;
+			process.title = previousTitle;
+		}
+	}, 15_000);
+
 	it("delivers a failed service only to its session when another session shares the broker", async () => {
 		using tempDir = TempDir.createSync("@omp-service-completion-");
 		const projectDir = path.join(tempDir.path(), "project");
@@ -135,6 +199,21 @@ describe("session-owned supervised services", () => {
 			for (const callback of callbacks) callback();
 		};
 		try {
+			const persist = atomicFiles.writeFileAtomically;
+			const metadataPath = path.join(runtimeDir, "daemons", "old-service", "meta.json");
+			let delayedTerminalWrite = false;
+			vi.spyOn(atomicFiles, "writeFileAtomically").mockImplementation(async (file, content, mode, syncDirectory) => {
+				if (
+					file === metadataPath &&
+					!delayedTerminalWrite &&
+					(JSON.parse(content) as { daemon?: { state?: string } }).daemon?.state === "failed"
+				) {
+					delayedTerminalWrite = true;
+					// Slow durable I/O must not expose exit before completion is replayable.
+					await Bun.sleep(150);
+				}
+				await persist(file, content, mode, syncDirectory);
+			});
 			vi.spyOn(brokerClients, "daemonClientForProject").mockResolvedValue(client);
 			await startService(session, {
 				name: "old-service",
@@ -147,6 +226,12 @@ describe("session-owned supervised services", () => {
 			const exited = await client.request({ op: "wait", name: "old-service", for: "exit", timeoutMs: 5_000 });
 			if (exited.op !== "wait") throw new Error("Expected daemon exit wait");
 			expect(exited.daemon.state).toBe("failed");
+			const beforeResume = (await Bun.file(metadataPath).json()) as {
+				daemon: { state: string };
+				pendingCompletions: DaemonCompletionNotification[];
+			};
+			expect(beforeResume.daemon.state).toBe("failed");
+			expect(beforeResume.pendingCompletions.map(item => item.daemon.name)).toEqual(["old-service"]);
 			expect(deliveries).toEqual([]);
 
 			switchTo("old-session");

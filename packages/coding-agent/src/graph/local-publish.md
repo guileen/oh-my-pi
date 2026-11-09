@@ -1,0 +1,1 @@
+Publish complete UTF-8 text for one declared Graph `output` name. Pass the returned `{id, digest}` reference directly to `graph_complete`. Identical repeat calls return the same reference; different text for the same output is rejected. Does not write workspace files or external targets.

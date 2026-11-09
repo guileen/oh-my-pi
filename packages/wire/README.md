@@ -1,8 +1,8 @@
 # @oh-my-pi/pi-wire
 
-Shared TypeScript wire contracts for omp collab live sessions.
+Shared TypeScript wire contracts and browser-safe Graph observation consumers for omp.
 
-The package contains only JSON-safe protocol shapes and constants. It has no runtime dependencies and is consumed by both the host CLI (`@oh-my-pi/pi-coding-agent`) and browser guest (`@oh-my-pi/collab-web`).
+The package has no runtime dependencies. Its collab contracts are consumed by the host CLI (`@oh-my-pi/pi-coding-agent`) and browser guest (`@oh-my-pi/collab-web`); the separate Graph entry can be consumed without installing the agent or coding-agent packages.
 
 ## Exports
 
@@ -10,6 +10,18 @@ The package contains only JSON-safe protocol shapes and constants. It has no run
 import type { GuestFrame, HostFrame, SessionEntry } from "@oh-my-pi/pi-wire";
 import { COLLAB_PROTO, DEFAULT_RELAY_URL, ENVELOPE_HEADER_LENGTH } from "@oh-my-pi/pi-wire";
 ```
+
+Graph clients use the dedicated entry, which shares its scalar types, record validation and deterministic serializer with the producer:
+
+```ts
+import { GRAPH_WIRE_PROTOCOL, GraphWireSourceState } from "@oh-my-pi/pi-wire/graph";
+import type { GraphCursor, GraphRef, GraphWireSourceFrame } from "@oh-my-pi/pi-wire/graph";
+import { canonicalJson } from "@oh-my-pi/pi-wire/canonical-json";
+```
+
+`GraphWireSourceState` is transport-independent and preserves authorized scopes, atomic snapshots, replay checkpoints and unsupported-state handling. It does not authenticate connections or provide a Host, persistence layer, transport or UI. Graph record validators are available from `@oh-my-pi/pi-wire/graph/wire-records` and `@oh-my-pi/pi-wire/graph/wire-execution-records`.
+
+`validateGraphWireAuthoringRequest`, `validateGraphWireDefinitionFrame`, `validateGraphWireAuthorResultFrame` and `validateGraphWireReconciliationFrame` validate exact definition-authoring envelopes, bounded Markdown, finite JSON and receipt-state coherence without importing a Host. They do not authorize requests, reconcile durable intents or enable execution; those belong to the authenticated transport and common authoring service. Protected definition text must not enter service-worker caches.
 
 Key groups:
 
@@ -21,7 +33,7 @@ Key groups:
 
 ## Protocol boundary
 
-`pi-wire` does not encode, decode, validate, encrypt, or route frames. It defines the shared contract used at those boundaries:
+The collab contract does not encode, decode, validate, encrypt, or route frames. It defines the shared shapes used at those boundaries:
 
 1. callers build a `GuestFrame` or `HostFrame`,
 2. transport code serializes it as JSON inside an encrypted payload,

@@ -1,3 +1,4 @@
+import { Database } from "bun:sqlite";
 import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
@@ -27,6 +28,97 @@ function startBroker(projectDir: string, runtimeDir: string): { listening: Promi
 }
 
 describe("daemon metadata writes", () => {
+	it("does not kill an unrelated live PID retained by a terminal launch ledger entry", async () => {
+		using tempDir = TempDir.createSync("@omp-broker-stale-ledger-");
+		const projectDir = path.join(tempDir.path(), "project");
+		const runtimeDir = path.join(tempDir.path(), "runtime");
+		await fs.mkdir(projectDir);
+		await fs.mkdir(runtimeDir);
+		const victim = Bun.spawn([process.execPath, "-e", "process.stdin.resume()"], {
+			stdin: "pipe",
+			stdout: "ignore",
+			stderr: "ignore",
+		});
+		const launch = { launch_intent_id: "stale-intent", session_owner_id: "owner", owner_epoch: "1" };
+		const daemon = {
+			name: "stale",
+			id: "stale-id",
+			state: "exited",
+			owner: "owner",
+			createdAt: 1,
+			startedAt: 1,
+			exitedAt: 2,
+			restartCount: 0,
+			outputBytes: 0,
+			persist: false,
+			detached: false,
+		};
+		const client = await createDaemonBrokerClient(projectDir, { runtimeDir, idleGraceMs: 5_000 });
+		let broker: { listening: Promise<boolean>; finished: Promise<void> } | undefined;
+		try {
+			await Bun.write(
+				path.join(runtimeDir, "daemons", "stale", "meta.json"),
+				JSON.stringify({
+					daemon,
+					launch,
+					spec: {
+						name: "stale",
+						application: process.execPath,
+						args: [],
+						env: {},
+						cwd: projectDir,
+						pty: false,
+						restart: "no",
+						persist: false,
+						detached: false,
+					},
+				}),
+			);
+			const db = new Database(path.join(runtimeDir, "launch-ledger.sqlite"), { create: true });
+			try {
+				db.exec(
+					"CREATE TABLE launches (id TEXT PRIMARY KEY, data TEXT NOT NULL); CREATE TABLE owners (id TEXT PRIMARY KEY, data TEXT NOT NULL)",
+				);
+				db.query("INSERT INTO launches (id, data) VALUES (?, ?)").run(
+					launch.launch_intent_id,
+					JSON.stringify({
+						...launch,
+						payload: null,
+						name: "stale",
+						cancelled: false,
+						daemon: { ...daemon, state: "running", exitedAt: undefined, pid: victim.pid },
+						disposition: {
+							launch_intent_id: launch.launch_intent_id,
+							state: "running",
+							service: { id: daemon.id, generation: "1" },
+							outcome: null,
+							final: false,
+							error: null,
+						},
+					}),
+				);
+			} finally {
+				db.close();
+			}
+			broker = startBroker(projectDir, runtimeDir);
+			await broker.listening;
+			const result = await client.request({ op: "reconcile_launch", ...launch, mode: "inspect" });
+			if (result.op !== "reconcile_launch") throw new Error("Expected launch reconciliation");
+			expect(result.disposition).toMatchObject({
+				state: "unknown",
+				final: false,
+				error: { code: "cleanup_failed" },
+			});
+			expect(victim.exitCode).toBeNull();
+		} finally {
+			await client.request({ op: "shutdown" }).catch(() => undefined);
+			client.close();
+			await broker?.finished;
+			victim.kill();
+			await victim.exited;
+		}
+	}, 20_000);
+
 	it("does not rewrite settled history on subscriber changes or broker restart", async () => {
 		using tempDir = TempDir.createSync("@omp-broker-metadata-");
 		const projectDir = path.join(tempDir.path(), "project");

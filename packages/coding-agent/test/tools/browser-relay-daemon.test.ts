@@ -327,10 +327,11 @@ try {
 	const starting = start([ownedPort, "1000", VERSION]);
 	let snapshot = await describe();
 	while (snapshot?.state === "exited") snapshot = await describe();
-	const startingPid = snapshot?.pid;
+	// A starting record is visible before its native supervisor reports a PID.
+	const startingId = snapshot?.id;
 	const startingRestarted = await restartRelayDaemon({ cdpUrl: ownedUrl });
 	await starting;
-	const startingKeptPid = (await describe())?.pid;
+	const startingKept = await describe();
 	// Another omp stopped the outdated relay and has not registered its replacement yet.
 	await client.request({ op: "stop", name, timeoutMs: 5_000 });
 	const exitedRestarted = await restartRelayDaemon({ cdpUrl: ownedUrl });
@@ -360,7 +361,7 @@ try {
 			owned,
 			ownedVersionIsCurrent,
 			startingRestarted,
-			startingKept: startingPid !== undefined && startingPid === startingKeptPid,
+			startingKept: startingId !== undefined && startingId === startingKept?.id && startingKept.pid !== undefined,
 			exitedRestarted,
 			exitedVersionIsCurrent,
 			manualOverRecordRestarted,

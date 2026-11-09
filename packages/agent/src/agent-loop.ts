@@ -1413,13 +1413,24 @@ async function runLoopBody(
 							throw error;
 						}
 					}
+					// A gate may stop an aborted run before the next provider request.
+					// If this run already executed tools, retain an interrupted boundary
+					// after their results so the session can retry the failed batch.
+					if (!turnOpen && signal?.aborted && newMessages.some(message => message.role === "toolResult")) {
+						stream.push({ type: "turn_start" });
+						turnOpen = true;
+					}
 					emitInputMessages(stream, turnMessages);
 					if (turnOpen) {
-						const stopMessage = createGateStopMessage(preparedProviderCall.model, gateResult.reason);
-						currentContext.messages.push(stopMessage);
+						const stopMessage = signal?.aborted
+							? emitAbortedAssistantMessage(null, false, new Set(), currentContext, config, stream, signal)
+							: createGateStopMessage(preparedProviderCall.model, gateResult.reason);
+						if (!signal?.aborted) {
+							currentContext.messages.push(stopMessage);
+							stream.push({ type: "message_start", message: stopMessage });
+							stream.push({ type: "message_end", message: stopMessage });
+						}
 						newMessages.push(stopMessage);
-						stream.push({ type: "message_start", message: stopMessage });
-						stream.push({ type: "message_end", message: stopMessage });
 						await emitTurnEnd(
 							stream,
 							currentContext,

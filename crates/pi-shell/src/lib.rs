@@ -2,6 +2,7 @@ pub mod cancel;
 mod git;
 pub mod minimizer;
 pub mod output_decode;
+pub mod owned_child;
 pub mod process;
 pub mod shell;
 pub mod taps;
