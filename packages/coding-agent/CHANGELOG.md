@@ -17,6 +17,7 @@
 
 ### Fixed
 
+- QA rollover now resumes to deliver a final reply or explain a blocker after a completed checkpoint, without duplicating queued background deliveries.
 - `omp -p` text mode now prints each automatic retry with its error (for example "Couldn't reach api.anthropic.com … check your network") instead of showing only `Working...` while a turn retries ([#17529](https://github.com/can1357/oh-my-pi/pull/17529) by [@Mannan-Goyal](https://github.com/Mannan-Goyal))
 - Manual compaction no longer loses the latest user request when it interrupts a turn before buffered message events have been saved.
 

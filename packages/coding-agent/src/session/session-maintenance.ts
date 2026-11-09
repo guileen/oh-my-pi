@@ -3451,13 +3451,11 @@ export class SessionMaintenance {
 			const checkpoint = qaOutcome.checkpoint;
 			const scheduled = this.#host.scheduleCompactionContinuation({
 				generation: qaOutcome.generation,
-				autoContinue:
-					autoContinue &&
-					this.#compactionSettings.autoContinue !== false &&
-					checkpoint?.disposition === "continue",
-				terminalTextAnswer: checkpoint?.disposition !== "continue",
+				// A checkpoint is internal, even when it says complete or blocked.
+				// The interrupted tool turn still owes the user a visible response.
+				autoContinue: autoContinue && this.#compactionSettings.autoContinue !== false && Boolean(checkpoint),
+				terminalTextAnswer: false,
 				suppressContinuation: false,
-				checkpointDisposition: checkpoint?.disposition,
 			});
 			return scheduled ? COMPACTION_CHECK_CONTINUATION : COMPACTION_CHECK_BLOCK_AUTOMATIC_CONTINUATION;
 		}

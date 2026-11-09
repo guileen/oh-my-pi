@@ -570,9 +570,39 @@ describe("AgentSession cooperative QA rollover", () => {
 		expect(h.sideRequests).toHaveLength(0);
 	});
 
+	it.each(["complete", "blocked"] as const)(
+		"reports a %s checkpoint to the user after compaction",
+		async disposition => {
+			const response =
+				disposition === "complete" ? "Completed the parser." : "Cannot continue without your approval.";
+			const h = await createHarness([() => work(), checkpoint(disposition), () => finalAnswer(response)]);
+			await run(h.session);
+
+			expect(h.calls).toHaveLength(3);
+			expect(h.calls[2]!.compactions).toBe(1);
+			expect(JSON.stringify(h.calls[2]!.context)).toContain(SUMMARY);
+			expect(JSON.stringify(h.manager.buildSessionContext().messages)).toContain(response);
+		},
+	);
+
+	it.each(["complete", "blocked"] as const)(
+		"reports a %s hard-stop checkpoint after compaction",
+		async disposition => {
+			const response =
+				disposition === "complete" ? "Completed the parser." : "Cannot continue without your approval.";
+			const h = await createHarness([checkpoint(disposition), () => finalAnswer(response)]);
+			await seedExactOccupancy(h, HARD);
+			await run(h.session);
+
+			expect(h.calls).toHaveLength(2);
+			expect(h.calls[1]!.compactions).toBe(1);
+			expect(JSON.stringify(h.manager.buildSessionContext().messages)).toContain(response);
+		},
+	);
+
 	it.each([
-		{ disposition: "complete" as const, autoContinue: true },
-		{ disposition: "blocked" as const, autoContinue: true },
+		{ disposition: "complete" as const, autoContinue: false },
+		{ disposition: "blocked" as const, autoContinue: false },
 		{ disposition: "continue" as const, autoContinue: false },
 	])("pauses after $disposition with autoContinue=$autoContinue", async ({ disposition, autoContinue }) => {
 		const h = await createHarness([() => work(), checkpoint(disposition)], {

@@ -5586,6 +5586,8 @@ export class AgentSession implements SettingsScope {
 		if (!options.autoContinue) return false;
 		const activeGoal = this.#goalModeState?.enabled === true && this.#goalModeState.goal.status === "active";
 		if (options.terminalTextAnswer && !activeGoal) return false;
+		// A queued background completion will start the next turn itself.
+		if (this.agent.hasBackgroundCompletions?.()) return true;
 		return this.#scheduleAutoContinuePrompt(options.generation);
 	}
 
