@@ -373,9 +373,9 @@ export const BUILTIN_MODE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 		name: "loop",
 		icon: "loop",
 		get description() {
-			return `Toggle loop mode. The first prompt runs immediately; --interval sets the wait after each turn. Use --count for a total execution limit and --duration for an elapsed time limit, independently or together; positional count retains its legacy repeat-count meaning. Gate repeats with \`--until '<cmd>'\` / \`--while '<cmd>'\`. ${formatKeyHint("escape")} pauses; /stop-loop stops future iterations without interrupting the current turn.`;
+			return `Toggle loop mode. /loop 100 5m runs up to 100 turns, /loop 6h 5m runs up to 6 hours; each waits 5 minutes after a turn. The first prompt runs immediately. A lone positional count retains its legacy repeat-count meaning. --count, --duration, --interval, --until and --while can be combined. ${formatKeyHint("escape")} pauses; /stop-loop stops future iterations without interrupting the current turn.`;
 		},
-		inlineHint: "[count|duration] [--count N] [--duration time] [--interval time] [--while|--until '<cmd>'] [prompt]",
+		inlineHint: "[count|duration] [interval] [options] [prompt]",
 		allowArgs: true,
 		getTuiAutocompleteDescription: runtime => {
 			if (!runtime.ctx.loopModeEnabled) return "Loop: off";

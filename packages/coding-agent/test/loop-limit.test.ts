@@ -86,6 +86,41 @@ describe("loop limit parsing", () => {
 	});
 });
 
+describe("positional loop interval", () => {
+	test("uses the first number as total executions and the second duration as interval", () => {
+		expect(parseLoopArgs("100 5m check progress")).toEqual({
+			limit: { kind: "iterations", iterations: 99 },
+			intervalMs: 300_000,
+			prompt: "check progress",
+		});
+		expect(parseLoopArgs("1 5m")).toEqual({ limit: { kind: "iterations", iterations: 0 }, intervalMs: 300_000 });
+		expect(parseLoopArgs("6h 5m check progress")).toEqual({
+			limit: { kind: "duration", durationMs: 21_600_000 },
+			intervalMs: 300_000,
+			prompt: "check progress",
+		});
+	});
+
+	test("composes the shorthand with a second bound and condition", () => {
+		expect(parseLoopArgs("100 5m --duration 6h --until 'test -f done' work")).toEqual({
+			limit: { kind: "iterations", iterations: 99 },
+			durationLimit: { kind: "duration", durationMs: 21_600_000 },
+			intervalMs: 300_000,
+			condition: { command: "test -f done", until: true },
+			prompt: "work",
+		});
+	});
+
+	test("rejects invalid or duplicate intervals while preserving numeric prose", () => {
+		expect(typeof parseLoopArgs("100 0m")).toBe("string");
+		expect(typeof parseLoopArgs("100 5m --interval 2m")).toBe("string");
+		expect(parseLoopArgs("100 42 issues remain")).toEqual({
+			limit: { kind: "iterations", iterations: 100 },
+			prompt: "42 issues remain",
+		});
+	});
+});
+
 describe("explicit loop budgets and interval", () => {
 	test("counts the first turn in an explicit count without changing positional repeats", () => {
 		expect(parseLoopArgs("--count 1")).toEqual({ limit: { kind: "iterations", iterations: 0 } });

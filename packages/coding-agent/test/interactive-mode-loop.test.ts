@@ -101,7 +101,7 @@ describe("InteractiveMode loop auto-submit", () => {
 		Object.defineProperty(session, "isCompacting", { configurable: true, get: () => false });
 		Object.defineProperty(session, "isStreaming", { configurable: true, get: () => false });
 		Object.defineProperty(session, "hasPostPromptWork", { configurable: true, get: () => false });
-		expect(await mode.handleLoopCommand("--count 2 --duration 10s --interval 2s repeat this")).toBe("repeat this");
+		expect(await mode.handleLoopCommand("2 2s --duration 10s repeat this")).toBe("repeat this");
 		mode.setLoopPrompt("repeat this");
 		const resolved: SubmittedUserInput[] = [];
 		pendingInput = mode.getUserInput();

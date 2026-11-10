@@ -30,7 +30,7 @@ const TIME_UNITS_MS = new Map<string, number>([
 ]);
 
 const LOOP_USAGE =
-	"Usage: /loop [count|duration] [--count N] [--duration TIME] [--interval TIME] [--while|--until '<command>'] [prompt]. Examples: /loop 10, /loop 10m, /loop --count 20 --until 'bun test' fix the failing tests.";
+	"Usage: /loop [count|duration] [interval] [--count N] [--duration TIME] [--interval TIME] [--while|--until '<command>'] [prompt]. Examples: /loop 100 5m, /loop 6h 5m, /loop --count 20 --until 'bun test' fix the failing tests.";
 
 /**
  * Flag → `until` polarity. `--while` continues while the command succeeds;
@@ -55,9 +55,9 @@ export interface ParsedLoopArgs {
 }
 
 /**
- * Parse an optional positional limit and leading flags, followed by an inline
- * prompt. Flags may precede or follow the positional limit; once prose begins,
- * the rest is kept as prompt text.
+ * Parse an optional positional limit and interval, leading flags, and prompt.
+ * A positional count followed by an interval counts the first turn; a lone
+ * positional count retains its legacy meaning of subsequent repeats.
  */
 export function parseLoopArgs(args: string): ParsedLoopArgs | string {
 	const trimmed = args.trim();
@@ -78,6 +78,17 @@ export function parseLoopArgs(args: string): ParsedLoopArgs | string {
 			if (!result.limit) break;
 			positional = result.limit;
 			rest = result.rest;
+			// A duration immediately after the positional bound is the interval.
+			// Do not consume numeric prose without a duration unit.
+			if (/^\d+[a-z]/i.test(rest) || /^\d+\s+(?:s|sec|secs|second|seconds|m|min|mins|minute|minutes|h|hr|hrs|hour|hours)(?:\s|$)/i.test(rest)) {
+				const next = takeLoopLimit(rest);
+				if (typeof next === "string") return next;
+				if (next.limit?.kind !== "duration" || !Number.isSafeInteger(next.limit.durationMs)) return "Loop interval must be a positive duration.";
+				if (intervalMs !== undefined) return "Use --interval only once.";
+				intervalMs = next.limit.durationMs;
+				if (positional.kind === "iterations") positional = { kind: "iterations", iterations: positional.iterations - 1 };
+				rest = next.rest;
+			}
 			continue;
 		}
 
