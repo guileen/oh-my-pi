@@ -1,113 +1,99 @@
 # rewind
 
-> End an active checkpoint by pruning exploratory context and retaining a concise report.
+> Replace a locating decision with selected original code, or close a work package with its handoff, then continue.
 
-## Source
+## Availability
 
-- Entry: `packages/coding-agent/src/tools/checkpoint.ts`
-- Model-facing prompt: `packages/coding-agent/src/prompts/tools/rewind.md`
-- Key collaborators:
-   - `packages/coding-agent/src/session/agent-session.ts` — validates pending rewind state, applies the actual rewind, and injects the retained report.
-   - `packages/coding-agent/src/session/session-manager.ts` — branches the persisted session tree and appends persisted summary/report entries.
-   - `packages/coding-agent/src/session/session-context.ts` — `buildSessionContext()` converts persisted `branch_summary` entries into LLM-visible `branchSummary` messages on rebuilt context.
-   - `packages/coding-agent/src/tools/index.ts` — registers the tool and shares the `checkpoint.enabled` gate.
-
-## Registration / Visibility
-
-- Tool metadata: `approval = "read"`, `strict = true`, `loadMode = "discoverable"`. Execution is single-shot; rewind side effects are deferred rather than streamed as progress updates.
-- Registration requires `checkpoint.enabled = true` (default `false`).
-- Top-level sessions receive the tool when enabled. Subagents do not discover it by default, but may receive it through an explicit `tools:`/requested-tools list.
-- `checkpoint` and `rewind` are a safety pair: explicitly requesting either while the feature is enabled automatically includes the other.
-- In an ordinary `tools.xdev` session, discoverable built-ins may be presented as `xd://rewind`; an explicitly requested tool remains top-level.
+`rewind` shares the `checkpoint.enabled` gate, essential tool visibility, and explicit-subagent restrictions of [checkpoint](./checkpoint.md). Registration treats them as a pair. Nested work packages can contain multiple small search decisions.
 
 ## Inputs
 
-| Field    | Type     | Required | Description                                                                |
-| -------- | -------- | -------- | -------------------------------------------------------------------------- |
-| `report` | `string` | Yes      | Investigation findings. `execute()` trims it and rejects the empty result. |
+### Small search decisions
 
-## Outputs
+Successful `grep`/`find` results return a `searchId`; numbered `read` results return a `readId`. No separate checkpoint is needed. Call rewind alone after locating useful code:
 
-The tool returns a single text result plus structured details:
+```json
+{
+  "searchId": "<returned searchId>",
+  "retain": [{"readId": "<returned readId>", "path": "src/entry.ts", "from": 82, "to": 95}],
+  "nextAction": "Located the entry; follow its worker"
+}
+```
 
-- text body:
-   - `Rewind requested.`
-   - `Report captured for context replacement.`
-- `details`:
-   - `report: string` — trimmed report text
-   - `rewound: true`
+The runtime extracts those exact, fully displayed rows from the delivered snapshot, including path, line numbers and edit tag. It does not reread the current file or ask the model to rewrite code. Raw reads, omitted/truncated rows and selections outside this search are rejected. A decision needs no intent paragraph or report.
 
-The returned tool result is not the final rewind. `AgentSession` waits until `turn_end`, then applies the rewind side effects asynchronously.
+Previously selected materials survive later hops. Use returned material references in `release` to remove obsolete code, or `demote: [{"ref": "<material>", "note": "Concise fact or exclusion reason"}]` to retain only a fact and source location. Released code does not reappear on rebuild. The original journal retains the abandoned search path.
 
-## Flow
+Boundaries spanning new user input, compaction, delivered context, or non-search operations are rejected. A search batched with non-search calls is not a safe boundary. Selection is limited to 32 ranges, each at most 2000 lines; up to 128 active materials. The full replacement must shrink context, excluding the generated rewind call from the savings baseline. A small cut preserves current todos and does not close the enclosing package or mark work complete.
 
-1. Tool registration in `packages/coding-agent/src/tools/index.ts` enforces `checkpoint.enabled` and the top-level/explicit-subagent visibility rules. `RewindTool.createIf()` itself always constructs the tool.
-2. Without an active checkpoint, `execute()` distinguishes two states:
-   - a retained completed rewind exists: `ToolError("Checkpoint already completed; continue from the retained rewind report instead of calling rewind again.")`
-   - no completed rewind exists: `ToolError("No active checkpoint. Create a checkpoint before calling rewind.")`
-3. It trims `params.report`; if empty, it throws `ToolError("Report cannot be empty.")`.
-4. It returns a `toolResult()` with `details.report` and `details.rewound = true`.
-5. On the successful rewind tool result, `AgentSession` extracts the report from `details.report` or the first text content block and stores it in `#pendingRewindReport`.
-6. At `turn_end`, `#extractRewindReport()` finds the pending or successful rewind result and calls `#applyRewind()`.
-7. `#applyRewind()` first calls `sessionManager.branchWithSummary(checkpointEntryId, report, { startedAt })`, recording a `branch_summary` at the checkpoint branch point. If that entry no longer resolves, it logs a warning and branches from root instead.
-8. It appends a hidden persisted `rewind-report` custom message. Its content is rendered from `prompts/system/rewind-report.md`, which tells the next turn that the checkpoint completed, not to call `rewind` again, and includes the report; details contain `{ report, startedAt, rewoundAt }`.
-9. It reparents completed sibling tool calls and results from the same assistant batch onto the retained branch (excluding `rewind`, including write-device dispatches). It sets `#lastCompletedRewind`, rebuilds display/LLM context, and replaces the active messages. Earlier exploration and the successful rewind tool result are absent from the next provider call; completed sibling work remains visible and persists across resume.
-10.   It resets advisor session state while preserving cost, synchronizes todo and model-mention state from the new branch, and closes provider sessions whose history was rewritten.
-11.   Finally it clears `#checkpointState` and `#pendingRewindReport`. On later resume or tree navigation, the persisted retained report rehydrates `#lastCompletedRewind`.
+### Work-package handoffs
 
-## Modes / Variants
 
-- Normal rewind: checkpoint entry exists; session history branches from that exact entry.
-- Fallback rewind: checkpoint entry ID is missing from the current session tree; rewind branches from root and logs a warning.
-- Deferred turn-end apply: the tool result only requests rewind; branching and context replacement happen after the surrounding assistant turn finishes.
-- Resumed checkpoint: an unfinished successful checkpoint tool result on the active persisted branch rehydrates the checkpoint state, allowing rewind after process resume.
+`checkpointId`, `report`, and `nextAction` are required nonblank strings and cannot be mixed with `searchId`. Only the active stack-top package can close.
 
-## Side Effects
+| Field | Meaning |
+| --- | --- |
+| `checkpointId` | Exact opaque ID returned by the active `checkpoint`; not a session entry ID or a label. |
+| `report` | Facts, source or artifact evidence, decisions, changed files, and remaining work needed after post-anchor context is removed. Distinguish observed results from unverified claims. |
+| `nextAction` | Concrete next operation for continuing the overall task. |
+| `outcome` | Required for a todo-bound package: `completed`, `blocked`, or `in_progress`. |
+| `reason` | Required when `outcome` is `blocked`. |
 
-- Session state (transcript, memory, jobs, checkpoints, registries)
-   - Rebuilds active conversation history from the checkpoint branch plus the retained summary/report; it does not restore files or process state.
-   - Adds a hidden custom message `rewind-report` carrying rendered recovery guidance and the report.
-   - Records `#lastCompletedRewind`, clears the active checkpoint and pending report, resets advisors, resynchronizes todo state, and closes provider sessions invalidated by the history rewrite.
-   - Repositions the persisted session leaf to the checkpoint branch point and appends new session entries.
-- Filesystem
-   - Persists the new `branch_summary` and `custom_message` entries into the session `.jsonl` file through normal `SessionManager` append persistence.
-   - Session files are named `<ISO-timestamp-with-:-and-.-replaced>_<uuidv7>.jsonl` in the session directory; default directory selection is `~/.omp/agent/sessions/<encoded-cwd>/` when no override is passed.
-- User-visible prompts / interactive UI
-   - The tool result is visible before turn-end application.
-   - The persisted `branch_summary` becomes an LLM-visible `branchSummary` message when context is rebuilt; compaction rendering presents it as a user-role `<summary>` block.
-   - The hidden `rewind-report` custom message becomes developer-role retained guidance for the next provider call.
-- Background work / cancellation
-   - Rewind application is deferred to `turn_end`. There is no separate job object or cancel handle.
+For example, after completing a todo-bound package:
 
-## Limits & Caps
+```json
+{
+  "checkpointId": "<copy the ID returned by checkpoint>",
+  "report": "Updated the model-facing prompts and checked the nested transaction contract.",
+  "outcome": "completed",
+  "nextAction": "Update the user documentation"
+}
+```
 
-- Availability is gated by `checkpoint.enabled`, default `false`.
-- Subagents require an explicit requested-tools entry; requesting either checkpoint tool auto-includes its sister.
-- A session has at most one active checkpoint; there is no path to name or choose among multiple checkpoints.
-- Report text must be non-empty after `trim()`.
-- Rewind restores only active conversation/session-tree context; there is no file, artifact, blob, process, or git restore path.
-- Persisted report/summary content is subject to the global session persistence cap `MAX_PERSIST_CHARS = 500_000`.
+Reach the package's `finishWhen` before completing it. Commit the report and todo outcome together; do not separately mark the todo done first. Completing a task starts the next pending task; blocked tasks do not restart automatically. Completing a phase requires all children completed and evidence of the phase's own acceptance. Preserve unmet boundaries and blockers explicitly.
 
-## Errors
+Before closing a child, select what its parent and later siblings need: shared constraints, verified contracts and decisions, a compact file/symbol or artifact index, verification evidence, and unresolved risks. Include those in `report`, not private exploration or unrelated code. The retained report stays available to later siblings across their cuts. Selected search materials inside the child are not automatically carried through a macro cut; preserve needed facts and locations in the report instead.
 
-- `ToolError("Checkpoint already completed; continue from the retained rewind report instead of calling rewind again.")` — thrown when the active branch already contains the retained completion.
-- `ToolError("No active checkpoint. Create a checkpoint before calling rewind.")` — thrown when neither an active checkpoint nor a completed rewind is present.
-- `ToolError("Report cannot be empty.")` — thrown when the trimmed report is empty.
-- Missing checkpoint entry IDs during apply do not fail the completed tool call; `#applyRewind()` logs `Rewind branch checkpoint missing, falling back to root` and branches from root.
+When closing the parent, consolidate still-needed child findings and indexes into the parent's report. Parent cuts replace child reports rather than copying their accumulated history. An index locates evidence; it is not a current source snapshot or edit anchor.
 
-## Notes
+## Outputs and application
 
-- Checkpoint selection is implicit. `rewind` always targets the single `#checkpointState` captured or rehydrated from the last unfinished successful `checkpoint`; there is no checkpoint list, label, or ID parameter.
-- Restored state is active conversation/session-tree context:
-   - persisted branch reset to `checkpointEntryId` or root fallback
-   - branch summary of the abandoned exploratory path
-   - retained `rewind-report` custom message
-   - rebuilt in-memory messages from that branch
-- Not restored:
-   - filesystem or git state
-   - artifacts under `packages/coding-agent/src/session/artifacts.ts`
-   - blob-store payloads under `packages/coding-agent/src/session/blob-store.ts`
-   - prompt history rows in `packages/coding-agent/src/session/history-storage.ts`
-   - auth or other agent storage in `packages/coding-agent/src/session/agent-storage.ts`
-- There is no concurrent-edit reconciliation. Rewind neither merges nor reverts code or session-adjacent external state.
-- Rewind is not destructive to persisted session history. `branchWithSummary()` appends a new `branch_summary` entry and moves the leaf; abandoned entries remain in the `.jsonl` log but leave the active branch.
+Structured result details contain:
+
+- `checkpointId`: the targeted active checkpoint.
+- `report`: the retained handoff body; `nextAction` is rendered separately.
+- `nextAction`: the concrete continuation.
+- `rewound`: whether a cut was requested; it is `false` for an accepted no-cut outcome. Neither value proves the transaction committed.
+- `estimate`: estimated context and cache eligibility; `willCompact: false` signals no expected compaction, not a cache hit.
+
+The session applies the request at turn end. The final journal report's `contextChanged` records whether context actually changed. With an explicit outcome and no net savings, progress is still committed atomically and the scope closes, but original context remains. Do not call that compaction or retry merely to force it. Provider usage, not eligibility estimates, establishes actual cache use.
+
+When context changes, the retained handoff includes the report, next action and current todo state; original history remains in the journal. Parent closure can replace child traces and summaries. Recovery restores persisted active parents and valid bindings.
+
+Continue package B from `nextAction`. Rewinding A does not finish the overall task, imply a final yield, or justify repeating already completed work. Create a new checkpoint before B's noisy work when appropriate.
+
+## Fail-closed safety
+
+The runtime validates the request before changing context:
+
+- The ID must match the active stack top; anchors and todo bindings must still resolve. Canonical source entry identity and fingerprint prevent concurrent replanning or delete-and-recreate from silently rebinding a package.
+- User input since the anchor prevents rewinding across that input. Unsafe mixed batches and stale boundaries fail closed.
+- The estimated replacement must shrink context for a cut; the strict savings baseline excludes the newly generated report, so a long report cannot manufacture savings. With an explicit outcome, no savings can still commit progress without a cut.
+- `report`, `nextAction`, and any blocker `reason` together must fit within 4096 estimated tokens.
+
+Invalid requests do not replace context or bypass todo validation. Continue from the handoff or unchanged context as applicable; do not repeat an unchanged rejected request.
+
+## What rewind does not restore
+
+Rewind does not revert files, artifacts, blobs, running processes, external effects, or git state. Edits made during A remain in place. It is a conversation branch operation, not a rollback mechanism.
+
+The prefix through the checkpoint is eligible for provider prompt-cache reuse only while other request and provider conditions match. Rewind does not guarantee a cache hit, fixed context size, or monetary savings.
+
+## Implementation
+
+- Tool schema and result: `packages/coding-agent/src/tools/checkpoint.ts`
+- Validation, deferred application, and recovery: `packages/coding-agent/src/session/agent-session.ts`
+- Branch persistence: `packages/coding-agent/src/session/session-manager.ts`
+- Context rebuilding: `packages/coding-agent/src/session/session-context.ts`
+- Retained handoff: `packages/coding-agent/src/prompts/system/rewind-report.md`
+

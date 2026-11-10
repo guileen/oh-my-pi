@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, spyOn } from "bun:test";
 import * as path from "node:path";
 import { type } from "@oh-my-pi/omptype";
 import { Agent, type AgentMessage, type AgentTool } from "@oh-my-pi/pi-agent-core";
@@ -17,10 +17,14 @@ import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
-import { RewindTool, type ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
+import { CheckpointTool, RewindTool, type ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
+import { GrepTool } from "@oh-my-pi/pi-coding-agent/tools/grep";
+import { ReadTool } from "@oh-my-pi/pi-coding-agent/tools/read";
+import { SEARCH_MATERIAL, searchReference } from "@oh-my-pi/pi-coding-agent/session/search-rewind";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { TempDir } from "@oh-my-pi/pi-utils";
 
+// Legacy result fixtures deliberately omit work-package fields to cover persisted-session recovery.
 const checkpointSchema = type({ goal: type("string") });
 const rewindSchema = type({ report: type("string") });
 
@@ -115,6 +119,11 @@ async function createHarness(
 	options?: {
 		onAgentEnd?: (willContinue: boolean | undefined) => void;
 		resolveFallbackTool?: (name: string) => AgentTool | undefined;
+		realTools?: boolean;
+		realSearchTools?: boolean;
+		todoBinding?: boolean;
+		persist?: boolean;
+		initialMessages?: AgentMessage[];
 	},
 ): Promise<Harness & { mock: MockModel }> {
 	const tempDir = TempDir.createSync("@pi-checkpoint-rewind-branch-");
@@ -125,12 +134,28 @@ async function createHarness(
 	const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir.path(), "models.yml"));
 	const settings = Settings.isolated({
 		"compaction.enabled": false,
+		"checkpoint.enabled": options?.realTools ?? false,
 		"retry.enabled": false,
 		"todo.enabled": false,
 		"todo.eager": "default",
 		"todo.reminders": false,
 	});
 	settings.setModelRole("default", `${mock.provider}/${mock.id}`);
+	if (options?.realTools) {
+		const toolSession = createToolSession({
+			cwd: tempDir.path(),
+			settings,
+			getCheckpointState: () => session.getCheckpointState(),
+			getLastCompletedRewind: () => session.getLastCompletedRewind(),
+			validateRewind: (checkpointId, report, nextAction, outcome, reason) =>
+				session.validateRewind(checkpointId, report, nextAction, outcome, reason),
+			bindCheckpointTodo: options.todoBinding ? target => session.bindCheckpointTodo(target) : undefined,
+			validateSearchRewind: input => session.validateSearchRewind(input),
+		});
+		tools = [new CheckpointTool(toolSession) as AgentTool, new RewindTool(toolSession) as AgentTool, ...tools];
+		if (options.realSearchTools)
+			tools.push(new GrepTool(toolSession) as AgentTool, new ReadTool(toolSession) as AgentTool);
+	}
 	const toolRegistry = new Map(tools.map(tool => [tool.name, tool]));
 	const agent = new Agent({
 		getApiKey: () => "test-key",
@@ -138,14 +163,21 @@ async function createHarness(
 			model: mock,
 			systemPrompt: ["Test"],
 			tools,
-			messages: [],
+			messages: options?.initialMessages ?? [],
 		},
 		convertToLlm,
 		streamFn: mock.stream,
 		resolveFallbackTool: options?.resolveFallbackTool,
 	});
 
-	const sessionManager = SessionManager.inMemory(tempDir.path());
+	const sessionManager = options?.persist
+		? SessionManager.create(tempDir.path(), path.join(tempDir.path(), "sessions"))
+		: SessionManager.inMemory(tempDir.path());
+	for (const message of options?.initialMessages ?? []) {
+		if (message.role === "assistant" || message.role === "user" || message.role === "toolResult") {
+			sessionManager.appendMessage(message);
+		}
+	}
 	let extensionRunner: ExtensionRunner | undefined;
 	if (options?.onAgentEnd) {
 		const runtime = new ExtensionRuntime();
@@ -206,13 +238,1113 @@ function rewindToolForSession(session: AgentSession): RewindTool {
 	);
 }
 
-async function expectNoActiveCheckpointError(session: AgentSession): Promise<void> {
-	await expect(rewindToolForSession(session).execute("repeat_rewind", { report: "retry" })).rejects.toThrow(
-		"No active checkpoint. Create a checkpoint before calling rewind.",
+function validatingRewindToolForSession(session: AgentSession): RewindTool {
+	return new RewindTool(
+		createToolSession({
+			getCheckpointState: () => session.getCheckpointState(),
+			getLastCompletedRewind: () => session.getLastCompletedRewind(),
+			validateRewind: (checkpointId, report, nextAction) => session.validateRewind(checkpointId, report, nextAction),
+		}),
 	);
 }
 
+const workPackage = {
+	goal: "Complete work package A",
+	finishWhen: "A is implemented and its result is recorded",
+	carryForward: "Keep the user constraint: do not commit",
+};
+
+function assistantFixture(content: AssistantMessage["content"]): AssistantMessage {
+	return {
+		role: "assistant",
+		content,
+		api: "anthropic-messages",
+		provider: "anthropic",
+		model: "claude-sonnet-4-5",
+		usage: {
+			input: 0,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 0,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		},
+		stopReason: "stop",
+		timestamp: 1,
+	};
+}
+
+async function createActiveWorkPackage(trace = "Exploration evidence. ".repeat(1200)) {
+	const result = await new CheckpointTool(createToolSession()).execute("package_a", workPackage);
+	const initialMessages: AgentMessage[] = [
+		{ role: "user", content: "Complete A, then continue with B. Do not commit.", timestamp: 1 },
+		assistantFixture([{ type: "toolCall", id: "package_a", name: "checkpoint", arguments: workPackage }]),
+		{
+			role: "toolResult",
+			toolCallId: "package_a",
+			toolName: "checkpoint",
+			...result,
+			isError: false,
+			timestamp: 2,
+		},
+	];
+	if (trace) initialMessages.push(assistantFixture([{ type: "text", text: trace }]));
+	return createHarness([], [], { realTools: true, initialMessages });
+}
+
+function rewindMutationSnapshot(session: AgentSession) {
+	return structuredClone({
+		messages: session.messages,
+		entries: session.sessionManager.getEntries(),
+		leafId: session.sessionManager.getLeafId(),
+		checkpoint: session.getCheckpointState(),
+		completed: session.getLastCompletedRewind(),
+		todos: session.getTodoPhases(),
+	});
+}
+
+async function expectNoActiveCheckpointError(session: AgentSession): Promise<void> {
+	await expect(
+		rewindToolForSession(session).execute("repeat_rewind", {
+			checkpointId: "call_checkpoint",
+			report: "retry",
+			nextAction: "Continue the task",
+		}),
+	).rejects.toThrow("No active checkpoint. Create a checkpoint before calling rewind.");
+}
+
 describe("AgentSession checkpoint rewind branch context", () => {
+	it("rejects a todo binding already owned by a non-immediate ancestor", async () => {
+		const { session } = await createHarness(
+			[
+				{
+					content: [{ type: "toolCall", id: "root_task", name: "checkpoint", arguments: workPackage }],
+					stopReason: "toolUse",
+				},
+				{
+					content: [
+						{
+							type: "toolCall",
+							id: "intermediate",
+							name: "checkpoint",
+							arguments: { ...workPackage, todo: false },
+						},
+					],
+					stopReason: "toolUse",
+				},
+				{
+					content: [{ type: "toolCall", id: "duplicate", name: "checkpoint", arguments: workPackage }],
+					stopReason: "toolUse",
+				},
+				{ content: ["Keep the existing scopes."], stopReason: "stop" },
+			],
+			[],
+			{ realTools: true, todoBinding: true },
+		);
+		session.commitTodoPhases([{ name: "Build", tasks: [{ content: "A", status: "in_progress" }] }]);
+		await session.prompt("Explore a nested scope without duplicating its todo.");
+		const intermediate = session.messages.find(
+			message => message.role === "toolResult" && message.toolCallId === "intermediate",
+		);
+		expect(intermediate).toMatchObject({ isError: false });
+		expect(
+			session.messages.find(message => message.role === "toolResult" && message.toolCallId === "duplicate"),
+		).toMatchObject({ isError: true });
+		expect(session.getCheckpointState()).toMatchObject({
+			checkpointId: "intermediate",
+			parent: { checkpointId: "root_task" },
+		});
+		expect(session.getTodoPhases()[0].tasks[0].status).toBe("in_progress");
+	});
+
+	it("preserves an external delivery that arrives while macro commit waits for the journal lock", async () => {
+		const { session } = await createHarness(
+			[
+				{
+					content: [{ type: "toolCall", id: "bound", name: "checkpoint", arguments: workPackage }],
+					stopReason: "toolUse",
+				},
+				{
+					content: [
+						{
+							type: "toolCall",
+							id: "close",
+							name: "rewind",
+							arguments: {
+								checkpointId: "bound",
+								report: "A verified.",
+								nextAction: "Continue B.",
+								outcome: "completed",
+							},
+						},
+					],
+					stopReason: "toolUse",
+				},
+			],
+			[],
+			{ realTools: true, todoBinding: true },
+		);
+		session.commitTodoPhases([
+			{
+				name: "Build",
+				tasks: [
+					{ content: "A", status: "in_progress" },
+					{ content: "B", status: "pending" },
+				],
+			},
+		]);
+		const manager = session.sessionManager;
+		const original = manager.appendEntriesAtomically.bind(manager);
+		const intercept = spyOn(manager, "appendEntriesAtomically").mockImplementationOnce(
+			<T>(append: () => T, options?: { commitGuard?: () => boolean }): Promise<T> => {
+				manager.appendCustomMessageEntry("external-delivery", "KEEP_NEW_DELIVERY", false, undefined, "agent");
+				session.agent.appendMessage({
+					role: "custom",
+					customType: "external-delivery",
+					content: "KEEP_NEW_DELIVERY",
+					display: false,
+					timestamp: Date.now(),
+				});
+				return original(append, options);
+			},
+		);
+		try {
+			await session.prompt("Complete A.").catch(() => undefined);
+			expect(intercept).toHaveBeenCalledTimes(1);
+			expect(session.getTodoPhases()[0].tasks.map(task => task.status)).toEqual(["in_progress", "pending"]);
+			expect(session.getCheckpointState()?.checkpointId).toBe("bound");
+			expect(
+				manager
+					.getBranch()
+					.some(
+						entry =>
+							entry.type === "custom_message" &&
+							entry.customType === "external-delivery" &&
+							entry.content === "KEEP_NEW_DELIVERY",
+					),
+			).toBe(true);
+			expect(manager.getBranch().some(entry => entry.type === "branch_summary")).toBe(false);
+		} finally {
+			intercept.mockRestore();
+		}
+	});
+	it("closes A and B into their parent phase with canonical todo advancement and no child-history accumulation", async () => {
+		const running: { session?: AgentSession } = {};
+		const evidenceSchema = type({ scope: "string" });
+		const tool: AgentTool<typeof evidenceSchema> = {
+			name: "stage_evidence",
+			label: "Stage evidence",
+			description: "Observe stage evidence",
+			parameters: evidenceSchema,
+			async execute(_toolCallId, params) {
+				return { content: [{ type: "text", text: `${params.scope}_LOCAL_EVIDENCE `.repeat(1500) }] };
+			},
+		};
+		const responses = (async function* () {
+			yield {
+				content: [
+					{
+						type: "toolCall",
+						id: "root",
+						name: "checkpoint",
+						arguments: { ...workPackage, goal: "Integrate both tasks", todo: { phase: "Build" } },
+					},
+				],
+				stopReason: "toolUse" as const,
+			};
+			yield {
+				content: [{ type: "toolCall", id: "evidence", name: "stage_evidence", arguments: { scope: "STAGE" } }],
+				stopReason: "toolUse" as const,
+			};
+			yield {
+				content: [{ type: "toolCall", id: "a", name: "checkpoint", arguments: workPackage }],
+				stopReason: "toolUse" as const,
+			};
+			yield {
+				content: [{ type: "toolCall", id: "a_evidence", name: "stage_evidence", arguments: { scope: "A" } }],
+				stopReason: "toolUse" as const,
+			};
+			yield {
+				content: [
+					{
+						type: "toolCall",
+						id: "close_a",
+						name: "rewind",
+						arguments: {
+							checkpointId: "a",
+							report:
+								"A implemented and verified. src/shared.ts:resolveJob keeps job ids stable; B must reuse that contract.",
+							nextAction: "Implement B.",
+							outcome: "completed",
+						},
+					},
+				],
+				stopReason: "toolUse" as const,
+			};
+			expect(running.session?.getCheckpointState()?.checkpointId).toBe("root");
+			expect(running.session?.getLastCompletedRewind()).toMatchObject({ checkpointId: "a", contextChanged: true });
+			expect(running.session?.getTodoPhases()[0].tasks.map(task => task.status)).toEqual([
+				"completed",
+				"in_progress",
+			]);
+			const beforeB = convertToLlm(running.session?.messages ?? [])
+				.map(messageText)
+				.join("\n");
+			expect(beforeB).toContain("src/shared.ts:resolveJob");
+			expect(beforeB).toContain("job ids stable");
+			expect(beforeB).not.toContain("A_LOCAL_EVIDENCE");
+			yield {
+				content: [
+					{ type: "toolCall", id: "b", name: "checkpoint", arguments: { ...workPackage, goal: "Implement B" } },
+				],
+				stopReason: "toolUse" as const,
+			};
+			yield {
+				content: [{ type: "toolCall", id: "b_evidence", name: "stage_evidence", arguments: { scope: "B" } }],
+				stopReason: "toolUse" as const,
+			};
+			yield {
+				content: [
+					{
+						type: "toolCall",
+						id: "close_b",
+						name: "rewind",
+						arguments: {
+							checkpointId: "b",
+							report:
+								"B implemented and verified. src/worker.ts:resumeJob reuses stable ids; restart behavior verified.",
+							nextAction: "Verify the combined stage.",
+							outcome: "completed",
+						},
+					},
+				],
+				stopReason: "toolUse" as const,
+			};
+			expect(running.session?.getCheckpointState()?.checkpointId).toBe("root");
+			const beforeParentClose = convertToLlm(running.session?.messages ?? [])
+				.map(messageText)
+				.join("\n");
+			expect(beforeParentClose).toContain("src/shared.ts:resolveJob");
+			expect(beforeParentClose).toContain("src/worker.ts:resumeJob");
+			expect(beforeParentClose).not.toContain("B_LOCAL_EVIDENCE");
+			expect(running.session?.getLastCompletedRewind()).toMatchObject({ checkpointId: "b", contextChanged: true });
+			yield {
+				content: [
+					{
+						type: "toolCall",
+						id: "close_root",
+						name: "rewind",
+						arguments: {
+							checkpointId: "root",
+							report:
+								"Both tasks and the integration boundary are verified. Stable-id flow: src/shared.ts:resolveJob → src/worker.ts:resumeJob; restart verified.",
+							nextAction: "Deliver the verified work.",
+							outcome: "completed",
+						},
+					},
+				],
+				stopReason: "toolUse" as const,
+			};
+			yield { content: ["Verified."], stopReason: "stop" as const };
+		})() as MockResponseSource;
+		const { session, mock } = await createHarness(responses, [tool], { realTools: true, todoBinding: true });
+		running.session = session;
+		session.commitTodoPhases([
+			{
+				name: "Build",
+				tasks: [
+					{ content: "A", status: "in_progress" },
+					{ content: "B", status: "pending" },
+				],
+			},
+		]);
+		await session.prompt("Complete and integrate A and B.");
+		expect(session.getTodoPhases()[0].tasks.map(task => task.status)).toEqual(["completed", "completed"]);
+		expect(session.getCheckpointState()).toBeUndefined();
+		expect(session.getLastCompletedRewind()).toMatchObject({
+			checkpointId: "root",
+			contextChanged: true,
+			outcome: "completed",
+		});
+		const text = mock.calls.at(-1)?.context.messages.map(messageText).join("\n") ?? "";
+		expect(text).not.toContain("A implemented and verified.");
+		expect(text).not.toContain("B implemented and verified.");
+		expect(text).not.toContain("STAGE_LOCAL_EVIDENCE");
+		expect(text).toContain("Both tasks and the integration boundary are verified.");
+		expect(text).toContain("src/shared.ts:resolveJob");
+		expect(text).toContain("src/worker.ts:resumeJob");
+	});
+
+	it("records completed and blocked outcomes without cutting when the full handoff has no savings", async () => {
+		for (const outcome of ["completed", "blocked"] as const) {
+			const { session } = await createHarness(
+				[
+					{
+						content: [{ type: "toolCall", id: "bound", name: "checkpoint", arguments: workPackage }],
+						stopReason: "toolUse",
+					},
+					{
+						content: [
+							{
+								type: "toolCall",
+								id: "close",
+								name: "rewind",
+								arguments: {
+									checkpointId: "bound",
+									report: "Evidence and remaining boundary recorded. ".repeat(100),
+									nextAction: "Continue B.",
+									outcome,
+									...(outcome === "blocked" ? { reason: "waiting for owner" } : {}),
+								},
+							},
+						],
+						stopReason: "toolUse",
+					},
+					{ content: ["Continue."], stopReason: "stop" },
+				],
+				[],
+				{ realTools: true, todoBinding: true },
+			);
+			session.commitTodoPhases([
+				{
+					name: "Build",
+					tasks: [
+						{ content: "A", status: "in_progress" },
+						{ content: "B", status: "pending" },
+					],
+				},
+			]);
+			await session.prompt("Record A's evidence-backed result and continue B.");
+			expect(session.getTodoPhases()[0].tasks[0].status).toBe(outcome);
+			expect(session.getTodoPhases()[0].tasks[1].status).toBe("in_progress");
+			if (outcome === "blocked") expect(session.getTodoPhases()[0].tasks[0].blocker).toBe("waiting for owner");
+			expect(session.getLastCompletedRewind()?.contextChanged).toBe(false);
+			expect(session.sessionManager.getBranch().some(entry => entry.type === "branch_summary")).toBe(false);
+			expect(session.getCheckpointState()).toBeUndefined();
+			expect(session.messages).toEqual(session.sessionManager.buildSessionContext().messages);
+		}
+	});
+
+	it("keeps the bound todo and checkpoint unchanged when macro outcome persistence fails", async () => {
+		const { session } = await createHarness(
+			[
+				{
+					content: [{ type: "toolCall", id: "bound", name: "checkpoint", arguments: workPackage }],
+					stopReason: "toolUse",
+				},
+				{
+					content: [
+						{
+							type: "toolCall",
+							id: "close",
+							name: "rewind",
+							arguments: {
+								checkpointId: "bound",
+								report: "A verified.",
+								nextAction: "Continue B.",
+								outcome: "completed",
+							},
+						},
+					],
+					stopReason: "toolUse",
+				},
+			],
+			[],
+			{ realTools: true, todoBinding: true },
+		);
+		session.commitTodoPhases([
+			{
+				name: "Build",
+				tasks: [
+					{ content: "A", status: "in_progress" },
+					{ content: "B", status: "pending" },
+				],
+			},
+		]);
+		const failure = spyOn(session.sessionManager, "appendEntriesAtomically").mockRejectedValueOnce(
+			new Error("outcome storage failed"),
+		);
+		try {
+			await session.prompt("Complete A.").catch(() => undefined);
+			expect(failure).toHaveBeenCalledTimes(1);
+			expect(session.getTodoPhases()[0].tasks.map(task => task.status)).toEqual(["in_progress", "pending"]);
+			expect(session.getCheckpointState()?.checkpointId).toBe("bound");
+			expect(session.getLastCompletedRewind()).toBeUndefined();
+		} finally {
+			failure.mockRestore();
+		}
+	});
+
+	it("rehydrates a durable parent after child completion with the refreshed todo identity", async () => {
+		const harness = await createHarness(
+			[
+				{
+					content: [
+						{
+							type: "toolCall",
+							id: "root",
+							name: "checkpoint",
+							arguments: { ...workPackage, todo: { phase: "Build" } },
+						},
+					],
+					stopReason: "toolUse",
+				},
+				{
+					content: [{ type: "toolCall", id: "child", name: "checkpoint", arguments: workPackage }],
+					stopReason: "toolUse",
+				},
+				{
+					content: [
+						{
+							type: "toolCall",
+							id: "close",
+							name: "rewind",
+							arguments: {
+								checkpointId: "child",
+								report: "A verified.",
+								nextAction: "Continue B.",
+								outcome: "completed",
+							},
+						},
+					],
+					stopReason: "toolUse",
+				},
+				{ content: ["A is closed; B remains."], stopReason: "stop" },
+			],
+			[],
+			{ realTools: true, todoBinding: true, persist: true },
+		);
+		harness.session.commitTodoPhases([
+			{
+				name: "Build",
+				tasks: [
+					{ content: "A", status: "in_progress" },
+					{ content: "B", status: "pending" },
+				],
+			},
+		]);
+		await harness.session.prompt("Complete A before B.");
+		const file = harness.session.sessionManager.getSessionFile();
+		if (!file) throw new Error("Missing durable session");
+		await harness.session.dispose();
+		const manager = await SessionManager.open(file);
+		const model = createMockModel({ responses: [] });
+		const settings = Settings.isolated({ "compaction.enabled": false, "todo.reminders": false });
+		const reloaded = new AgentSession({
+			agent: new Agent({
+				initialState: {
+					model,
+					tools: [],
+					messages: manager.buildSessionContext().messages,
+					systemPrompt: ["Test"],
+				},
+				streamFn: model.stream,
+				convertToLlm,
+			}),
+			sessionManager: manager,
+			settings,
+			modelRegistry: new ModelRegistry(harness.authStorage, path.join(harness.tempDir.path(), "reload.yml")),
+		});
+		harness.extraSessions.push(reloaded);
+		expect(reloaded.getCheckpointState()?.checkpointId).toBe("root");
+		expect(reloaded.getTodoPhases()[0].tasks.map(task => task.status)).toEqual(["completed", "in_progress"]);
+		expect(() => reloaded.validateRewind("root", "Not integrated yet.", "Continue B.", "completed")).toThrow(
+			"every task",
+		);
+	});
+	it("carries selected read snapshots across two search hops inside an active work package", async () => {
+		let sourcePath = "";
+		const responses = (async function* () {
+			yield {
+				content: [{ type: "toolCall", id: "parent_package", name: "checkpoint", arguments: workPackage }],
+				stopReason: "toolUse" as const,
+			};
+			yield {
+				content: [
+					{ type: "toolCall", id: "search_a", name: "grep", arguments: { pattern: "SEARCH_NOISE", path: "." } },
+				],
+				stopReason: "toolUse" as const,
+			};
+			yield {
+				content: [{ type: "toolCall", id: "source_a", name: "read", arguments: { path: "entry.ts:1-4" } }],
+				stopReason: "toolUse" as const,
+			};
+			await Bun.write(sourcePath, 'export const entry = "CHANGED_AFTER_READ";\n');
+			yield {
+				content: [
+					{
+						type: "toolCall",
+						id: "cut_a",
+						name: "rewind",
+						arguments: {
+							searchId: searchReference("s", "search_a"),
+							retain: [{ readId: searchReference("r", "source_a"), path: "entry.ts", from: 1, to: 4 }],
+							nextAction: "Located entry; follow its worker.",
+						},
+					},
+				],
+				stopReason: "toolUse" as const,
+			};
+			yield {
+				content: [
+					{ type: "toolCall", id: "search_b", name: "grep", arguments: { pattern: "SEARCH_NOISE", path: "." } },
+				],
+				stopReason: "toolUse" as const,
+			};
+			yield {
+				content: [{ type: "toolCall", id: "source_b", name: "read", arguments: { path: "worker.ts:1-4" } }],
+				stopReason: "toolUse" as const,
+			};
+			yield {
+				content: [
+					{
+						type: "toolCall",
+						id: "cut_b",
+						name: "rewind",
+						arguments: {
+							searchId: searchReference("s", "search_b"),
+							retain: [{ readId: searchReference("r", "source_b"), path: "worker.ts", from: 1, to: 4 }],
+							nextAction: "Located worker; implement the fix.",
+						},
+					},
+				],
+				stopReason: "toolUse" as const,
+			};
+			yield { content: ["Ready to implement."], stopReason: "stop" as const };
+		})() as MockResponseSource;
+		const { session, mock, tempDir } = await createHarness(responses, [], {
+			realTools: true,
+			realSearchTools: true,
+			todoBinding: true,
+		});
+		await Bun.write(
+			path.join(tempDir.path(), "entry.ts"),
+			'export const entry = "KEEP_ENTRY";\nexport const caller = "worker";\nexport const limit = 20;\nexport const enabled = true;\n',
+		);
+		await Bun.write(
+			path.join(tempDir.path(), "worker.ts"),
+			'export const worker = "KEEP_WORKER";\nexport const mode = "safe";\nexport const ready = true;\nexport const count = 3;\n',
+		);
+		await Bun.write(
+			path.join(tempDir.path(), "noise.ts"),
+			Array.from({ length: 190 }, (_, i) => `export const noise${i} = "SEARCH_NOISE_${i}";`).join("\n"),
+		);
+		sourcePath = path.join(tempDir.path(), "entry.ts");
+		session.commitTodoPhases([
+			{
+				name: "Locate",
+				tasks: [
+					{ content: "A", status: "in_progress" },
+					{ content: "B", status: "pending" },
+				],
+			},
+		]);
+		await session.prompt("Locate the entry and worker, then implement. Do not commit.");
+		const request = mock.calls.at(-1);
+		if (!request) throw new Error("Missing post-cut request");
+		const text = request.context.messages.map(messageText).join("\n");
+		expect(text).toContain('export const entry = "KEEP_ENTRY";');
+		expect(text).toContain('export const worker = "KEEP_WORKER";');
+		expect(text).not.toContain("CHANGED_AFTER_READ");
+		expect(text).not.toContain("SEARCH_NOISE_");
+		expect(
+			request.context.messages.filter(message => message.role === "toolResult" && message.toolName !== "checkpoint"),
+		).toEqual([]);
+		expect(
+			session.sessionManager
+				.getEntries()
+				.some(
+					entry =>
+						entry.type === "message" &&
+						entry.message.role === "toolResult" &&
+						entry.message.toolCallId === "search_a",
+				),
+		).toBe(true);
+		expect(session.messages).toEqual(session.sessionManager.buildSessionContext().messages);
+		expect(session.sessionManager.getBranch().filter(entry => entry.type === "branch_summary")).toHaveLength(2);
+		expect(session.getCheckpointState()?.checkpointId).toBe("parent_package");
+		const accepted = await new RewindTool(
+			createToolSession({
+				getCheckpointState: () => session.getCheckpointState(),
+				validateRewind: (id, report, next, outcome, reason) =>
+					session.validateRewind(id, report, next, outcome, reason),
+			}),
+		).execute("after_hops", {
+			checkpointId: "parent_package",
+			report: "Both code paths located.",
+			nextAction: "Continue implementation.",
+			outcome: "in_progress",
+		});
+		expect(accepted.details?.estimate?.willCompact).toBe(true);
+	});
+
+	it("demotes and releases retained code across later decisions without resurrecting it on rebuild", async () => {
+		const materialRef = () => {
+			const entry = session.sessionManager
+				.getBranch()
+				.findLast(item => item.type === "custom_message" && item.customType === SEARCH_MATERIAL);
+			if (
+				entry?.type !== "custom_message" ||
+				!entry.details ||
+				typeof entry.details !== "object" ||
+				!("ref" in entry.details) ||
+				typeof entry.details.ref !== "string"
+			)
+				throw new Error("Missing retained material");
+			return entry.details.ref;
+		};
+		const responses = (async function* () {
+			yield {
+				content: [{ type: "toolCall", id: "find1", name: "grep", arguments: { pattern: "NOISE", path: "." } }],
+				stopReason: "toolUse" as const,
+			};
+			yield {
+				content: [{ type: "toolCall", id: "read1", name: "read", arguments: { path: "one.ts:1-2" } }],
+				stopReason: "toolUse" as const,
+			};
+			yield {
+				content: [
+					{
+						type: "toolCall",
+						id: "close1",
+						name: "rewind",
+						arguments: {
+							searchId: searchReference("s", "find1"),
+							retain: [{ readId: searchReference("r", "read1"), path: "one.ts", from: 1, to: 2 }],
+							nextAction: "Follow dependency.",
+						},
+					},
+				],
+				stopReason: "toolUse" as const,
+			};
+			const first = materialRef();
+			yield {
+				content: [{ type: "toolCall", id: "find2", name: "grep", arguments: { pattern: "NOISE", path: "." } }],
+				stopReason: "toolUse" as const,
+			};
+			yield {
+				content: [{ type: "toolCall", id: "read2", name: "read", arguments: { path: "two.ts:1-2" } }],
+				stopReason: "toolUse" as const,
+			};
+			yield {
+				content: [
+					{
+						type: "toolCall",
+						id: "close2",
+						name: "rewind",
+						arguments: {
+							searchId: searchReference("s", "find2"),
+							retain: [{ readId: searchReference("r", "read2"), path: "two.ts", from: 1, to: 2 }],
+							demote: [{ ref: first, note: "The entry delegates to the worker." }],
+							nextAction: "Check remaining candidates.",
+						},
+					},
+				],
+				stopReason: "toolUse" as const,
+			};
+			const second = materialRef();
+			yield {
+				content: [{ type: "toolCall", id: "find3", name: "grep", arguments: { pattern: "NOISE", path: "." } }],
+				stopReason: "toolUse" as const,
+			};
+			yield {
+				content: [
+					{
+						type: "toolCall",
+						id: "close3",
+						name: "rewind",
+						arguments: {
+							searchId: searchReference("s", "find3"),
+							release: [second],
+							nextAction: "Located the relevant path; continue.",
+						},
+					},
+				],
+				stopReason: "toolUse" as const,
+			};
+			yield { content: ["Ready."], stopReason: "stop" as const };
+		})() as MockResponseSource;
+		const { session, mock, tempDir } = await createHarness(responses, [], { realTools: true, realSearchTools: true });
+		await Bun.write(
+			path.join(tempDir.path(), "one.ts"),
+			'export const one = "OLD_ENTRY_BODY";\nexport const target = "two";\n',
+		);
+		await Bun.write(
+			path.join(tempDir.path(), "two.ts"),
+			'export const two = "OLD_WORKER_BODY";\nexport const ready = true;\n',
+		);
+		await Bun.write(
+			path.join(tempDir.path(), "noise.ts"),
+			Array.from({ length: 180 }, (_, i) => `export const n${i} = "NOISE_${i}";`).join("\n"),
+		);
+		await session.prompt("Locate the dependency and retain only the final decision.");
+		const text = mock.calls.at(-1)?.context.messages.map(messageText).join("\n") ?? "";
+		expect(text).toContain("The entry delegates to the worker.");
+		expect(text).toContain("[one.ts#");
+		expect(text).not.toContain("OLD_ENTRY_BODY");
+		expect(text).not.toContain("OLD_WORKER_BODY");
+		expect(session.messages).toEqual(session.sessionManager.buildSessionContext().messages);
+	});
+
+	it("rejects unseen source lines and a search superseded by new user instructions without cutting context", async () => {
+		const { session, tempDir } = await createHarness(
+			[
+				{
+					content: [{ type: "toolCall", id: "search", name: "grep", arguments: { pattern: "value", path: "." } }],
+					stopReason: "toolUse",
+				},
+				{
+					content: [{ type: "toolCall", id: "source", name: "read", arguments: { path: "sample.ts:1-2" } }],
+					stopReason: "toolUse",
+				},
+				{ content: ["Located."], stopReason: "stop" },
+			],
+			[],
+			{ realTools: true, realSearchTools: true },
+		);
+		await Bun.write(
+			path.join(tempDir.path(), "sample.ts"),
+			Array.from({ length: 80 }, (_, i) => `export const value${i} = ${i};`).join("\n"),
+		);
+		await session.prompt("Locate the code.");
+		const snapshot = rewindMutationSnapshot(session);
+		const selection = { readId: searchReference("r", "source"), path: "sample.ts", from: 40, to: 41 };
+		expect(() =>
+			session.validateSearchRewind({
+				searchId: searchReference("s", "search"),
+				retain: [selection],
+				nextAction: "Continue.",
+			}),
+		).toThrow("not fully displayed");
+		expect(rewindMutationSnapshot(session)).toEqual(snapshot);
+		session.sessionManager.appendMessage({
+			role: "user",
+			content: "Keep the current exploration.",
+			timestamp: Date.now(),
+		});
+		expect(() =>
+			session.validateSearchRewind({
+				searchId: searchReference("s", "search"),
+				retain: [],
+				nextAction: "Continue.",
+			}),
+		).toThrow("New user input");
+		expect(session.sessionManager.getBranch().some(entry => entry.type === "branch_summary")).toBe(false);
+	});
+
+	it("keeps the exploration and latest todo when handoff persistence fails", async () => {
+		const trace = "UNCOMMITTED_EXPLORATION ".repeat(1200);
+		const { session, mock } = await createHarness(
+			[
+				{
+					content: [{ type: "toolCall", id: "package_a", name: "checkpoint", arguments: workPackage }],
+					stopReason: "toolUse",
+				},
+				{
+					content: [{ type: "toolCall", id: "read_trace", name: "read_trace", arguments: {} }],
+					stopReason: "toolUse",
+				},
+				{
+					content: [
+						{
+							type: "toolCall",
+							id: "rewind_a",
+							name: "rewind",
+							arguments: { checkpointId: "package_a", report: "A validated.", nextAction: "Start B." },
+						},
+					],
+					stopReason: "toolUse",
+				},
+			],
+			[
+				{
+					name: "read_trace",
+					label: "Read trace",
+					description: "Read the exploration evidence",
+					parameters: type({}),
+					async execute() {
+						return { content: [{ type: "text", text: trace }] };
+					},
+				} as AgentTool,
+			],
+			{ realTools: true },
+		);
+		const todos = [{ name: "Work", tasks: [{ content: "Implement B", status: "in_progress" as const }] }];
+		session.commitTodoPhases(todos);
+		const failure = spyOn(session.sessionManager, "appendEntriesAtomically").mockRejectedValueOnce(
+			new Error("handoff storage unavailable"),
+		);
+		try {
+			await session.prompt("Investigate A then B.").catch(() => undefined);
+			expect(failure).toHaveBeenCalledTimes(1);
+			expect(session.sessionManager.getBranch().some(entry => entry.type === "branch_summary")).toBe(false);
+			expect(
+				session.messages.some(
+					message =>
+						message.role === "toolResult" &&
+						message.content.some(block => block.type === "text" && block.text === trace),
+				),
+			).toBe(true);
+			expect(session.getCheckpointState()?.checkpointId).toBe("package_a");
+			expect(session.getLastCompletedRewind()).toBeUndefined();
+			expect(session.getTodoPhases()).toEqual(todos);
+			expect(mock.calls.length).toBe(3);
+		} finally {
+			failure.mockRestore();
+		}
+	});
+
+	it("rejects a mixed checkpoint batch before any exploration tool runs", async () => {
+		let reads = 0;
+		const { session } = await createHarness(
+			[
+				{
+					content: [
+						{ type: "toolCall", id: "package_a", name: "checkpoint", arguments: workPackage },
+						{ type: "toolCall", id: "read_trace", name: "read_trace", arguments: {} },
+					],
+					stopReason: "toolUse",
+				},
+				{ content: ["Batch refused; plan the work package first."], stopReason: "stop" },
+			],
+			[
+				{
+					name: "read_trace",
+					label: "Read trace",
+					description: "Read evidence",
+					parameters: type({}),
+					async execute() {
+						reads++;
+						return { content: [{ type: "text", text: "trace" }] };
+					},
+				} as AgentTool,
+			],
+			{ realTools: true },
+		);
+		await session.prompt("Research A.");
+		expect(reads).toBe(0);
+		expect(session.getCheckpointState()).toBeUndefined();
+		expect(session.messages.filter(message => message.role === "toolResult" && message.isError).length).toBe(2);
+	});
+
+	it("hands file changes and the latest todo from A to B without retaining A's long trace", async () => {
+		const traceMarker = "A_PRIVATE_EXPLORATION_TRACE";
+		const trace = `${traceMarker}: inspected implementation details.\n`.repeat(1200);
+		const report = "A implemented: package-a.txt contains the completed change.";
+		const nextAction = "Begin B by consuming package-a.txt; do not repeat A's exploration.";
+		const initialTodos = [
+			{
+				name: "Work",
+				tasks: [
+					{ content: "Implement A", status: "in_progress" as const },
+					{ content: "Implement B", status: "pending" as const },
+				],
+			},
+		];
+		const latestTodos = [
+			{
+				name: "Work",
+				tasks: [
+					{ content: "Implement A", status: "completed" as const },
+					{ content: "Implement B", status: "in_progress" as const },
+				],
+			},
+		];
+		const implementSchema = type({});
+		const implement: AgentTool<typeof implementSchema, unknown> = {
+			name: "implement_a",
+			label: "Implement A",
+			description: "Apply A and record its detailed evidence",
+			parameters: implementSchema,
+			async execute() {
+				await Bun.write(path.join(session.sessionManager.getCwd(), "package-a.txt"), "A is implemented\n");
+				session.commitTodoPhases(latestTodos);
+				return { content: [{ type: "text", text: trace }] };
+			},
+		};
+		const { session, mock, tempDir } = await createHarness(
+			[
+				{
+					content: [{ type: "toolCall", id: "package_a", name: "checkpoint", arguments: workPackage }],
+					stopReason: "toolUse",
+				},
+				{
+					content: [{ type: "toolCall", id: "implement_a", name: "implement_a", arguments: {} }],
+					stopReason: "toolUse",
+				},
+				{
+					content: [
+						{
+							type: "toolCall",
+							id: "rewind_a",
+							name: "rewind",
+							arguments: {
+								checkpointId: "package_a",
+								report,
+								nextAction,
+							},
+						},
+					],
+					stopReason: "toolUse",
+				},
+				{ content: ["B begins from the retained handoff."], stopReason: "stop" },
+			],
+			[implement as AgentTool],
+			{ realTools: true },
+		);
+		session.commitTodoPhases(initialTodos);
+
+		await session.prompt("Complete A, then B. Keep all file changes and do not commit.");
+
+		expect(await Bun.file(path.join(tempDir.path(), "package-a.txt")).text()).toBe("A is implemented\n");
+		expect(session.getTodoPhases()).toEqual(latestTodos);
+		expect(session.getCheckpointState()).toBeUndefined();
+		expect(session.getLastCompletedRewind()).toMatchObject({ checkpointId: "package_a", nextAction });
+		expect(mock.calls).toHaveLength(4);
+		const beforeRewind = mock.calls[2]!.context.messages.map(messageText).join("\n");
+		expect(beforeRewind).toContain(traceMarker);
+		const nextCall = mock.calls[3]!.context.messages;
+		const nextContext = nextCall.map(messageText).join("\n");
+		expect(nextContext).not.toContain(traceMarker);
+		expect(nextContext).toContain("do not commit");
+		const handoffs = nextCall.filter(
+			message => message.role === "developer" && messageText(message).includes(report),
+		);
+		expect(handoffs).toHaveLength(1);
+		expect(messageText(handoffs[0]!)).toContain(nextAction);
+		expect(nextContext.length).toBeLessThan(beforeRewind.length);
+		expect(session.messages).toEqual(session.sessionManager.buildSessionContext().messages);
+		const retained = convertToLlm(session.sessionManager.buildSessionContext().messages).map(messageText).join("\n");
+		expect(retained).toContain(report);
+		expect(retained).toContain(nextAction);
+		expect(retained).not.toContain(traceMarker);
+	});
+
+	it("returns the matching checkpoint ID and next action only after runtime validation succeeds", async () => {
+		const { session } = await createActiveWorkPackage();
+		const before = rewindMutationSnapshot(session);
+		const request = { checkpointId: "package_a", report: "A completed", nextAction: "Start B" };
+
+		const result = await validatingRewindToolForSession(session).execute("rewind_a", request);
+
+		expect(result.details).toMatchObject({ ...request, rewound: true });
+		const estimate = result.details?.estimate;
+		if (!estimate) throw new Error("Expected projected context estimate");
+		expect(estimate.afterTokens).toBeLessThan(estimate.beforeTokens);
+		expect(estimate.reusablePrefixTokens).toBeLessThanOrEqual(estimate.afterTokens);
+		// The tool acknowledges the request; only the session lifecycle applies the branch cut.
+		expect(rewindMutationSnapshot(session)).toEqual(before);
+	});
+
+	it("refuses a stale checkpoint ID through the real rewind tool without mutating state", async () => {
+		const { session } = await createActiveWorkPackage();
+		expect(session.getCheckpointState()).toMatchObject({ checkpointId: "package_a", ...workPackage });
+		const before = rewindMutationSnapshot(session);
+
+		await expect(
+			validatingRewindToolForSession(session).execute("stale_rewind", {
+				checkpointId: "previous_package",
+				report: "A completed",
+				nextAction: "Start B",
+			}),
+		).rejects.toThrow(/checkpoint/i);
+
+		expect(rewindMutationSnapshot(session)).toEqual(before);
+	});
+
+	it.each([false, true])("refuses to discard a newer user instruction (persisted=%s)", async persisted => {
+		const { session } = await createActiveWorkPackage();
+		const instruction: AgentMessage = {
+			role: "user",
+			content: "New instruction: preserve the audit output and stop after A.",
+			timestamp: 3,
+		};
+		session.agent.appendMessage(instruction);
+		if (persisted) session.sessionManager.appendMessage(instruction);
+		const before = rewindMutationSnapshot(session);
+
+		await expect(
+			validatingRewindToolForSession(session).execute("unsafe_rewind", {
+				checkpointId: "package_a",
+				report: "A completed",
+				nextAction: "Start B",
+			}),
+		).rejects.toThrow(/user|instruction/i);
+
+		const after = rewindMutationSnapshot(session);
+		expect({ ...after, checkpoint: before.checkpoint }).toEqual(before);
+		expect(session.messages).toContainEqual(instruction);
+	});
+
+	it("fails closed when the matching checkpoint has lost its durable anchor", async () => {
+		const { session } = await createActiveWorkPackage();
+		const state = session.getCheckpointState();
+		if (!state) throw new Error("Expected active work package");
+		session.setCheckpointState({ ...state, checkpointEntryId: "missing-anchor" });
+		const before = rewindMutationSnapshot(session);
+		await expect(
+			validatingRewindToolForSession(session).execute("lost_anchor", {
+				checkpointId: "package_a",
+				report: "A validated.",
+				nextAction: "Start B.",
+			}),
+		).rejects.toThrow();
+		expect(rewindMutationSnapshot(session)).toEqual(before);
+	});
+
+	it("does not schedule hidden continuation after a no-savings refusal", async () => {
+		const { session, mock } = await createHarness(
+			[
+				{
+					content: [{ type: "toolCall", id: "package_a", name: "checkpoint", arguments: workPackage }],
+					stopReason: "toolUse",
+				},
+				{
+					content: [
+						{
+							type: "toolCall",
+							id: "rewind_a",
+							name: "rewind",
+							arguments: {
+								checkpointId: "package_a",
+								report: "Retained implementation finding. ".repeat(300),
+								nextAction: "Start B.",
+							},
+						},
+					],
+					stopReason: "toolUse",
+				},
+				{ content: ["Context retained; no rewrite performed."], stopReason: "stop" },
+			],
+			[],
+			{ realTools: true },
+		);
+		await session.prompt("Complete A.");
+		await session.waitForIdle();
+		expect(mock.calls.length).toBe(3);
+		expect(
+			session.messages.some(
+				message => message.role === "toolResult" && message.toolName === "rewind" && message.isError,
+			),
+		).toBe(true);
+		expect(session.sessionManager.getBranch().some(entry => entry.type === "branch_summary")).toBe(false);
+	});
+
+	it("rejects a no-savings handoff before mutating the active branch", async () => {
+		const { session } = await createActiveWorkPackage("");
+		const before = rewindMutationSnapshot(session);
+
+		await expect(
+			validatingRewindToolForSession(session).execute("no_savings_rewind", {
+				checkpointId: "package_a",
+				report: "Retained implementation finding. ".repeat(90),
+				nextAction: "Start B",
+			}),
+		).rejects.toThrow();
+
+		expect(rewindMutationSnapshot(session)).toEqual(before);
+	});
+
 	it("rebuilds active history at the checkpoint before the post-rewind assistant turn", async () => {
 		const report = "findings: kept checkpoint; risks: stale signed thinking";
 		const { session, mock } = await createHarness([
@@ -248,9 +1380,6 @@ describe("AgentSession checkpoint rewind branch context", () => {
 		const reportMessage = finalCall.context.messages[reportIndex];
 		if (!reportMessage) throw new Error("Expected rewind report context");
 		const reportText = messageText(reportMessage);
-		expect(reportText).toContain(
-			"Checkpoint called and rewound. Report retained below. Need explore again → new `checkpoint`.",
-		);
 		expect(reportText).toContain(report);
 
 		expect(
@@ -430,11 +1559,13 @@ describe("AgentSession checkpoint rewind branch context", () => {
 				message.role === "custom" && message.customType === "checkpoint-active-reminder",
 		);
 		expect(reminder).toBeDefined();
-		expect(reminder?.content).toContain("MUST `rewind` before yielding");
+		expect(reminder?.content).toBeTruthy();
 		const activeCall = mock.calls[1];
 		expect(activeCall).toBeDefined();
 		expect(
-			activeCall?.context.messages.some(message => messageText(message).includes("Exploration checkpoint active.")),
+			activeCall?.context.messages.some(
+				message => message.role === "developer" && messageText(message) === reminder?.content,
+			),
 		).toBe(true);
 		// #checkpointState is set synchronously with the reminder (pre-await), so an
 		// immediate rewind would find an active checkpoint, not "No active checkpoint".
@@ -460,10 +1591,9 @@ describe("AgentSession checkpoint rewind branch context", () => {
 
 		// Exactly one developer message carries the forward-looking rewind report.
 		const reportMessages = finalCall.context.messages.filter(
-			message => message.role === "developer" && messageText(message).includes("Checkpoint called and rewound."),
+			message => message.role === "developer" && messageText(message).includes(report),
 		);
 		expect(reportMessages).toHaveLength(1);
-		expect(messageText(reportMessages[0]!)).toContain("Need explore again → new `checkpoint`.");
 		expect(messageText(reportMessages[0]!)).toContain(report);
 	});
 
@@ -633,7 +1763,8 @@ describe("AgentSession checkpoint rewind branch context", () => {
 		).toBe(false);
 		expect(session.messages).toEqual(session.sessionManager.buildSessionContext().messages);
 
-		expect(session.getLastCompletedRewind()).toEqual({
+		expect(session.getLastCompletedRewind()).toMatchObject({
+			checkpointId: "call_checkpoint_xdev",
 			report,
 			startedAt: "2026-01-01T00:00:00.000Z",
 			rewoundAt: expect.any(String),
@@ -689,7 +1820,11 @@ describe("AgentSession checkpoint rewind branch context", () => {
 		// paused: prefixed checkpoint results must activate its session state.
 		const checkpointState = session.getCheckpointState();
 		const rewindProbe = await rewindToolForSession(session)
-			.execute("probe_rewind_after_direct_xdev", { report: "probe" })
+			.execute("probe_rewind_after_direct_xdev", {
+				checkpointId: "call_checkpoint_direct_xdev",
+				report: "probe",
+				nextAction: "Continue the task",
+			})
 			.then(
 				result => ({ result }),
 				error => ({ error }),
@@ -700,7 +1835,8 @@ describe("AgentSession checkpoint rewind branch context", () => {
 		expect(checkpointState).toBeDefined();
 		expect(rewindProbe).not.toHaveProperty("error");
 		expect(session.getCheckpointState()).toBeUndefined();
-		expect(session.getLastCompletedRewind()).toEqual({
+		expect(session.getLastCompletedRewind()).toMatchObject({
+			checkpointId: "call_checkpoint_direct_xdev",
 			report,
 			startedAt: "2026-01-01T00:00:00.000Z",
 			rewoundAt: expect.any(String),
@@ -764,7 +1900,8 @@ describe("AgentSession checkpoint rewind branch context", () => {
 		});
 		harness.extraSessions.push(reloadedSession);
 
-		expect(reloadedSession.getLastCompletedRewind()).toEqual({
+		expect(reloadedSession.getLastCompletedRewind()).toMatchObject({
+			checkpointId: "call_checkpoint",
 			report,
 			startedAt: "2026-01-01T00:00:00.000Z",
 			rewoundAt: expect.any(String),
@@ -774,7 +1911,13 @@ describe("AgentSession checkpoint rewind branch context", () => {
 				getLastCompletedRewind: () => reloadedSession.getLastCompletedRewind(),
 			}),
 		);
-		await expect(tool.execute("repeat_rewind", { report: "retry" })).rejects.toThrow(
+		await expect(
+			tool.execute("repeat_rewind", {
+				checkpointId: "call_checkpoint",
+				report: "retry",
+				nextAction: "Continue the task",
+			}),
+		).rejects.toThrow(
 			"Checkpoint already completed; continue from the retained rewind report instead of calling rewind again.",
 		);
 	});
@@ -836,6 +1979,8 @@ describe("AgentSession checkpoint rewind branch context", () => {
 		const tool = new RewindTool(
 			createToolSession({
 				getLastCompletedRewind: () => ({
+					checkpointId: "call_checkpoint",
+					nextAction: "Continue the task",
 					report: "findings retained",
 					startedAt: "2026-01-01T00:00:00.000Z",
 					rewoundAt: "2026-01-01T00:01:00.000Z",
@@ -843,7 +1988,13 @@ describe("AgentSession checkpoint rewind branch context", () => {
 			}),
 		);
 
-		await expect(tool.execute("repeat_rewind", { report: "retry" })).rejects.toThrow(
+		await expect(
+			tool.execute("repeat_rewind", {
+				checkpointId: "call_checkpoint",
+				report: "retry",
+				nextAction: "Continue the task",
+			}),
+		).rejects.toThrow(
 			"Checkpoint already completed; continue from the retained rewind report instead of calling rewind again.",
 		);
 	});
@@ -915,17 +2066,18 @@ describe("AgentSession checkpoint rewind branch context", () => {
 		const restored = reloadedSession.getCheckpointState();
 		expect(restored).toBeDefined();
 		expect(restored?.checkpointEntryId).toBe(checkpointEntry.id);
+		expect(restored?.checkpointId).toBe("call_checkpoint");
 		expect(restored?.startedAt).toBe(startedAt);
 		expect(reloadedSession.getLastCompletedRewind()).toBeUndefined();
 
 		// The rewind tool must accept the request now that the active checkpoint
 		// has been re-hydrated — previously this threw "No active checkpoint".
 		const rewindResult = await rewindToolForSession(reloadedSession).execute("call_rewind_after_resume", {
+			checkpointId: "call_checkpoint",
+			nextAction: "Continue the task",
 			report: "post-resume findings",
 		});
-		expect(rewindResult.content.some(part => part.type === "text" && part.text.includes("Rewind requested"))).toBe(
-			true,
-		);
+		expect(rewindResult.details?.rewound).toBe(true);
 	});
 	it("marks extension agent_end willContinue when enforceRewindBeforeYield continues", async () => {
 		const agentEnds: Array<boolean | undefined> = [];
@@ -1048,11 +2200,14 @@ describe("AgentSession checkpoint rewind branch context", () => {
 
 		expect(reloadedSession.getCheckpointState()).toMatchObject({
 			checkpointEntryId: checkpointEntry.id,
+			checkpointId: "call_checkpoint_xdev",
 			startedAt: "2026-01-01T00:00:00.000Z",
 		});
 		expect(reloadedSession.getLastCompletedRewind()).toBeUndefined();
 		await expect(
 			rewindToolForSession(reloadedSession).execute("call_rewind_after_xdev_resume", {
+				checkpointId: "call_checkpoint_xdev",
+				nextAction: "Continue the task",
 				report: "post-resume findings",
 			}),
 		).resolves.toMatchObject({ details: { report: "post-resume findings", rewound: true } });

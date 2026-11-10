@@ -7,6 +7,25 @@ Compaction and branch summaries are the two mechanisms that keep long sessions u
 
 Both are persisted as session entries and converted back into user-context messages when rebuilding LLM input.
 
+## Proactive work-package checkpoints
+
+The paired [checkpoint](./tools/checkpoint.md) and [rewind](./tools/rewind.md) tools offer a planned boundary before noisy research or a long implementation phase. They reuse session branching; they do not add a scheduler or wait for automatic compaction thresholds.
+
+Record the overall objective, constraints, and A→B plan before anchoring A with `checkpoint({goal, finishWhen, carryForward})`. Packages nest up to 32 levels and only the stack top closes. Omit `todo` to bind the unique active task, supply `{phase}` or `{phase, task}` for an explicit binding, or use `false` for an unbound package. A todo cannot be bound twice in the same stack.
+
+After reaching `finishWhen`, call `rewind({checkpointId, report, nextAction, outcome})`; a bound package requires `outcome`, and `blocked` also requires `reason`. Report and progress commit atomically; do not mark the todo done separately. Completing a task starts the next pending task, while a blocked task stays blocked. Phase completion requires completed children and evidence for its own acceptance. Close A before B; then verify and close their parent.
+
+A successful context change replaces post-anchor conversation with the handoff and current todo state; later parent cuts replace child traces and summaries. With an explicit outcome, no net savings can still commit progress and close the scope without changing context. Acceptance is not proof of a cut: the final journal report's `contextChanged` is. Strict savings checks exclude the newly generated report. Files and external effects are never rolled back; stale anchors, changed binding identities and new user input fail closed. The persisted journal retains original history and recovers active parents and bindings.
+
+Child reports carry only what the parent and later siblings need: shared contracts and constraints, verified decisions, compact file/symbol indexes, evidence, and unresolved risks. Later sibling cuts preserve prior reports; parent closure consolidates still-needed findings into its own report before replacing child history. Macro cuts do not automatically retain child search materials. File indexes locate evidence but are not fresh source snapshots.
+
+`checkpoint.enabled` gates both tools, with stable essential definitions when available; subagents require explicit inclusion. Cache eligibility estimates do not guarantee a hit; actual provider usage is evidence. This is separate from the threshold-driven QA `new_context` checkpoint protocol below.
+
+Small locating decisions use `rewind({searchId, retain, nextAction})`: search tools provide the pre-search boundary, and retained read ranges carry exact already-displayed code with its source snapshot, without rereading. A short continuation replaces the search trace. Later hops inherit selected materials and can explicitly release or demote them. These cuts preserve canonical todo state and the enclosing package; they do not mark work complete. See [selective rewind](./tools/rewind.md#small-search-decisions) for selection and safety limits.
+
+
+While a work package is active, ordinary mid-turn threshold cuts and QA advisories defer to its milestone. The hard context boundary and overflow recovery remain safety fallbacks; a fallback boundary invalidates the older package anchor.
+
 ## Key implementation files
 
 - `packages/agent/src/compaction/compaction.ts` (context-full summarization and handoff generation)

@@ -10,6 +10,7 @@ import { type } from "@oh-my-pi/omptype";
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@oh-my-pi/pi-agent-core";
 
 import { isRecord, prompt } from "@oh-my-pi/pi-utils";
+import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 
 import todoDescription from "../prompts/tools/todo.md" with { type: "text" };
 import type { ToolSession } from "../sdk";
@@ -180,6 +181,126 @@ function todoPhasesFingerprint(phases: readonly TodoPhase[]): string {
 			),
 		})),
 	);
+}
+
+export interface WorkPackageTodoBinding {
+	phase: string;
+	task?: string;
+	identity: TodoSnapshotIdentity;
+}
+
+export type WorkPackageOutcome = "completed" | "blocked" | "in_progress";
+
+function validateWorkPackageIdentity(phases: readonly TodoPhase[], identity: TodoSnapshotIdentity | undefined): void {
+	if (!identity?.sourceEntryId || !identity.fingerprint || identity.fingerprint !== todoPhasesFingerprint(phases)) {
+		throw new ToolError("Todo snapshot is missing or stale.");
+	}
+}
+
+function workPackagePhase(phases: readonly TodoPhase[], name: string): TodoPhase {
+	const matches = phases.filter(phase => phase.name === name);
+	if (matches.length !== 1) throw new ToolError("Work-package phase is missing or ambiguous.");
+	return matches[0];
+}
+
+function workPackageTask(phase: TodoPhase, content: string): TodoItem {
+	const matches = phase.tasks.filter(task => task.content === content);
+	if (matches.length !== 1) throw new ToolError("Work-package task is missing or ambiguous.");
+	return matches[0];
+}
+
+/** Bind a work package to a canonical snapshot, never to an invented task identity. */
+export function bindWorkPackageTodo(
+	phases: readonly TodoPhase[],
+	identity: TodoSnapshotIdentity | undefined,
+	target?: { phase?: string; task?: string },
+): WorkPackageTodoBinding | undefined {
+	if (target && ((!target.phase && !target.task) || target.phase === "" || target.task === "")) {
+		throw new ToolError("Work-package target must name a phase or task.");
+	}
+	let phase: TodoPhase;
+	let task: TodoItem | undefined;
+	if (!target) {
+		const active = phases.flatMap(candidate =>
+			candidate.tasks.filter(item => item.status === "in_progress").map(item => ({ phase: candidate, task: item })),
+		);
+		if (active.length === 0) return undefined;
+		if (active.length !== 1) throw new ToolError("Active work-package task is ambiguous.");
+		({ phase, task } = active[0]);
+		workPackagePhase(phases, phase.name);
+		workPackageTask(phase, task.content);
+	} else if (target.task !== undefined) {
+		const matches = phases.flatMap(candidate =>
+			target.phase === undefined || candidate.name === target.phase
+				? candidate.tasks
+						.filter(item => item.content === target.task)
+						.map(item => ({ phase: candidate, task: item }))
+				: [],
+		);
+		if (matches.length !== 1) throw new ToolError("Work-package task is missing or ambiguous.");
+		({ phase, task } = matches[0]);
+		workPackagePhase(phases, phase.name);
+		if (task.status === "completed" || task.status === "abandoned") {
+			throw new ToolError("Work-package task is already finished or abandoned.");
+		}
+	} else {
+		phase = workPackagePhase(phases, target.phase!);
+		if (phase.tasks.length === 0 || phase.tasks.every(item => item.status === "abandoned")) {
+			throw new ToolError("Work-package phase has no eligible tasks.");
+		}
+	}
+	validateWorkPackageIdentity(phases, identity);
+	return { phase: phase.name, ...(task ? { task: task.content } : {}), identity: { ...identity! } };
+}
+
+/** Apply an outcome to a caller-owned canonical copy after validating the entire transition. */
+export function applyWorkPackageTodoOutcome(
+	phases: TodoPhase[],
+	identity: TodoSnapshotIdentity | undefined,
+	binding: WorkPackageTodoBinding,
+	outcome: WorkPackageOutcome,
+	reason?: string,
+): void {
+	validateWorkPackageIdentity(phases, identity);
+	if (
+		!binding?.identity ||
+		identity?.sourceEntryId !== binding.identity.sourceEntryId ||
+		identity?.fingerprint !== binding.identity.fingerprint
+	)
+		throw new ToolError("Work-package todo binding is stale.");
+	if (outcome !== "completed" && outcome !== "blocked" && outcome !== "in_progress") {
+		throw new ToolError("Invalid work-package outcome.");
+	}
+	const blocker = reason?.replace(/\s+/g, " ").trim();
+	if (outcome === "blocked" && !blocker) throw new ToolError("Blocked work requires a reason.");
+	const phase = workPackagePhase(phases, binding.phase);
+	const task = binding.task === undefined ? undefined : workPackageTask(phase, binding.task);
+	if (task && (task.status === "completed" || task.status === "abandoned")) {
+		throw new ToolError("Work-package task is already finished or abandoned.");
+	}
+	if (!task && (phase.tasks.length === 0 || phase.tasks.every(item => item.status === "abandoned"))) {
+		throw new ToolError("Work-package phase has no eligible tasks.");
+	}
+	if (!task && outcome === "completed" && phase.tasks.some(item => item.status !== "completed")) {
+		throw new ToolError("A phase cannot complete until every task is completed.");
+	}
+	if (task && outcome === "completed") {
+		task.status = "completed";
+		task.blocker = undefined;
+	} else if (outcome === "blocked") {
+		for (const item of task ? [task] : phase.tasks) {
+			if (item.status === "completed" || item.status === "abandoned") continue;
+			item.status = "blocked";
+			item.blocker = blocker;
+		}
+	} else if (outcome === "in_progress") {
+		for (const item of task ? [task] : phase.tasks) {
+			if (item.status === "completed" || item.status === "abandoned") continue;
+			if (item.status === "blocked") item.status = "pending";
+			item.blocker = undefined;
+		}
+	}
+	normalizeInProgressTask(phases);
 }
 
 function canonicalTodoPhases(entry: SessionEntry): TodoPhase[] | undefined {

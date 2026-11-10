@@ -13,3 +13,5 @@ Sources:
 - JSON/JSONL/NDJSON: file.json?q=<jq filter>; &raw=true unquoted strings, &compact=true one-line values, &offset=&limit= page results; `&` inside the filter → %26.
 {{#if BINARY_VIEWS}}- Executables (ELF/PE/Mach-O, extensionless ok): overview + function list; :<func|0xaddr> pseudocode, :<func>:asm, :imports, :exports, :strings, :xrefs:<func|0xaddr>; line ranges apply after the view (bin:main:10-40). Universal Mach-O: host-arch slice by default, bin:@<arch> picks another (bin:@x86_64:main).
 {{/if}}- PDF/documents: extracted text; notebooks: editable cells; images: decoded inline. URLs: reader text/markdown, :raw original HTML; bare host:port needs trailing slash.
+
+`readId` identifies this delivered snapshot for `rewind.retain`. Select only fully displayed numbered lines under an exact `[path#tag]`; raw, omitted and truncated content cannot be retained this way. Do not reread unchanged code merely to carry it across a search rewind.

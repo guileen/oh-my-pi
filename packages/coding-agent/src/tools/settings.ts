@@ -757,12 +757,12 @@ export const cfgImagesQuestionTimeoutMs = register({
 export const cfgCheckpointEnabled = register({
 	id: "checkpoint.enabled",
 	type: "boolean",
-	default: false,
+	default: true,
 	ui: {
 		tab: "tools",
 		group: "Available Tools",
 		label: "Checkpoint/Rewind",
-		description: "Enable the checkpoint and rewind tools for context checkpointing",
+		description: "Plan work packages and replace their temporary context with a handoff",
 	},
 });
 

@@ -1,1 +1,11 @@
-End the active checkpoint; rewind context to it, replacing intermediate exploration with your report.
+Close a locating decision as soon as it yields a concrete next action; do not wait for the whole todo to finish.
+
+- Search decision: use the `searchId` returned by grep/find. `retain` selects exact `{readId, path, from, to}` ranges already displayed by read; runtime carries the original code and edit anchors, without rereading. `nextAction` is a short continuation, e.g. “Located the entry; follow its worker.” No intent paragraph or long report.
+- Existing materials survive later hops. `release` drops returned material references; `demote` replaces their code with a concise fact/exclusion reason and source location. Preserve caller constraints that later code does not replace.
+- Call alone after the search/read batch settles, before editing or starting unrelated work. A search mixed with non-search operations is not a safe boundary.
+- Work-package handoff: use `checkpointId`, evidence-backed `report`, and `nextAction`; a bound package also requires `outcome`, and `blocked` requires `reason`. Commit progress through rewind, not a separate todo mutation. Only the stack top closes.
+- Before closing, decide what the parent and later siblings need: shared constraints, verified contracts/decisions, compact file/symbol or artifact indexes, verification evidence, and unresolved risks. Put only relevant information in `report`; omit private exploration and irrelevant code. Macro cuts do not automatically carry selected search materials. When closing a parent, consolidate still-needed child findings and indexes into its report; do not merely announce completion.
+- A small decision neither completes a todo nor closes its enclosing package. New input, stale boundaries, unseen/truncated source, unsafe batches, or no net reduction reject its cut.
+- An explicit macro outcome can commit progress and close the scope without a context cut when there is no net reduction; this is not successful compaction. Accepted is not committed: `contextChanged` is the actual macro result. NEVER retry an unchanged rejected handoff.
+- Rewind changes context, never files or authoritative todo history. Parent cuts replace child traces and summaries when beneficial. Cache eligibility is an estimate, not a hit; only usage confirms caching.
+- After success, continue from the retained code immediately. Reopen evidence only for missing detail, changed sources, or contradiction.

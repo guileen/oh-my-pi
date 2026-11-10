@@ -2764,6 +2764,10 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			getCheckpointState: () => session.getCheckpointState(),
 			setCheckpointState: state => session.setCheckpointState(state ?? undefined),
 			getLastCompletedRewind: () => session.getLastCompletedRewind(),
+			validateRewind: (checkpointId, report, nextAction, outcome, reason) =>
+				session.validateRewind(checkpointId, report, nextAction, outcome, reason),
+			bindCheckpointTodo: target => session.bindCheckpointTodo(target),
+			validateSearchRewind: input => session.validateSearchRewind(input),
 			getToolChoiceQueue: () => session.toolChoiceQueue,
 			buildToolChoice: name => {
 				const m = session.model;

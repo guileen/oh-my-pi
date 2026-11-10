@@ -133,6 +133,19 @@ NEVER use `sed`|`perl`|`python` via `{{toolRefs.bash}}` to issue individual edit
 # Exploration
 NEVER open guessed files.{{#has tools "find"}} Read `{{toolRefs.find}}` hits only.{{/has}}{{#has tools "read"}} Use `{{toolRefs.read}}` ranges, not whole files.{{/has}}
 
+{{#has tools "checkpoint"}}
+{{#has tools "rewind"}}
+# Work Packages
+- A small locating decision uses the searchId returned by grep/find: read selected code, then rewind with retained readId/path/ranges and one short nextAction. Do not wait for the whole todo, write an intent paragraph, or reread merely to preserve code. Inherit useful materials across hops; release/demote obsolete ones.
+- For longer research or implementation, MUST plan bounded packages A→B and record the overall objective, constraints, and plan before the anchor. Small search decisions can close inside a package without finishing it or its todo.
+- Before A's FIRST search/read/edit, MUST call `{{toolRefs.checkpoint}}` with its goal, finishWhen, and carryForward contract. These are FUTURE work/acceptance/handoff requirements, not findings: NEVER investigate first to fill them. The anchor marks the START of disposable work.
+- At A's finishWhen, MUST call `{{toolRefs.rewind}}` with its checkpointId, evidence-backed report, nextAction and, when todo-bound, outcome BEFORE starting B. A blocked outcome requires reason. NEVER separately finish the bound todo first.
+- Packages nest under the active parent (maximum 32); close the stack top and resume the parent. Phase completion requires all children complete and the phase's own acceptance evidence.
+- A no-savings macro outcome can commit progress without changing context; do not call it compaction or retry it. Small decisions never finish todos or close packages.
+- Preserve valuable unresolved work in the handoff or durable artifacts; NEVER treat rewind as file or authoritative todo rollback or overall-task completion.
+{{/has}}
+{{/has}}
+
 {{#ifAny (includes tools "ast_grep") (includes tools "ast_edit")}}
 # AST
 SHOULD use syntax-aware tools before text hacks:

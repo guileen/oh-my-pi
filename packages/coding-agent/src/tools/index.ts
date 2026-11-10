@@ -37,6 +37,7 @@ import type { CustomMessage } from "../session/messages";
 import type { QaCheckpointAcceptance, QaCheckpointInput } from "../session/qa-rollover";
 import type { UsageStatistics } from "../session/session-entries";
 import type { SessionManager } from "../session/session-manager";
+import type { SearchRewindInput } from "../session/search-rewind";
 import type { ToolChoiceQueue } from "../session/tool-choice-queue";
 import { TaskTool } from "../task";
 import type { AgentOutputManager } from "../task/output-manager";
@@ -51,7 +52,13 @@ import { AstEditTool } from "./ast-edit";
 import { AstGrepTool } from "./ast-grep";
 import { BashTool } from "./bash";
 import { type BuiltinToolName, type HiddenToolName, normalizeToolNames } from "./builtin-names";
-import { type CheckpointState, CheckpointTool, type CompletedRewindState, RewindTool } from "./checkpoint";
+import {
+	type CheckpointState,
+	CheckpointTool,
+	type CompletedRewindState,
+	type RewindContextEstimate,
+	RewindTool,
+} from "./checkpoint";
 import { ContextNotesTool, NewContextTool } from "./context-notes";
 import { DebugTool } from "./debug";
 import { cfgIdaAvailable } from "../ida/install";
@@ -75,6 +82,7 @@ import { ReadTool } from "./read";
 import type { PlanProposalHandler } from "./resolve";
 import { SecurityScanTool } from "./security-scan";
 import { supportsExternalThinking, ThinkTool } from "./think";
+import type { WorkPackageOutcome, WorkPackageTodoBinding } from "./todo";
 import { type TodoPhase } from "@oh-my-pi/pi-tui/tools/todo";
 import { TodoTool } from "./todo";
 import { WriteTool } from "./write";
@@ -553,6 +561,18 @@ export interface ToolSession {
 	setCheckpointState?: (state: CheckpointState | null) => void;
 	/** Get the most recent completed rewind, if this session just rewound a checkpoint. */
 	getLastCompletedRewind?: () => CompletedRewindState | undefined;
+	/** Validate a work-package handoff without changing the active transcript. */
+	validateRewind?: (
+		checkpointId: string,
+		report: string,
+		nextAction: string,
+		outcome?: WorkPackageOutcome,
+		reason?: string,
+	) => RewindContextEstimate;
+	/** Resolve a checkpoint's canonical todo target before work begins. */
+	bindCheckpointTodo?: (target?: { phase?: string; task?: string }) => WorkPackageTodoBinding | undefined;
+	/** Validate a selective search decision against already-delivered snapshots. */
+	validateSearchRewind?: (input: SearchRewindInput) => RewindContextEstimate;
 
 	/** Native snapshots, clipboard registers, and no-op guard shared by edit calls. */
 	editStore?: EditStore;

@@ -249,7 +249,12 @@ import {
 	releaseIdleTabsForOwner,
 	releaseTabsForOwner,
 } from "../tools/browser/tab-supervisor";
-import type { CheckpointState, CompletedRewindState } from "../tools/checkpoint";
+import type {
+	CheckpointState,
+	CompletedRewindState,
+	RewindContextEstimate,
+	RewindToolDetails,
+} from "../tools/checkpoint";
 import {
 	beginComputerTurnForOwner,
 	endComputerTurnForOwner,
@@ -268,7 +273,23 @@ import {
 } from "../tools/resolve";
 import { PROPOSE_DEVICE_NAME } from "@oh-my-pi/pi-tui/tools/resolve";
 import { supportsExternalThinking } from "../tools/think";
-import { USER_TODO_EDIT_CUSTOM_TYPE } from "../tools/todo";
+import {
+	applyWorkPackageTodoOutcome,
+	bindWorkPackageTodo,
+	getLatestTodoSnapshotIdentity,
+	phasesToMarkdown,
+	USER_TODO_EDIT_CUSTOM_TYPE,
+	type WorkPackageOutcome,
+	type WorkPackageTodoBinding,
+} from "../tools/todo";
+import { customMessageEntryMessage } from "@oh-my-pi/pi-tui/chat/transcript-entry";
+import {
+	checkpointStateFromValue,
+	checkpointTodoFromValue,
+	refreshCheckpointTodoIdentity,
+	WORK_PACKAGE_REWIND_KIND,
+	WORK_PACKAGE_STATE_TYPE,
+} from "./work-package-state";
 import type { TodoPhase } from "@oh-my-pi/pi-tui/tools/todo";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { currentThreadId, isMainThread } from "../thread/identity";
@@ -353,8 +374,23 @@ import {
 	checkpointStartedAtFromEntry,
 	completedRewindFromEntry,
 	isSuccessfulCheckpointEntry,
+	semanticCheckpointCall,
 	semanticToolResult,
 } from "./checkpoint-entries";
+import {
+	annotateSearchResult,
+	buildSearchRewindPlan,
+	isSearchRewind,
+	isSearchRewindCall,
+	keepSearchMessage,
+	renderSearchMaterial,
+	SEARCH_DECISION,
+	SEARCH_MATERIAL,
+	SEARCH_REWIND_KIND,
+	SEARCH_REWIND_STATE,
+	type SearchRewindInput,
+	type SearchRewindPlan,
+} from "./search-rewind";
 import type { ClientBridge } from "./client-bridge";
 import {
 	type ClaudeResetAction,
@@ -590,6 +626,7 @@ import {
 } from "../utils/title-settings";
 import {
 	cfgArchiveEnabled,
+	cfgCheckpointEnabled,
 	cfgComputerEnabled,
 	cfgRatchetEnabled,
 	cfgDevAutoqa,
@@ -1423,7 +1460,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	/** Last `skillful` value applied to this session; dedupes {@link setSkillful} and its setting watch. */
 	#skillfulApplied = false;
 	#checkpointState: CheckpointState | undefined = undefined;
-	#pendingRewindReport: string | undefined = undefined;
+	#pendingRewindReport: RewindToolDetails | undefined = undefined;
 	#lastCompletedRewind: CompletedRewindState | undefined = undefined;
 	#rewoundToolResultIds = new Set<string>();
 	#lastSuccessfulYieldToolCallId: string | undefined = undefined;
@@ -2460,10 +2497,27 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		this.agent.setRawSseEventInterceptor(this.#onSseEvent);
 		this.agent.setOnTurnEnd(async (messages, signal, context) => {
 			if (signal?.aborted) return;
-			const rewindReport = this.#extractRewindReport(messages);
+			await this.#messageEndPersistenceTail;
+			if (signal?.aborted) return;
+			const searchResult = context?.toolResults.find(result => {
+				const semantic = semanticToolResult(result.toolName, result);
+				return (
+					!result.isError &&
+					semantic?.toolName === "rewind" &&
+					isRecord(semantic.details) &&
+					isRecord(semantic.details.search)
+				);
+			});
+			if (searchResult) {
+				const details = semanticToolResult(searchResult.toolName, searchResult)?.details;
+				if (isRecord(details) && isRecord(details.search)) {
+					await this.#applySearchRewind(details.search as unknown as SearchRewindInput, messages, signal);
+				}
+			}
+			const rewindReport = searchResult ? undefined : this.#extractRewindReport(messages);
 			if (rewindReport) {
 				this.#pendingRewindReport = undefined;
-				await this.#applyRewind(rewindReport, messages, context);
+				await this.#applyRewind(rewindReport, messages, context, signal);
 			}
 			this.#loopGuards.recordTurn(messages, context);
 			await this.#prewalk.advanceAtTurnEnd(messages, context);
@@ -2902,6 +2956,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				this.#experimentalContextNotesReminder = { prompt, generation: this.#promptGeneration };
 			},
 			hasQaRolloverTool: () => this.#tools.getEnabledToolNames().includes("new_context"),
+			hasActiveWorkPackage: () => this.getCheckpointState() !== undefined,
 			pendingQaMessages: () => [
 				...this.agent.peekSteeringQueue(),
 				...this.agent.peekFollowUpQueue(),
@@ -4393,21 +4448,30 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 * its normal custom-message event. Because the entry sits after the checkpoint
 	 * entry, the rewind branch cut drops it from the active path.
 	 */
-	#checkpointActiveReminderFor(
-		message: AgentMessage,
-	): CustomMessage<{ goal?: string; startedAt?: string }> | undefined {
+	#checkpointActiveReminderFor(message: AgentMessage): CustomMessage<Partial<CheckpointState>> | undefined {
 		if (message.role !== "toolResult" || message.isError) return undefined;
 		const semanticResult = semanticToolResult(message.toolName, message);
 		if (semanticResult?.toolName !== "checkpoint") return undefined;
 		const details = isRecord(semanticResult.details) ? semanticResult.details : undefined;
 		const goal = details ? stringProperty(details, "goal") : undefined;
 		const startedAt = details ? stringProperty(details, "startedAt") : undefined;
+		const checkpointId = (details && stringProperty(details, "checkpointId")) ?? message.toolCallId;
+		const finishWhen = details && stringProperty(details, "finishWhen");
+		const carryForward = details && stringProperty(details, "carryForward");
 		return {
 			role: "custom",
 			customType: CHECKPOINT_ACTIVE_REMINDER_TYPE,
-			content: prompt.render(checkpointActiveNoticeTemplate),
+			content: prompt.render(checkpointActiveNoticeTemplate, { goal, checkpointId, finishWhen, carryForward }),
 			display: false,
-			details: { goal, startedAt },
+			details: {
+				goal,
+				startedAt,
+				checkpointId,
+				finishWhen,
+				carryForward,
+				parent: checkpointStateFromValue(details?.parent),
+				todoBinding: checkpointTodoFromValue(details?.todoBinding),
+			},
 			attribution: "agent",
 			timestamp: Date.now(),
 		};
@@ -4704,6 +4768,10 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		if (interruptedThinkingMessage) {
 			this.agent.appendMessage(interruptedThinkingMessage);
 		}
+		if (event.type === "message_end" && event.message.role === "user" && this.#checkpointState) {
+			this.#checkpointState = undefined;
+			this.#pendingRewindReport = undefined;
+		}
 
 		// message_end listeners are fire-and-forget, and the agent loop runs against
 		// a context cloned at prompt start. Appending only to agent.state would not
@@ -4723,6 +4791,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			// toolResult entry is persisted; #applyRewind runs on a later rewind turn,
 			// never before that backfill.
 			this.#checkpointState = {
+				...checkpointReminder.details,
 				checkpointMessageCount: this.agent.state.messages.length,
 				checkpointEntryId: null,
 				startedAt:
@@ -4741,6 +4810,13 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		if (event.type === "message_end" && event.message.role === "assistant") {
 			event.message.completedAt = Date.now();
 			this.#tools.bindReplyToCapturedPrompt(event.message);
+		}
+		if (
+			event.type === "message_end" &&
+			event.message.role === "toolResult" &&
+			cfgCheckpointEnabled.get(this.settings)
+		) {
+			annotateSearchResult(event.message);
 		}
 		// Turn-boundary maintenance awaits this commit before draining steering;
 		// extension notifications must not own or delay the persistence work.
@@ -4993,12 +5069,29 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 						this.#checkpointState.checkpointEntryId = checkpointEntryId;
 					}
 				}
-				if (semanticResult?.toolName === "rewind" && !isError && this.#checkpointState) {
+				if (
+					semanticResult?.toolName === "rewind" &&
+					!isError &&
+					this.#checkpointState &&
+					!isRecord(semanticDetails?.search)
+				) {
 					const detailReport = semanticDetails ? (stringProperty(semanticDetails, "report")?.trim() ?? "") : "";
 					const textReport = content?.find(part => part.type === "text")?.text?.trim() ?? "";
 					const report = detailReport || textReport;
 					if (report.length > 0) {
-						this.#pendingRewindReport = report;
+						this.#pendingRewindReport = {
+							report,
+							rewound: true,
+							checkpointId: semanticDetails && stringProperty(semanticDetails, "checkpointId"),
+							nextAction: semanticDetails && stringProperty(semanticDetails, "nextAction"),
+							outcome:
+								semanticDetails?.outcome === "completed" ||
+								semanticDetails?.outcome === "blocked" ||
+								semanticDetails?.outcome === "in_progress"
+									? semanticDetails.outcome
+									: undefined,
+							reason: semanticDetails && stringProperty(semanticDetails, "reason"),
+						};
 					}
 				}
 			}
@@ -5813,6 +5906,18 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	async #beforeToolCall(ctx: BeforeToolCallContext, signal?: AbortSignal): Promise<BeforeToolCallResult | undefined> {
 		const qaBlock = this.#maintenance.blockQaToolCall(ctx.assistantMessage, ctx.tool.name);
 		if (qaBlock) return { block: true, reason: qaBlock };
+		const calls = ctx.assistantMessage.content.filter(block => block.type === "toolCall");
+		if (calls.length > 1 && calls.some(call => semanticCheckpointCall(call) === "checkpoint")) {
+			return {
+				block: true,
+				reason:
+					"Call checkpoint alone before the work package; run its search/read/edit calls in the following turn.",
+			};
+		}
+		if (calls.length > 1 && calls.some(isSearchRewindCall)) {
+			return { block: true, reason: "Call a search rewind alone after its search/read batch has settled." };
+		}
+		if (semanticCheckpointCall(ctx.toolCall)) await this.#messageEndPersistenceTail;
 		const runner = this.#extensionRunner;
 		runner?.markLoopToolCall?.(ctx.toolCall.id, ctx.tool.name);
 		const ttsrResult = await this.#ttsr.beforeToolCall(ctx);
@@ -8059,37 +8164,207 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	#rehydrateCheckpointRewindState(): void {
 		this.#clearCheckpointRuntimeState();
 		let completed: CompletedRewindState | undefined;
-		let pending: { entryId: string; startedAt: string; messageCount: number } | undefined;
+		let pending: CheckpointState | undefined;
 		let messageCount = 0;
 		for (const entry of this.sessionManager.getBranch()) {
 			if (entry.type === "message") messageCount++;
+			// A new user turn ends the old scope; its instructions must never be branch-cut.
+			if (
+				entry.type === "compaction" ||
+				entry.type === "reset_boundary" ||
+				(entry.type === "branch_summary" &&
+					!isSearchRewind(entry) &&
+					!(isRecord(entry.details) && entry.details.kind === WORK_PACKAGE_REWIND_KIND))
+			)
+				pending = undefined;
+			if (entry.type === "message" && entry.message.role === "user") pending = undefined;
+			if (
+				entry.type === "custom_message" &&
+				(entry.customType === WORK_PACKAGE_STATE_TYPE || entry.customType === SEARCH_REWIND_STATE) &&
+				isRecord(entry.details) &&
+				"checkpoint" in entry.details
+			) {
+				pending = checkpointStateFromValue(entry.details.checkpoint);
+			}
 			if (isSuccessfulCheckpointEntry(entry)) {
 				completed = undefined;
+				const rawDetails = semanticToolResult(entry.message.toolName, entry.message)?.details;
+				const details = isRecord(rawDetails) ? rawDetails : {};
 				pending = {
-					entryId: entry.id,
+					checkpointEntryId: entry.id,
+					checkpointId: stringProperty(details, "checkpointId") ?? entry.message.toolCallId,
 					startedAt: checkpointStartedAtFromEntry(entry) ?? entry.timestamp,
-					messageCount,
+					checkpointMessageCount: messageCount,
+					goal: stringProperty(details, "goal"),
+					finishWhen: stringProperty(details, "finishWhen"),
+					carryForward: stringProperty(details, "carryForward"),
+					parent: checkpointStateFromValue(details.parent),
+					todoBinding: checkpointTodoFromValue(details.todoBinding),
 				};
 				continue;
 			}
 			const completedFromEntry = completedRewindFromEntry(entry);
 			if (completedFromEntry) {
 				completed = completedFromEntry;
-				pending = undefined;
+				pending = completedFromEntry.parent;
 			}
 		}
 		if (pending) {
-			this.#checkpointState = {
-				checkpointEntryId: pending.entryId,
-				startedAt: pending.startedAt,
-				checkpointMessageCount: pending.messageCount,
-			};
+			this.#checkpointState = pending;
 			return;
 		}
 		this.#lastCompletedRewind = completed;
 	}
 
+	/** Validate the projected context before accepting a work-package handoff. */
+	bindCheckpointTodo(target?: { phase?: string; task?: string }): WorkPackageTodoBinding | undefined {
+		return bindWorkPackageTodo(
+			this.#todo.phases,
+			getLatestTodoSnapshotIdentity(this.sessionManager.getBranch()),
+			target,
+		);
+	}
+
+	#workPackageTodoPhases(state: CheckpointState, outcome?: WorkPackageOutcome, reason?: string): TodoPhase[] {
+		const phases = this.#todo.phases;
+		if (state.todoBinding) {
+			if (!outcome) throw new ToolError("A todo-bound package requires an explicit outcome.");
+			applyWorkPackageTodoOutcome(
+				phases,
+				getLatestTodoSnapshotIdentity(this.sessionManager.getBranch()),
+				state.todoBinding,
+				outcome,
+				reason,
+			);
+		} else if (outcome && outcome !== "in_progress") {
+			throw new ToolError("This package has no todo binding; it cannot complete or block a todo.");
+		}
+		return phases;
+	}
+
+	validateRewind(
+		checkpointId: string,
+		report: string,
+		nextAction: string,
+		outcome?: WorkPackageOutcome,
+		reason?: string,
+	): RewindContextEstimate {
+		const state = this.#checkpointState;
+		if (!state || state.checkpointId !== checkpointId)
+			throw new ToolError("Checkpoint ID does not match an active work package.");
+		this.#validateRewindAnchor(state);
+		if (!report.trim() || !nextAction.trim()) throw new ToolError("report and nextAction must be nonempty.");
+		if (!this.agent.tokenizer.checkTokenBudget([report, nextAction, reason ?? ""], 4096).fits)
+			throw new ToolError("Handoff exceeds 4096 tokens. Keep only decisions, evidence, risks and the next action.");
+		const phases = this.#workPackageTodoPhases(state, outcome, reason);
+		return this.#validateRewindSavings(state, report, nextAction, [], outcome !== undefined, phases);
+	}
+
+	#validateRewindAnchor(state: CheckpointState, activeMessages = this.agent.state.messages): void {
+		const branch = this.sessionManager.getBranch();
+		const anchor = branch.findIndex(entry => entry.id === state.checkpointEntryId);
+		if (
+			branch
+				.slice(anchor + 1)
+				.some(
+					entry =>
+						entry.type === "compaction" ||
+						entry.type === "reset_boundary" ||
+						(entry.type === "branch_summary" &&
+							!isSearchRewind(entry) &&
+							!(isRecord(entry.details) && entry.details.kind === WORK_PACKAGE_REWIND_KIND)),
+				)
+		) {
+			this.#checkpointState = undefined;
+			this.#pendingRewindReport = undefined;
+			throw new ToolError(
+				"Checkpoint was superseded by a context boundary. Create a fresh checkpoint; current context was not changed.",
+			);
+		}
+		if (!state.checkpointEntryId || anchor < 0) {
+			throw new ToolError("Checkpoint anchor is no longer on the active branch. Context was not changed.");
+		}
+		if (
+			branch.slice(anchor + 1).some(entry => entry.type === "message" && entry.message.role === "user") ||
+			activeMessages.slice(state.checkpointMessageCount).some(message => message.role === "user")
+		) {
+			// User input ends the old scope. Rehydration applies the same rule.
+			this.#checkpointState = undefined;
+			this.#pendingRewindReport = undefined;
+			throw new ToolError(
+				"New user instructions arrived after this checkpoint. Keep the current context and create a fresh checkpoint for the revised scope.",
+			);
+		}
+	}
+
+	#rewindReportMessage(
+		state: CheckpointState,
+		report: string,
+		nextAction?: string,
+		phases: TodoPhase[] = this.#todo.phases,
+	): CustomMessage {
+		return {
+			role: "custom",
+			customType: REWIND_REPORT_MESSAGE_TYPE,
+			content: prompt.render(rewindReportTemplate, {
+				report,
+				nextAction,
+				goal: state.goal,
+				todos: phases.length > 0 ? phasesToMarkdown(phases) : "",
+			}),
+			display: false,
+			attribution: "agent",
+			timestamp: Date.now(),
+		};
+	}
+
+	#validateRewindSavings(
+		state: CheckpointState,
+		report: string,
+		nextAction?: string,
+		siblings: AgentMessage[] = [],
+		allowNoSavings = false,
+		phases: TodoPhase[] = this.#todo.phases,
+	): RewindContextEstimate {
+		const prefix = buildSessionContext(this.sessionManager.getEntries(), state.checkpointEntryId).messages;
+		const projected = [...prefix, this.#rewindReportMessage(state, report, nextAction, phases), ...siblings];
+		const current = this.agent.state.messages;
+		const lastAssistant = current.findLastIndex(message => message.role === "assistant");
+		const last = current[lastAssistant];
+		// Never count the generated handoff itself as disposable old context.
+		const baseline =
+			last?.role === "assistant" &&
+			last.content.some(block => block.type === "toolCall" && semanticCheckpointCall(block) === "rewind")
+				? current.slice(0, lastAssistant)
+				: current;
+		const before = this.agent.tokenizer.countMessages(baseline, { excludeEncryptedReasoning: true });
+		const after = this.agent.tokenizer.countMessages(projected, { excludeEncryptedReasoning: true });
+		if (after >= before && !allowNoSavings)
+			throw new ToolError(
+				`Rewind would not shrink context (${before} → ${after} estimated message tokens). Shorten the handoff or keep working without replacing context.`,
+			);
+		const fixed = computeNonMessageTokens(this, this.agent.tokenizer, this.settings.revision);
+		return {
+			beforeTokens: before + fixed,
+			afterTokens: after + fixed,
+			reusablePrefixTokens: this.agent.tokenizer.countMessages(prefix, { excludeEncryptedReasoning: true }) + fixed,
+			willCompact: after < before,
+		};
+	}
+
 	getCheckpointState(): CheckpointState | undefined {
+		const state = this.#checkpointState;
+		if (state?.checkpointEntryId) {
+			const branch = this.sessionManager.getBranchView();
+			const anchor = branch.findIndex(entry => entry.id === state.checkpointEntryId);
+			if (
+				anchor >= 0 &&
+				branch.slice(anchor + 1).some(entry => entry.type === "compaction" || entry.type === "reset_boundary")
+			) {
+				this.#checkpointState = undefined;
+				this.#pendingRewindReport = undefined;
+			}
+		}
 		return this.#checkpointState;
 	}
 
@@ -8104,6 +8379,126 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		} else {
 			this.#pendingRewindReport = undefined;
 		}
+	}
+
+	#searchRewindMessages(plan: SearchRewindPlan): CustomMessage[] {
+		const messages: CustomMessage[] = plan.materials.map(material => ({
+			role: "custom",
+			customType: SEARCH_MATERIAL,
+			content: renderSearchMaterial(material),
+			details: material,
+			display: false,
+			attribution: "agent",
+			timestamp: Date.now(),
+		}));
+		messages.push({
+			role: "custom",
+			customType: SEARCH_DECISION,
+			content: plan.nextAction,
+			display: false,
+			attribution: "agent",
+			timestamp: Date.now(),
+		});
+		return messages;
+	}
+
+	validateSearchRewind(input: SearchRewindInput): RewindContextEstimate {
+		const plan = buildSearchRewindPlan(this.sessionManager.getBranch(), input);
+		const active = new Set(plan.activeRefs);
+		const originalPrefix = buildSessionContext(this.sessionManager.getEntries(), plan.anchorId).messages;
+		const prefix = originalPrefix.filter(message => keepSearchMessage(message, active));
+		const changedAt = originalPrefix.findIndex((message, index) => message !== prefix[index]);
+		const reusablePrefix = changedAt < 0 ? originalPrefix : originalPrefix.slice(0, changedAt);
+		const projected = [...prefix, ...this.#searchRewindMessages(plan)];
+		const current = this.agent.state.messages;
+		const lastAssistant = current.findLastIndex(message => message.role === "assistant");
+		const last = current[lastAssistant];
+		const baseline =
+			last?.role === "assistant" &&
+			last.content.some(part => part.type === "toolCall" && semanticCheckpointCall(part) === "rewind")
+				? current.slice(0, lastAssistant)
+				: current;
+		const before = this.agent.tokenizer.countMessages(baseline, { excludeEncryptedReasoning: true });
+		const after = this.agent.tokenizer.countMessages(projected, { excludeEncryptedReasoning: true });
+		if (after >= before)
+			throw new ToolError(
+				`Search rewind would not shrink context (${before} → ${after}). Keep working without cutting.`,
+			);
+		const fixed = computeNonMessageTokens(this, this.agent.tokenizer, this.settings.revision);
+		return {
+			beforeTokens: before + fixed,
+			afterTokens: after + fixed,
+			reusablePrefixTokens:
+				this.agent.tokenizer.countMessages(reusablePrefix, { excludeEncryptedReasoning: true }) + fixed,
+		};
+	}
+
+	async #applySearchRewind(input: SearchRewindInput, messages: AgentMessage[], signal?: AbortSignal): Promise<void> {
+		const generation = this.#promptGeneration;
+		let committedLeaf = this.sessionManager.getLeafId();
+		const checkpoint = this.#checkpointState;
+		let restoredCheckpoint = checkpoint;
+		await this.sessionManager.appendEntriesAtomically(
+			() => {
+				this.validateSearchRewind(input);
+				const plan = buildSearchRewindPlan(this.sessionManager.getBranch(), input);
+				const phases = this.#todo.phases;
+				const previousTodoIdentity = getLatestTodoSnapshotIdentity(this.sessionManager.getBranch());
+				const mode = this.sessionManager.getBranch().findLast(entry => entry.type === "mode_change");
+				this.#bash.withBranchTransition(() =>
+					this.sessionManager.branchWithSummary(plan.anchorId, "", {
+						kind: SEARCH_REWIND_KIND,
+						searchId: input.searchId,
+					}),
+				);
+				this.sessionManager.appendCustomMessageEntry(
+					SEARCH_REWIND_STATE,
+					"",
+					false,
+					{ activeRefs: plan.activeRefs },
+					"agent",
+				);
+				for (const message of this.#searchRewindMessages(plan)) {
+					this.sessionManager.appendCustomMessageEntry(
+						message.customType,
+						message.content,
+						false,
+						message.details,
+						"agent",
+					);
+				}
+				this.sessionManager.appendCustomEntry(USER_TODO_EDIT_CUSTOM_TYPE, { phases });
+				restoredCheckpoint = refreshCheckpointTodoIdentity(
+					checkpoint,
+					getLatestTodoSnapshotIdentity(this.sessionManager.getBranch()),
+					previousTodoIdentity,
+				);
+				this.sessionManager.appendCustomMessageEntry(
+					WORK_PACKAGE_STATE_TYPE,
+					"",
+					false,
+					{ checkpoint: restoredCheckpoint ?? null },
+					"agent",
+				);
+				if (mode?.type === "mode_change") this.sessionManager.appendModeChange(mode.mode, mode.data);
+				committedLeaf = this.sessionManager.getLeafId();
+			},
+			{
+				commitGuard: () =>
+					!signal?.aborted &&
+					this.#promptGeneration === generation &&
+					this.sessionManager.getLeafId() === committedLeaf,
+			},
+		);
+		if (this.#promptGeneration !== generation || this.#checkpointState !== checkpoint) return;
+		this.#checkpointState = restoredCheckpoint;
+		const rebuilt = this.buildDisplaySessionContext();
+		messages.splice(0, messages.length, ...rebuilt.messages);
+		this.agent.replaceMessages(messages);
+		this.#todo.syncFromBranch();
+		this.#modelMentions.syncFromBranch();
+		this.#advisors.resetSessionState({ preserveCost: true });
+		this.#closeCodexProviderSessionsForHistoryRewrite();
 	}
 
 	/**
@@ -12544,14 +12939,12 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	}
 
 	#enforceRewindBeforeYield(): boolean {
-		if (!this.#checkpointState || this.#pendingRewindReport) {
+		// Planned packages use ordinary tool-loop continuation, never a hidden retry scheduler.
+		// In particular, a rejected no-savings handoff must not trap a finished turn in a retry loop.
+		if (!this.#checkpointState || this.#checkpointState.finishWhen || this.#pendingRewindReport) {
 			return false;
 		}
-		const reminder = [
-			"<system-warning>",
-			"You are in an active checkpoint. You MUST call rewind with your investigation findings before yielding. Do NOT yield without completing the checkpoint.",
-			"</system-warning>",
-		].join("\n");
+		const reminder = prompt.render(checkpointActiveNoticeTemplate, { ...this.#checkpointState });
 		this.agent.appendMessage({
 			role: "developer",
 			content: [{ type: "text", text: reminder }],
@@ -12565,7 +12958,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		return true;
 	}
 
-	#extractRewindReport(messages: AgentMessage[]): string | undefined {
+	#extractRewindReport(messages: AgentMessage[]): RewindToolDetails | undefined {
 		const checkpointState = this.#checkpointState;
 		if (!checkpointState) return undefined;
 		if (this.#pendingRewindReport) return this.#pendingRewindReport;
@@ -12574,91 +12967,168 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			if (message?.role !== "toolResult" || message.isError) continue;
 			const semanticResult = semanticToolResult(message.toolName, message);
 			if (semanticResult?.toolName !== "rewind") continue;
-			const details = semanticResult.details;
+			const details = isRecord(semanticResult.details) ? semanticResult.details : {};
+			if (isRecord(details.search)) continue;
 			const detailReport =
 				details && typeof details === "object" && "report" in details && typeof details.report === "string"
 					? details.report.trim()
 					: "";
 			const textReport = message.content.find(part => part.type === "text")?.text.trim() ?? "";
 			const report = detailReport || textReport;
-			return report.length > 0 ? report : undefined;
+			return report.length > 0
+				? {
+						report,
+						rewound: true,
+						checkpointId: stringProperty(details, "checkpointId"),
+						nextAction: stringProperty(details, "nextAction"),
+						outcome:
+							details.outcome === "completed" ||
+							details.outcome === "blocked" ||
+							details.outcome === "in_progress"
+								? details.outcome
+								: undefined,
+						reason: stringProperty(details, "reason"),
+					}
+				: undefined;
 		}
 		return undefined;
 	}
 
-	async #applyRewind(report: string, activeMessages?: AgentMessage[], turn?: AgentTurnEndContext): Promise<void> {
-		const checkpointState = this.#checkpointState;
-		if (!checkpointState) {
-			return;
-		}
-		// The rewound turn's reply is the exploration branch's newest, so this records its prompt.
+	async #applyRewind(
+		handoff: RewindToolDetails,
+		activeMessages?: AgentMessage[],
+		turn?: AgentTurnEndContext,
+		signal?: AbortSignal,
+	): Promise<void> {
+		const state = this.#checkpointState;
+		if (!state) return;
+		const { report, nextAction, outcome, reason } = handoff;
+		if (state.finishWhen) this.validateRewind(handoff.checkpointId ?? "", report, nextAction ?? "", outcome, reason);
+		else this.#validateRewindAnchor(state, activeMessages);
 		const explorationPromptDigest = this.#tools.recordedPromptDigest();
-		this.#bash.withBranchTransition(() => {
-			try {
-				this.sessionManager.branchWithSummary(checkpointState.checkpointEntryId, report, {
-					startedAt: checkpointState.startedAt,
-				});
-			} catch (error) {
-				logger.warn("Rewind branch checkpoint missing, falling back to root", {
-					error: error instanceof Error ? error.message : String(error),
-				});
-				this.sessionManager.branchWithSummary(null, report, { startedAt: checkpointState.startedAt });
-			}
-		});
-
-		const rewoundAt = new Date().toISOString();
-		const details = { report, startedAt: checkpointState.startedAt, rewoundAt };
-		this.sessionManager.appendCustomMessageEntry(
-			REWIND_REPORT_MESSAGE_TYPE,
-			prompt.render(rewindReportTemplate, { report }),
-			false,
-			details,
-			"agent",
-		);
-		// Rewind cuts the exploration branch, but sibling calls in this tool batch
-		// have already run. Reparent their calls and results together so the next
-		// provider turn (and a resumed session) can see their completed work.
+		const details: CompletedRewindState & { kind: string; reason?: string } = {
+			kind: WORK_PACKAGE_REWIND_KIND,
+			report,
+			nextAction,
+			outcome,
+			reason,
+			checkpointId: state.checkpointId,
+			startedAt: state.startedAt,
+			rewoundAt: new Date().toISOString(),
+		};
+		const siblings: (AssistantMessage | ToolResultMessage | CustomMessage)[] = [];
 		if (turn?.message.role === "assistant") {
-			const siblingResults = turn.toolResults.filter(
+			const results = turn.toolResults.filter(
 				result => semanticToolResult(result.toolName, result)?.toolName !== "rewind",
 			);
-			if (siblingResults.length > 0) {
-				const siblingIds = new Set(siblingResults.map(result => result.toolCallId));
-				const calls = turn.message.content.filter(
-					(block): block is ToolCall => block.type === "toolCall" && siblingIds.has(block.id),
-				);
-				if (calls.length > 0) {
-					const callIds = new Set(calls.map(call => call.id));
-					// The rewind branch ends at the checkpoint, whose recorded prompt may predate this reply's.
-					this.#tools.recordPromptDigest(explorationPromptDigest);
-					this.sessionManager.appendMessage(
-						sanitizeAssistantForReparentedHistory({ ...turn.message, content: calls }),
+			const ids = new Set(results.map(result => result.toolCallId));
+			const calls = turn.message.content.filter(
+				(block): block is ToolCall => block.type === "toolCall" && ids.has(block.id),
+			);
+			if (calls.length > 0) {
+				siblings.push(sanitizeAssistantForReparentedHistory({ ...turn.message, content: calls }));
+				siblings.push(...results);
+			}
+		}
+		const branch = this.sessionManager.getBranch();
+		const anchorIndex = branch.findIndex(entry => entry.id === state.checkpointEntryId);
+		// Deliveries and other asides remain evidence, not disposable exploration.
+		for (const entry of branch.slice(anchorIndex + 1)) {
+			if (
+				entry.type !== "custom_message" ||
+				[
+					CHECKPOINT_ACTIVE_REMINDER_TYPE,
+					REWIND_REPORT_MESSAGE_TYPE,
+					SEARCH_MATERIAL,
+					SEARCH_DECISION,
+					SEARCH_REWIND_STATE,
+					WORK_PACKAGE_STATE_TYPE,
+				].includes(entry.customType)
+			)
+				continue;
+			const message = customMessageEntryMessage(entry);
+			if (message) siblings.push(message);
+		}
+		const generation = this.#promptGeneration;
+		const mode = branch.findLast(entry => entry.type === "mode_change");
+		let committedLeaf = this.sessionManager.getLeafId();
+		await this.sessionManager.appendEntriesAtomically(
+			() => {
+				this.#validateRewindAnchor(state, activeMessages);
+				const phases = this.#workPackageTodoPhases(state, outcome, reason);
+				const previousTodoIdentity = getLatestTodoSnapshotIdentity(this.sessionManager.getBranch());
+				const estimate = state.finishWhen
+					? this.#validateRewindSavings(state, report, nextAction, siblings, outcome !== undefined, phases)
+					: undefined;
+				const compact = estimate?.willCompact !== false;
+				details.contextChanged = compact;
+				if (compact)
+					this.#bash.withBranchTransition(() =>
+						this.sessionManager.branchWithSummary(state.checkpointEntryId, report, details),
 					);
-					for (const result of siblingResults) {
-						if (callIds.has(result.toolCallId)) this.sessionManager.appendMessage(result);
+				const retained = compact ? this.#rewindReportMessage(state, report, nextAction, phases) : undefined;
+				this.sessionManager.appendCustomMessageEntry(
+					REWIND_REPORT_MESSAGE_TYPE,
+					retained?.content ?? nextAction ?? "",
+					false,
+					details,
+					"agent",
+				);
+				// Summary and report stay adjacent for provider-side deduplication.
+				this.sessionManager.appendCustomEntry(USER_TODO_EDIT_CUSTOM_TYPE, { phases });
+				details.parent = refreshCheckpointTodoIdentity(
+					state.parent,
+					getLatestTodoSnapshotIdentity(this.sessionManager.getBranch()),
+					previousTodoIdentity,
+				);
+				this.sessionManager.appendCustomMessageEntry(
+					WORK_PACKAGE_STATE_TYPE,
+					"",
+					false,
+					{ checkpoint: details.parent ?? null },
+					"agent",
+				);
+				if (mode?.type === "mode_change" && compact) this.sessionManager.appendModeChange(mode.mode, mode.data);
+				if (compact) {
+					if (siblings.length > 0) this.#tools.recordPromptDigest(explorationPromptDigest);
+					for (const message of siblings) {
+						if (message.role === "custom")
+							this.sessionManager.appendCustomMessageEntry(
+								message.customType,
+								message.content,
+								message.display,
+								message.details,
+								message.attribution,
+							);
+						else this.sessionManager.appendMessage(message);
 					}
 				}
-			}
-		}
-		this.#lastCompletedRewind = { report, startedAt: checkpointState.startedAt, rewoundAt };
-
-		if (activeMessages) {
+				committedLeaf = this.sessionManager.getLeafId();
+			},
+			{
+				commitGuard: () =>
+					!signal?.aborted &&
+					this.#promptGeneration === generation &&
+					this.#checkpointState === state &&
+					this.sessionManager.getLeafId() === committedLeaf,
+			},
+		);
+		if (this.#promptGeneration !== generation || this.#checkpointState !== state) return;
+		this.#lastCompletedRewind = details;
+		if (details.contextChanged && activeMessages) {
 			for (const message of activeMessages) {
-				if (message.role === "toolResult" && semanticToolResult(message.toolName, message)?.toolName === "rewind") {
+				if (message.role === "toolResult" && semanticToolResult(message.toolName, message)?.toolName === "rewind")
 					this.#rewoundToolResultIds.add(message.toolCallId);
-				}
 			}
 		}
-		const sessionContext = this.buildDisplaySessionContext();
-		if (activeMessages) {
-			activeMessages.splice(0, activeMessages.length, ...sessionContext.messages);
-		}
-		this.agent.replaceMessages(activeMessages ?? sessionContext.messages);
+		const rebuilt = this.buildDisplaySessionContext();
+		if (activeMessages) activeMessages.splice(0, activeMessages.length, ...rebuilt.messages);
+		this.agent.replaceMessages(activeMessages ?? rebuilt.messages);
 		this.#advisors.resetSessionState({ preserveCost: true });
 		this.#todo.syncFromBranch();
 		this.#modelMentions.syncFromBranch();
-		this.#closeCodexProviderSessionsForHistoryRewrite();
-		this.#checkpointState = undefined;
+		if (details.contextChanged) this.#closeCodexProviderSessionsForHistoryRewrite();
+		this.#checkpointState = details.parent;
 		this.#pendingRewindReport = undefined;
 	}
 	/** Plan-mode decision affordances: `ask`, or plan approval via `write xd://propose`. */

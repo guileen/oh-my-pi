@@ -444,6 +444,7 @@ export interface SessionMaintenanceHost {
 	takeExperimentalContextRolloverRequest(context: AgentTurnEndContext | undefined): boolean;
 	queueExperimentalContextNotesReminder(prompt: string): void;
 	hasQaRolloverTool?(): boolean;
+	hasActiveWorkPackage?(): boolean;
 	pendingQaMessages?(): AgentMessage[];
 	memoryBackendSession(): MemoryBackendOperationContext["session"];
 	emitSessionEvent(event: AgentSessionEvent, options?: { detachExtensions?: boolean }): Promise<void>;
@@ -779,6 +780,8 @@ export class SessionMaintenance {
 		}
 		let cycle = this.#currentQaCycle();
 		const tokens = this.#estimatePrePromptContextTokens([], this.#model?.contextWindow ?? 0);
+		// Work packages own ordinary milestone cuts; QA retains only its hard safety boundary.
+		if (this.#host.hasActiveWorkPackage?.() && tokens < policy.hard && !cycle?.checkpointEntryId) return;
 		if (!cycle && tokens >= policy.hint) {
 			this.cancelSpeculation();
 			cycle = this.#qaCycle = {
@@ -920,6 +923,13 @@ export class SessionMaintenance {
 			throw qaCheckpointError("QA_NOT_ACTIVE", "No automatic QA checkpoint cycle is active.", input.cycleId);
 		if (cycle.cycleId !== input.cycleId)
 			throw qaCheckpointError("QA_STALE_CYCLE", "Checkpoint belongs to another cycle.", input.cycleId);
+		if (this.#host.hasActiveWorkPackage?.() && cycle.phase !== "hard-report" && !cycle.checkpoint) {
+			throw qaCheckpointError(
+				"QA_NOT_ACTIVE",
+				"An active work package owns this boundary; close it with rewind before requesting QA rollover.",
+				input.cycleId,
+			);
+		}
 		if (cycle.checkpoint) {
 			if (
 				cycle.checkpoint.summary !== input.summary ||
@@ -3337,6 +3347,13 @@ export class SessionMaintenance {
 		const storedContextTokens = this.#estimateStoredContextTokens();
 		const contextTokens = compactionContextTokens(billedContextTokens, storedContextTokens);
 		const qaPolicy = this.#qaPolicy();
+		if (
+			this.#host.hasActiveWorkPackage?.() &&
+			contextTokens < (qaPolicy?.hard ?? promptBudgetTokens(contextWindow, compactionSettings))
+		) {
+			this.cancelSpeculation();
+			return;
+		}
 		const qaCycle = this.#currentQaCycle();
 		if (
 			qaPolicy &&

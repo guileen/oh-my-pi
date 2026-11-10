@@ -30,6 +30,8 @@ import {
 import { QA_STATE_TYPE, QA_TOOL_TIP_TYPE } from "./compact-modes";
 import { renderQaCompactionCheckpoint, resolveQaCompactionCheckpoint } from "./qa-compaction";
 import { QA_CHECKPOINT_ENTRY_TYPE } from "./qa-rollover";
+import { activeSearchMaterialRefs, SEARCH_MATERIAL, SEARCH_REWIND_STATE } from "./search-rewind";
+import { WORK_PACKAGE_STATE_TYPE } from "./work-package-state";
 
 // #4470 crash artifacts had legacy frames (no shape metadata) with 17 frames,
 // ~306k archive chars, and ~1.5M truncated chars. Current snapcompact frames
@@ -418,6 +420,7 @@ export function buildSessionContext(
 			}
 		}
 	}
+	const searchMaterials = activeSearchMaterialRefs(path);
 
 	const appendMessage = (entry: SessionEntry) => {
 		handleEntryResetTracking(entry);
@@ -431,6 +434,15 @@ export function buildSessionContext(
 			}
 			pushMessage(entry.message);
 		} else if (entry.type === "custom_message") {
+			if (entry.customType === SEARCH_REWIND_STATE || entry.customType === WORK_PACKAGE_STATE_TYPE) return;
+			if (
+				!options?.transcript &&
+				entry.customType === SEARCH_MATERIAL &&
+				searchMaterials &&
+				isRecord(entry.details) &&
+				(typeof entry.details.ref !== "string" || !searchMaterials.has(entry.details.ref))
+			)
+				return;
 			if (
 				!options?.transcript &&
 				(entry.customType === PREWALK_PLAN_MESSAGE_TYPE || entry.customType === VIBE_MODE_CONTEXT_MESSAGE_TYPE)

@@ -20,7 +20,7 @@ import {
 import type { SessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { MemorySessionStorage, type WriteTextAtomicOptions } from "@oh-my-pi/pi-coding-agent/session/session-storage";
-import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
+import { CheckpointTool, type ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { NewContextTool } from "@oh-my-pi/pi-coding-agent/tools/context-notes";
 import { computeNonMessageTokens } from "@oh-my-pi/pi-tui/status-line/context-usage";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
@@ -235,6 +235,7 @@ describe("AgentSession cooperative QA rollover", () => {
 			contextWindow?: number;
 			maxTokens?: number;
 			omitMaxOutputTokens?: boolean;
+			workPackages?: boolean;
 			afterCheckpointAccepted?: (
 				session: AgentSession,
 				input: QaCheckpointInput,
@@ -280,6 +281,7 @@ describe("AgentSession cooperative QA rollover", () => {
 			getSessionFile: () => manager.getSessionFile() ?? null,
 			getSessionSpawns: () => "*",
 			isDisposed: () => session?.isDisposed ?? false,
+			getCheckpointState: () => session?.getCheckpointState(),
 			qaRollover: {
 				isEnabled: () => session?.isQaRolloverEnabled() ?? false,
 				accept: async (input, signal) => {
@@ -300,7 +302,11 @@ describe("AgentSession cooperative QA rollover", () => {
 				return { content: [{ type: "text", text: options.toolResult ?? RAW_RESULT }] };
 			},
 		};
-		const tools: AgentTool[] = [workTool, new NewContextTool(toolSession)];
+		const tools: AgentTool[] = [
+			workTool,
+			new NewContextTool(toolSession),
+			...(options.workPackages ? [new CheckpointTool(toolSession) as AgentTool] : []),
+		];
 		const calls: Request[] = [];
 		const sideRequests: Context[] = [];
 		const events: AgentSessionEvent[] = [];
@@ -402,6 +408,49 @@ describe("AgentSession cooperative QA rollover", () => {
 			},
 		};
 	}
+
+	it("defers QA advisories to an active work package but retains hard-boundary recovery", async () => {
+		const h = await createHarness(
+			[
+				() =>
+					assistant([
+						{
+							type: "toolCall",
+							id: "package-a",
+							name: "checkpoint",
+							arguments: {
+								goal: "Finish A",
+								finishWhen: "A validated",
+								carryForward: "Evidence for B",
+							},
+						},
+					]),
+				() => work(WARNED_INPUT),
+				request => {
+					expect(h.session.getCheckpointState()?.checkpointId).toBe("package-a");
+					expect(
+						request.messages.filter(
+							message => message.role === "custom" && message.customType.startsWith("qa-rollover-"),
+						),
+					).toEqual([]);
+					expect(request.compactions).toBe(0);
+					return work(HARD + 1);
+				},
+				request => {
+					expect(request.toolChoice).toEqual({ type: "tool", name: "new_context" });
+					return checkpoint()(request);
+				},
+				request => {
+					expect(request.compactions).toBe(1);
+					expect(h.session.getCheckpointState()).toBeUndefined();
+					return finalAnswer();
+				},
+			],
+			{ workPackages: true },
+		);
+		await run(h.session);
+		expect(h.calls).toHaveLength(5);
+	});
 
 	async function run(session: AgentSession, request = REQUEST): Promise<void> {
 		await session.prompt(request);

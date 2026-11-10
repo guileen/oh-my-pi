@@ -1,11 +1,12 @@
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
-import type { ImageContent, TextContent } from "@oh-my-pi/pi-ai";
+import type { ImageContent, TextContent, ToolCall } from "@oh-my-pi/pi-ai";
 import { stringProperty } from "@oh-my-pi/pi-utils";
 import { stripXdUrlPrefix } from "@oh-my-pi/pi-tui/tools/xd-url";
 import type { CompletedRewindState } from "../tools/checkpoint";
 import { writeDeviceDispatch } from "../tools/resolve";
 import { REWIND_REPORT_MESSAGE_TYPE } from "./messages";
 import type { SessionEntry } from "./session-entries";
+import { checkpointStateFromValue } from "./work-package-state";
 
 /** Extracts text from custom message content. */
 export function customMessageContentText(content: string | (TextContent | ImageContent)[]): string {
@@ -27,6 +28,15 @@ export function reportFromRewindReportContent(content: string): string {
 
 /** Checkpoint-domain tool names normalized from native and xdev calls. */
 export type SemanticCheckpointToolName = "checkpoint" | "rewind";
+
+/** Normalize an invocation before it has a tool result (including the xd:// write transport). */
+export function semanticCheckpointCall(call: ToolCall): SemanticCheckpointToolName | undefined {
+	const name = stripXdUrlPrefix(call.name);
+	if (name === "checkpoint" || name === "rewind") return name;
+	if (name !== "write") return undefined;
+	const path = call.arguments.path;
+	return path === "xd://checkpoint" ? "checkpoint" : path === "xd://rewind" ? "rewind" : undefined;
+}
 
 /** Normalized checkpoint-domain tool result. */
 export interface SemanticToolResult {
@@ -59,7 +69,25 @@ export function completedRewindFromEntry(entry: SessionEntry): CompletedRewindSt
 	const report =
 		stringProperty(details, "report")?.trim() ||
 		reportFromRewindReportContent(customMessageContentText(entry.content));
-	return report.length > 0 ? { report, startedAt, rewoundAt } : undefined;
+	return report.length > 0
+		? {
+				report,
+				startedAt,
+				rewoundAt,
+				checkpointId: stringProperty(details, "checkpointId"),
+				nextAction: stringProperty(details, "nextAction"),
+				parent: checkpointStateFromValue("parent" in details ? details.parent : undefined),
+				contextChanged:
+					"contextChanged" in details && typeof details.contextChanged === "boolean"
+						? details.contextChanged
+						: undefined,
+				outcome:
+					"outcome" in details &&
+					(details.outcome === "completed" || details.outcome === "blocked" || details.outcome === "in_progress")
+						? details.outcome
+						: undefined,
+			}
+		: undefined;
 }
 
 /** Whether an entry is a successful checkpoint tool result. */

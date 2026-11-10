@@ -4,6 +4,7 @@
 
 ### Added
 
+- Search decisions can now discard their locating trace while retaining selected original code, source positions and edit anchors across multiple hops.
 - QA rollover checkpoints now stay visible in the transcript after compaction, showing the recorded summary and next action instead of disappearing with the old context
 - Added opt-in auto-update (`update.auto`, offered by a new setup wizard step): a launch that finds a newer release installs it in the background through whatever installed omp (standalone binary, Homebrew, mise, bun, npm), shows the version and download progress beside the welcome banner's version, and the next launch runs it. Quitting mid-update does not interrupt it. Skipped under Tern, which updates its omp itself, and on Nix and source checkouts
 - `omp update` now refuses to start while another update (including a background auto-update) is installing, instead of running two installers at once
@@ -84,6 +85,7 @@
 
 ### Changed
 
+- Checkpoint work packages can now nest, advance todo tasks atomically, and hand relevant findings and source indexes to siblings and parent acceptance.
 - Compaction handoffs now direct long-running work to the next actionable TODO, preserve all outstanding goals and verification, and discourage repeated exploration, checks, and job launches.
 - QA compaction no longer forces a stop at a fixed 200K: it gives an optional denoise hint near 100K, two advisory warnings (60% and 85% of the usable context), and forces a handoff only near the model's context limit; warnings tell the model to turn reads into edits or written findings before checkpointing.
 - Local foreground Graph Runs set `tools.approvalMode: yolo`, because a foreground Run has no terminal to answer an approval prompt and the member's grants are the actual boundary; without it a granted `write` or `bash` call would wait for an answer that can never arrive.
