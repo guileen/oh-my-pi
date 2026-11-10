@@ -301,6 +301,8 @@ export interface InteractiveModeContext {
 	loopModePaused: boolean;
 	loopPrompt?: string;
 	loopLimit?: LoopLimitRuntime;
+	loopDurationLimit?: LoopLimitRuntime;
+	loopIntervalMs?: number;
 	loopCondition?: LoopConditionConfig;
 	planModePlanFilePath?: string;
 	hideThinkingBlock: boolean;

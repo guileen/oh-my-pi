@@ -22,7 +22,7 @@ import {
 	saveModelPreset,
 } from "../config/model-presets";
 import { describeLoopCondition } from "../modes/loop-condition";
-import { describeLoopLimitRuntime } from "../modes/loop-limit";
+import { describeLoopLimit, describeLoopLimitRuntime } from "../modes/loop-limit";
 import type { InteractiveModeContext } from "../modes/types";
 import ratchetKickoffPrompt from "../prompts/ratchet-kickoff.md" with { type: "text" };
 import type { AgentSession } from "../session/agent-session";
@@ -373,15 +373,17 @@ export const BUILTIN_MODE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 		name: "loop",
 		icon: "loop",
 		get description() {
-			return `Toggle loop mode. While enabled, the next prompt you send re-submits after every yield. Bound it with a count/duration, or gate it with \`--until '<cmd>'\` / \`--while '<cmd>'\` — the command's exit status decides whether the next iteration runs. ${formatKeyHint("escape")} suspends the ongoing loop; /stop-loop disables it without interrupting the current turn.`;
+			return `Toggle loop mode. The first prompt runs immediately; --interval sets the wait after each turn. Use --count for a total execution limit and --duration for an elapsed time limit, independently or together; positional count retains its legacy repeat-count meaning. Gate repeats with \`--until '<cmd>'\` / \`--while '<cmd>'\`. ${formatKeyHint("escape")} pauses; /stop-loop stops future iterations without interrupting the current turn.`;
 		},
-		inlineHint: "[count|duration] [--while|--until '<cmd>'] [prompt]",
+		inlineHint: "[count|duration] [--count N] [--duration time] [--interval time] [--while|--until '<cmd>'] [prompt]",
 		allowArgs: true,
 		getTuiAutocompleteDescription: runtime => {
 			if (!runtime.ctx.loopModeEnabled) return "Loop: off";
 			if (runtime.ctx.loopModePaused) return "Loop: paused";
 			const bounds = [
 				runtime.ctx.loopLimit ? describeLoopLimitRuntime(runtime.ctx.loopLimit) : undefined,
+				runtime.ctx.loopDurationLimit ? describeLoopLimitRuntime(runtime.ctx.loopDurationLimit) : undefined,
+				runtime.ctx.loopIntervalMs === undefined ? undefined : `every ${describeLoopLimit({ kind: "duration", durationMs: runtime.ctx.loopIntervalMs })} after each turn`,
 				runtime.ctx.loopCondition ? describeLoopCondition(runtime.ctx.loopCondition) : undefined,
 			].filter((part): part is string => part !== undefined);
 			if (bounds.length > 0) return `Loop: on (${bounds.join(", ")})`;

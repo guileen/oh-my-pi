@@ -96,6 +96,124 @@ describe("InteractiveMode loop auto-submit", () => {
 		expect(resolved).toEqual([]);
 	});
 
+	it("waits the configured interval, then stops after the requested total count", async () => {
+		vi.useFakeTimers();
+		Object.defineProperty(session, "isCompacting", { configurable: true, get: () => false });
+		Object.defineProperty(session, "isStreaming", { configurable: true, get: () => false });
+		Object.defineProperty(session, "hasPostPromptWork", { configurable: true, get: () => false });
+		expect(await mode.handleLoopCommand("--count 2 --duration 10s --interval 2s repeat this")).toBe("repeat this");
+		mode.setLoopPrompt("repeat this");
+		const resolved: SubmittedUserInput[] = [];
+		pendingInput = mode.getUserInput();
+		void pendingInput.then(input => resolved.push(input));
+		vi.advanceTimersByTime(1999);
+		await flushMicrotasks();
+		expect(resolved).toHaveLength(0);
+		vi.advanceTimersByTime(1);
+		await flushMicrotasks();
+		expect(resolved.map(input => input.text)).toEqual(["repeat this"]);
+		expect(mode.loopLimit).toEqual({ kind: "iterations", initial: 1, remaining: 0 });
+		mode.cancelPendingSubmission();
+		pendingInput = mode.getUserInput();
+		expect(mode.loopModeEnabled).toBe(false);
+	});
+
+	it("does not repeat or evaluate the condition with a total count of one", async () => {
+		vi.useFakeTimers();
+		const evaluate = vi.spyOn(loopCondition, "evaluateLoopCondition");
+		expect(await mode.handleLoopCommand("--count 1 --while 'true' repeat this")).toBe("repeat this");
+		mode.setLoopPrompt("repeat this");
+		pendingInput = mode.getUserInput();
+		expect(mode.loopModeEnabled).toBe(false);
+		vi.advanceTimersByTime(5000);
+		await flushMicrotasks();
+		expect(evaluate).not.toHaveBeenCalled();
+	});
+
+	it("expires the duration while waiting for a longer interval", async () => {
+		vi.useFakeTimers();
+		expect(await mode.handleLoopCommand("--count 5 --duration 2s --interval 5s repeat this")).toBe("repeat this");
+		mode.setLoopPrompt("repeat this");
+		const resolved: SubmittedUserInput[] = [];
+		pendingInput = mode.getUserInput();
+		void pendingInput.then(input => resolved.push(input));
+		vi.advanceTimersByTime(1999);
+		expect(mode.loopModeEnabled).toBe(true);
+		vi.advanceTimersByTime(1);
+		await flushMicrotasks();
+		expect(mode.loopModeEnabled).toBe(false);
+		expect(resolved).toEqual([]);
+	});
+
+	it("retries busy sessions every 800ms instead of the configured interval", async () => {
+		vi.useFakeTimers();
+		let busy = true;
+		Object.defineProperty(session, "isCompacting", { configurable: true, get: () => busy });
+		Object.defineProperty(session, "isStreaming", { configurable: true, get: () => false });
+		Object.defineProperty(session, "hasPostPromptWork", { configurable: true, get: () => false });
+		await mode.handleLoopCommand("--duration 3s --interval 1s repeat this");
+		mode.setLoopPrompt("repeat this");
+		const resolved: SubmittedUserInput[] = [];
+		pendingInput = mode.getUserInput();
+		void pendingInput.then(input => resolved.push(input));
+		vi.advanceTimersByTime(1000);
+		busy = false;
+		vi.advanceTimersByTime(799);
+		await flushMicrotasks();
+		expect(resolved).toEqual([]);
+		vi.advanceTimersByTime(1);
+		await flushMicrotasks();
+		expect(resolved.map(input => input.text)).toEqual(["repeat this"]);
+	});
+
+	it("expires on time while a busy session is being retried", async () => {
+		vi.useFakeTimers();
+		Object.defineProperty(session, "isCompacting", { configurable: true, get: () => true });
+		await mode.handleLoopCommand("--duration 2s --interval 1s repeat this");
+		mode.setLoopPrompt("repeat this");
+		const resolved: SubmittedUserInput[] = [];
+		pendingInput = mode.getUserInput();
+		void pendingInput.then(input => resolved.push(input));
+		vi.advanceTimersByTime(1999);
+		expect(mode.loopModeEnabled).toBe(true);
+		vi.advanceTimersByTime(1);
+		await flushMicrotasks();
+		expect(mode.loopModeEnabled).toBe(false);
+		expect(resolved).toEqual([]);
+	});
+
+	it("chunks intervals beyond the maximum timer delay without submitting early", async () => {
+		vi.useFakeTimers();
+		Object.defineProperty(session, "isCompacting", { configurable: true, get: () => false });
+		Object.defineProperty(session, "isStreaming", { configurable: true, get: () => false });
+		Object.defineProperty(session, "hasPostPromptWork", { configurable: true, get: () => false });
+		await mode.handleLoopCommand("--interval 600h repeat this");
+		mode.setLoopPrompt("repeat this");
+		const resolved: SubmittedUserInput[] = [];
+		pendingInput = mode.getUserInput();
+		void pendingInput.then(input => resolved.push(input));
+		vi.advanceTimersByTime(2_147_483_647);
+		await flushMicrotasks();
+		expect(resolved).toEqual([]);
+		vi.advanceTimersByTime(12_516_353);
+		await flushMicrotasks();
+		expect(resolved.map(input => input.text)).toEqual(["repeat this"]);
+	});
+
+	it("cancels a custom interval when explicitly stopped", async () => {
+		vi.useFakeTimers();
+		await mode.handleLoopCommand("--interval 5s repeat this");
+		mode.setLoopPrompt("repeat this");
+		const resolved: SubmittedUserInput[] = [];
+		pendingInput = mode.getUserInput();
+		void pendingInput.then(input => resolved.push(input));
+		await executeBuiltinSlashCommand("/stop-loop", { ctx: mode });
+		vi.advanceTimersByTime(5000);
+		await flushMicrotasks();
+		expect(mode.loopModeEnabled).toBe(false);
+		expect(resolved).toEqual([]);
+	});
+
 	it("does not resolve the next loop prompt while compaction is running", async () => {
 		vi.useFakeTimers();
 		let compacting = true;

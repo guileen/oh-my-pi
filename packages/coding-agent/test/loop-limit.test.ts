@@ -86,6 +86,72 @@ describe("loop limit parsing", () => {
 	});
 });
 
+describe("explicit loop budgets and interval", () => {
+	test("counts the first turn in an explicit count without changing positional repeats", () => {
+		expect(parseLoopArgs("--count 1")).toEqual({ limit: { kind: "iterations", iterations: 0 } });
+		expect(parseLoopArgs("--count=5")).toEqual({ limit: { kind: "iterations", iterations: 4 } });
+		expect(parseLoopArgs("5")).toEqual({ limit: { kind: "iterations", iterations: 5 } });
+	});
+
+	test("combines all flags in either order with a condition and prompt", () => {
+		const expected = {
+			limit: { kind: "iterations", iterations: 2 },
+			durationLimit: { kind: "duration", durationMs: 90_000 },
+			intervalMs: 300_000,
+			condition: { command: "bun test", until: true },
+			prompt: "fix the tests",
+		};
+		expect(parseLoopArgs("--interval 5m --until 'bun test' --duration 1m30s --count 3 fix the tests")).toEqual(expected);
+		expect(parseLoopArgs("--count=3 --duration '90 seconds' --interval=5m --until='bun test' fix the tests")).toEqual(expected);
+	});
+
+	test("combines positional limits with a different explicit budget and interval", () => {
+		expect(parseLoopArgs("--interval 2s 100 --duration 5m --while true work")).toEqual({
+			limit: { kind: "iterations", iterations: 100 },
+			durationLimit: { kind: "duration", durationMs: 300_000 },
+			intervalMs: 2_000,
+			condition: { command: "true", until: false },
+			prompt: "work",
+		});
+		expect(parseLoopArgs("--count 2 5m --interval 10 seconds work")).toEqual({
+			limit: { kind: "iterations", iterations: 1 },
+			durationLimit: { kind: "duration", durationMs: 300_000 },
+			intervalMs: 10_000,
+			prompt: "work",
+		});
+		expect(parseLoopArgs("--duration 5m --interval 1s")).toEqual({
+			limit: { kind: "duration", durationMs: 300_000 },
+			intervalMs: 1_000,
+		});
+	});
+
+	test("rejects duplicate and conflicting budgets and conditions", () => {
+		for (const input of [
+			"--count 1 --count 2",
+			"--duration 1m --duration 2m",
+			"--interval 1m --interval 2m",
+			"5 --count 5",
+			"--count 5 5",
+			"5m --duration 1m",
+			"--duration 1m 5m",
+			"--while true --until false",
+		]) {
+			expect(typeof parseLoopArgs(input)).toBe("string");
+		}
+	});
+
+	test("rejects missing, invalid, non-positive, and overflowing flag values", () => {
+		for (const input of [
+			"--count", "--count --interval 1m", "--count 0", "--count -1", "--count 1.5",
+			"--count 9007199254740992", "--duration", "--duration 0m", "--duration 5",
+			"--duration 1.5m", "--duration 9999999999999h", "--interval 0s",
+			"--interval -1m", "--interval 9999999999999h", "--interval '1m extra'",
+		]) {
+			expect(typeof parseLoopArgs(input)).toBe("string");
+		}
+	});
+});
+
 describe("loop condition parsing", () => {
 	test("composes a limit, a condition, and an inline prompt", () => {
 		expect(parseLoopArgs("20 --until 'bun test' fix the failing tests")).toEqual({

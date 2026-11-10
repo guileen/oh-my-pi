@@ -30,7 +30,7 @@ const TIME_UNITS_MS = new Map<string, number>([
 ]);
 
 const LOOP_USAGE =
-	"Usage: /loop [count|duration] [--while|--until '<command>'] [prompt]. Examples: /loop 10, /loop 10m, /loop 20 --until 'bun test' fix the failing tests.";
+	"Usage: /loop [count|duration] [--count N] [--duration TIME] [--interval TIME] [--while|--until '<command>'] [prompt]. Examples: /loop 10, /loop 10m, /loop --count 20 --until 'bun test' fix the failing tests.";
 
 /**
  * Flag → `until` polarity. `--while` continues while the command succeeds;
@@ -42,8 +42,12 @@ const CONDITION_FLAGS: Record<string, boolean | undefined> = {
 };
 
 export interface ParsedLoopArgs {
-	/** Iteration/duration budget, when the user supplied a leading limit token. */
+	/** Positional budget or explicit total-count budget. */
 	limit?: LoopLimitConfig;
+	/** Duration budget when an iteration budget also occupies `limit`. */
+	durationLimit?: LoopLimitConfig;
+	/** Delay between turns, independent of the budgets. */
+	intervalMs?: number;
 	/** Continue-condition from `--while` / `--until`, re-evaluated before each iteration. */
 	condition?: LoopConditionConfig;
 	/** Inline loop prompt: text after the limit and flags, or the whole argument when neither was given. */
@@ -51,29 +55,93 @@ export interface ParsedLoopArgs {
 }
 
 /**
- * Parse `/loop` arguments into an optional leading limit, an optional
- * continue-condition flag, and an optional inline prompt.
- *
- * A leading token that *looks* like a limit (starts with a digit or sign) or
- * like a flag (starts with `--`) but fails to parse is a hard error, so a typo
- * surfaces instead of silently becoming prompt text. Anything else is prompt
- * text, so plain prose after `/loop` keeps starting an unbounded loop (the
- * pre-arg-parsing behavior). Returns the error message string on failure.
+ * Parse an optional positional limit and leading flags, followed by an inline
+ * prompt. Flags may precede or follow the positional limit; once prose begins,
+ * the rest is kept as prompt text.
  */
 export function parseLoopArgs(args: string): ParsedLoopArgs | string {
 	const trimmed = args.trim();
 	if (!trimmed) return {};
 
-	const limitResult = takeLoopLimit(trimmed);
-	if (typeof limitResult === "string") return limitResult;
+	let rest = trimmed;
+	let positional: LoopLimitConfig | undefined;
+	let count: LoopLimitConfig | undefined;
+	let duration: LoopLimitConfig | undefined;
+	let intervalMs: number | undefined;
+	let condition: LoopConditionConfig | undefined;
 
-	const conditionResult = takeLoopCondition(limitResult.rest);
-	if (typeof conditionResult === "string") return conditionResult;
+	while (rest) {
+		if (!rest.startsWith("--")) {
+			if (positional) break;
+			const result = takeLoopLimit(rest);
+			if (typeof result === "string") return result;
+			if (!result.limit) break;
+			positional = result.limit;
+			rest = result.rest;
+			continue;
+		}
 
+		const name = /^(--[a-z][a-z-]*)(?=[\s=]|$)/.exec(rest)?.[1];
+		const until = name === undefined ? undefined : CONDITION_FLAGS[name];
+		if (!name || (until === undefined && !["--count", "--duration", "--interval"].includes(name))) {
+			return `Unknown /loop flag ${name ?? rest.split(/\s+/, 1)[0]}. ${LOOP_USAGE}`;
+		}
+		const valueText = rest.slice(name.length);
+		const input = valueText.startsWith("=") ? valueText.slice(1) : valueText;
+		const value = readShellWord(input);
+		if (value === "unterminated") return `${name} has an unterminated quote.`;
+		if (until !== undefined) {
+			if (condition) return "Use only one of --while or --until.";
+			if (value === undefined || !value.value.trim() || input.trim().startsWith("-")) {
+				return `${name} needs a shell command. Quote it when it contains spaces: /loop ${name} 'bun test'.`;
+			}
+			condition = { command: value.value.trim(), until };
+			rest = value.rest;
+			continue;
+		}
+		if (value === undefined || !value.value.trim() || input.trim().startsWith("-")) {
+			return `${name} needs a positive ${name === "--count" ? "integer" : "duration"}.`;
+		}
+		if (name === "--count") {
+			if (count) return "Use --count only once.";
+			if (!/^\d+$/.test(value.value)) return "Loop count must be a positive integer.";
+			const parsed = makeIterations(value.value);
+			if (typeof parsed === "string") return parsed;
+			count = { kind: "iterations", iterations: parsed.iterations - 1 };
+			rest = value.rest;
+			continue;
+		}
+		if (name === "--duration" && duration) return "Use --duration only once.";
+		if (name === "--interval" && intervalMs !== undefined) return "Use --interval only once.";
+		// Accept both compact and space-separated units, including quoted values.
+		let durationText = value.value.trim();
+		rest = value.rest;
+		if (/^\d+$/.test(durationText)) {
+			const unit = /^\S+/.exec(rest)?.[0];
+			if (unit && TIME_UNITS_MS.has(unit.toLowerCase())) {
+				durationText += ` ${unit}`;
+				rest = rest.slice(unit.length).trim();
+			}
+		}
+		const parsed = takeLoopLimit(durationText);
+		if (typeof parsed === "string") return parsed;
+		if (parsed.limit?.kind !== "duration" || parsed.rest || !Number.isSafeInteger(parsed.limit.durationMs)) {
+			return `${name} needs a positive duration.`;
+		}
+		if (name === "--duration") duration = parsed.limit;
+		else intervalMs = parsed.limit.durationMs;
+	}
+
+	if (positional?.kind === "iterations" && count) return "A positional count cannot be combined with --count.";
+	if (positional?.kind === "duration" && duration) return "A positional duration cannot be combined with --duration.";
+	const iterationLimit = positional?.kind === "iterations" ? positional : count;
+	const timeLimit = positional?.kind === "duration" ? positional : duration;
 	return {
-		limit: limitResult.limit,
-		condition: conditionResult.condition,
-		prompt: conditionResult.rest || undefined,
+		limit: iterationLimit ?? timeLimit,
+		durationLimit: iterationLimit ? timeLimit : undefined,
+		intervalMs,
+		condition,
+		prompt: rest || undefined,
 	};
 }
 
@@ -114,34 +182,7 @@ function takeLoopLimit(input: string): { limit?: LoopLimitConfig; rest: string }
 	return LOOP_USAGE;
 }
 
-/** Split an optional leading `--while` / `--until` flag off the argument string. */
-function takeLoopCondition(input: string): { condition?: LoopConditionConfig; rest: string } | string {
-	let rest = input.trim();
-	let condition: LoopConditionConfig | undefined;
-
-	while (rest.startsWith("--")) {
-		const name = /^(--[a-z][a-z-]*)(?=[\s=]|$)/.exec(rest)?.[1];
-		const until = name === undefined ? undefined : CONDITION_FLAGS[name];
-		if (name === undefined || until === undefined) {
-			return `Unknown /loop flag ${name ?? rest.split(/\s+/, 1)[0]}. ${LOOP_USAGE}`;
-		}
-		if (condition) return "Use only one of --while or --until.";
-
-		const afterName = rest.slice(name.length);
-		const valueText = afterName.startsWith("=") ? afterName.slice(1) : afterName;
-		const value = readShellWord(valueText);
-		if (value === "unterminated") return `${name} has an unterminated quote.`;
-		if (value === undefined || !value.value.trim() || valueText.trim().startsWith("-")) {
-			return `${name} needs a shell command. Quote it when it contains spaces: /loop ${name} 'bun test'.`;
-		}
-		condition = { command: value.value.trim(), until };
-		rest = value.rest;
-	}
-
-	return { condition, rest };
-}
-
-function makeIterations(amountText: string): LoopLimitConfig | string {
+function makeIterations(amountText: string): Extract<LoopLimitConfig, { kind: "iterations" }> | string {
 	const amount = Number(amountText);
 	if (!Number.isSafeInteger(amount) || amount <= 0) {
 		return "Loop count must be a positive integer.";
@@ -154,7 +195,9 @@ function makeDuration(amountText: string, unitMs: number): LoopLimitConfig | str
 	if (!Number.isSafeInteger(amount) || amount <= 0) {
 		return "Loop duration must be positive.";
 	}
-	return { kind: "duration", durationMs: amount * unitMs };
+	const durationMs = amount * unitMs;
+	if (!Number.isSafeInteger(durationMs)) return "Loop duration is too large.";
+	return { kind: "duration", durationMs };
 }
 
 /**
@@ -180,6 +223,7 @@ function parseCompoundDuration(token: string): LoopLimitConfig | string | undefi
 			return "Loop duration must be positive.";
 		}
 		totalMs += amount * unitMs;
+		if (!Number.isSafeInteger(totalMs)) return "Loop duration is too large.";
 	}
 	if (totalMs <= 0) return "Loop duration must be positive.";
 	return { kind: "duration", durationMs: totalMs };
@@ -225,14 +269,14 @@ export function isLoopLimitExhausted(limit: LoopLimitRuntime | undefined, nowMs 
 
 export function describeLoopLimit(config: LoopLimitConfig): string {
 	if (config.kind === "iterations") {
-		return `${config.iterations} ${config.iterations === 1 ? "iteration" : "iterations"}`;
+		return `${config.iterations} ${config.iterations === 1 ? "repeat" : "repeats"} after the first turn`;
 	}
 	return formatLoopBudget(config.durationMs);
 }
 
 export function describeLoopLimitRuntime(limit: LoopLimitRuntime): string {
 	if (limit.kind === "iterations") {
-		return `${limit.remaining} of ${limit.initial} ${limit.initial === 1 ? "iteration" : "iterations"} remaining`;
+		return `${limit.remaining} of ${limit.initial} ${limit.initial === 1 ? "repeat" : "repeats"} remaining`;
 	}
 	return `${formatLoopBudget(limit.durationMs)} limit`;
 }

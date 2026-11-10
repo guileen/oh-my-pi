@@ -4,6 +4,7 @@
 
 ### Added
 
+- `/loop` accepts `--count`, `--duration`, and `--interval` together; count includes the first turn and the interval starts after each turn ends. Positional limits retain their existing meaning.
 - `/stop-loop` cancels future loop iterations without interrupting the current turn, even during compaction; interactive extensions can also exit loop mode via `ctx.sessionModes.set()` while work is running.
 - Lightweight observation rewind can retire search/read, test, browser and Computer Use results, including failures, before the next action; exact text/images and source anchors can be retained, with non-undo action receipts preserving uncertain outcomes.
 - QA rollover checkpoints now stay visible in the transcript after compaction, showing the recorded summary and next action instead of disappearing with the old context

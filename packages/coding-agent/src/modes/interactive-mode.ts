@@ -1407,6 +1407,8 @@ export class InteractiveMode implements InteractiveModeContext {
 	loopModePaused = false;
 	loopPrompt: string | undefined = undefined;
 	loopLimit: LoopLimitRuntime | undefined = undefined;
+	loopDurationLimit: LoopLimitRuntime | undefined = undefined;
+	loopIntervalMs: number | undefined = undefined;
 	loopCondition: LoopConditionConfig | undefined = undefined;
 	/** Last state reported through `mode_changed`; starts inactive so a restored session's modes are reported too. */
 	#reportedModeState: SessionModeState = {
@@ -3242,24 +3244,43 @@ export class InteractiveMode implements InteractiveModeContext {
 	#scheduleLoopAutoSubmit(): void {
 		this.#cancelLoopAutoSubmit();
 		if (!this.loopModeEnabled || !this.loopPrompt || this.#isShuttingDown) return;
+		if (isLoopLimitExhausted(this.loopLimit) || isLoopLimitExhausted(this.loopDurationLimit)) {
+			this.disableLoopMode("Loop limit reached. Loop mode disabled.");
+			return;
+		}
 		const prompt = this.loopPrompt;
 		const loopAction = cfgLoopMode.get(settings);
 		this.#deferLoopAutoSubmit(() => {
 			void this.#runLoopIteration(loopAction, prompt);
-		});
+		}, this.loopIntervalMs);
 	}
 
-	#deferLoopAutoSubmit(callback: () => void): void {
-		// Brief delay so the user has a chance to press Esc between iterations.
-		this.#loopAutoSubmitTimer = setTimeout(() => {
-			this.#loopAutoSubmitTimer = undefined;
-			try {
-				if (!this.loopModeEnabled || !this.onInputCallback) return;
-				callback();
-			} finally {
-				this.syncIdleMaintenanceView();
-			}
-		}, 800);
+	#deferLoopAutoSubmit(callback: () => void, delayMs = 800): void {
+		// Long intervals need multiple timers; runtimes clamp overflowing delays to 1 ms.
+		const wakeMs = Math.min(Number.MAX_SAFE_INTEGER, Date.now() + delayMs);
+		const arm = () => {
+			const duration = this.loopDurationLimit ?? (this.loopLimit?.kind === "duration" ? this.loopLimit : undefined);
+			const deadlineMs = duration?.kind === "duration" ? duration.deadlineMs : Infinity;
+			const waitMs = Math.max(0, Math.min(wakeMs, deadlineMs) - Date.now());
+			this.#loopAutoSubmitTimer = setTimeout(() => {
+				this.#loopAutoSubmitTimer = undefined;
+				try {
+					if (isLoopDurationExpired(this.loopLimit) || isLoopDurationExpired(this.loopDurationLimit)) {
+						this.disableLoopMode("Loop time limit reached. Loop mode disabled.");
+						return;
+					}
+					if (!this.loopModeEnabled || !this.onInputCallback) return;
+					if (Date.now() < wakeMs) {
+						arm();
+						return;
+					}
+					callback();
+				} finally {
+					this.syncIdleMaintenanceView();
+				}
+			}, Math.min(waitMs, 2_147_483_647));
+		};
+		arm();
 	}
 
 	#cancelLoopAutoSubmit(): void {
@@ -3358,7 +3379,7 @@ export class InteractiveMode implements InteractiveModeContext {
 
 	#submitLoopPromptWhenReady(prompt: string): void {
 		if (!this.loopModeEnabled || this.loopPrompt !== prompt || !this.onInputCallback) return;
-		if (isLoopDurationExpired(this.loopLimit)) {
+		if (isLoopDurationExpired(this.loopLimit) || isLoopDurationExpired(this.loopDurationLimit)) {
 			this.disableLoopMode("Loop time limit reached. Loop mode disabled.");
 			return;
 		}
@@ -3396,7 +3417,7 @@ export class InteractiveMode implements InteractiveModeContext {
 
 		// An exhausted budget ends the loop regardless of the condition, so check
 		// it first: the user's command must not run one last time for nothing.
-		if (isLoopLimitExhausted(this.loopLimit)) {
+		if (isLoopLimitExhausted(this.loopLimit) || isLoopLimitExhausted(this.loopDurationLimit)) {
 			this.disableLoopMode("Loop limit reached. Loop mode disabled.");
 			return;
 		}
@@ -3405,6 +3426,10 @@ export class InteractiveMode implements InteractiveModeContext {
 		// iteration that did not run, and after the blocked-check/defer above so
 		// a streaming turn cannot re-run the command on every retry tick.
 		if (this.loopCondition && !(await this.#passesLoopCondition(prompt))) return;
+		if (isLoopLimitExhausted(this.loopLimit) || isLoopLimitExhausted(this.loopDurationLimit)) {
+			this.disableLoopMode("Loop limit reached. Loop mode disabled.");
+			return;
+		}
 
 		// The gate awaited a child process: a turn may have started meanwhile
 		// (async job, idle flush), so re-check before spending budget or
@@ -3503,6 +3528,8 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.loopModePaused = false;
 		this.loopPrompt = undefined;
 		this.loopLimit = undefined;
+		this.loopDurationLimit = undefined;
+		this.loopIntervalMs = undefined;
 		this.loopCondition = undefined;
 		this.#cancelLoopAutoSubmit();
 		this.#abortLoopCondition();
@@ -3558,7 +3585,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.showError(parsed);
 			return undefined;
 		}
-		this.#enableLoopMode(parsed.limit, parsed.condition, Boolean(parsed.prompt));
+		this.#enableLoopMode(parsed.limit, parsed.condition, Boolean(parsed.prompt), parsed.durationLimit, parsed.intervalMs);
 		// Hand any inline prompt back to the dispatcher so the normal submit flow
 		// runs the first iteration — it records the text as the loop prompt and
 		// auto-resubmits it after each yield, identical to typing the prompt right
@@ -3570,21 +3597,33 @@ export class InteractiveMode implements InteractiveModeContext {
 		limit: LoopLimitConfig | undefined,
 		condition: LoopConditionConfig | undefined,
 		hasPrompt: boolean,
+		durationLimit?: LoopLimitConfig,
+		intervalMs?: number,
 	): void {
 		this.loopModeEnabled = true;
 		this.loopModePaused = false;
 		this.loopPrompt = undefined;
-		this.loopLimit = createLoopLimitRuntime(limit);
+		const nowMs = Date.now();
+		this.loopLimit = createLoopLimitRuntime(limit, nowMs);
+		this.loopDurationLimit = createLoopLimitRuntime(durationLimit, nowMs);
+		for (const bound of [this.loopLimit, this.loopDurationLimit]) {
+			if (bound?.kind === "duration") bound.deadlineMs = Math.min(Number.MAX_SAFE_INTEGER, bound.deadlineMs);
+		}
+		this.loopIntervalMs = intervalMs;
 		this.loopCondition = condition;
 		this.#syncLoopModeStatus();
-		const limitSuffix = limit ? ` Limited to ${describeLoopLimit(limit)}.` : "";
-		const remainingSuffix = this.loopLimit ? ` ${describeLoopLimitRuntime(this.loopLimit)}.` : "";
+		const limitSuffix = [limit, durationLimit].filter((bound): bound is LoopLimitConfig => bound !== undefined)
+			.map(bound => ` Limited to ${describeLoopLimit(bound)}.`).join("");
+		const remainingSuffix = [this.loopLimit, this.loopDurationLimit]
+			.filter((bound): bound is LoopLimitRuntime => bound !== undefined)
+			.map(bound => ` ${describeLoopLimitRuntime(bound)}.`).join("");
+		const intervalSuffix = intervalMs === undefined ? "" : ` Interval: ${describeLoopLimit({ kind: "duration", durationMs: intervalMs })}.`;
 		// The condition is a *continuation* signal: the first iteration always
 		// runs, and it is re-evaluated before each subsequent one.
 		const conditionSuffix = condition ? ` Continuing ${describeLoopCondition(condition)}.` : "";
 		const tail = hasPrompt ? "Repeating it after each turn." : "Your next prompt will repeat after each turn.";
 		this.showStatus(
-			`Loop mode enabled.${limitSuffix}${remainingSuffix}${conditionSuffix} ${tail} ${appKey(this.keybindings, "app.interrupt")} suspends the ongoing loop; /loop again to disable.`,
+			`Loop mode enabled.${limitSuffix}${remainingSuffix}${intervalSuffix}${conditionSuffix} ${tail} ${appKey(this.keybindings, "app.interrupt")} suspends the ongoing loop; /loop again to disable.`,
 		);
 	}
 
