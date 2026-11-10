@@ -2512,7 +2512,12 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			if (searchResult) {
 				const details = semanticToolResult(searchResult.toolName, searchResult)?.details;
 				if (isRecord(details) && isRecord(details.search)) {
-					await this.#applySearchRewind(details.search as unknown as SearchRewindInput, messages, signal);
+					await this.#applySearchRewind(
+						details.search as unknown as SearchRewindInput,
+						messages,
+						signal,
+						(details as unknown as RewindToolDetails).sourceReads,
+					);
 				}
 			}
 			const rewindReport = searchResult ? undefined : this.#extractRewindReport(messages);
@@ -8382,7 +8387,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		}
 	}
 
-	#searchRewindMessages(plan: SearchRewindPlan): CustomMessage[] {
+	#searchRewindMessages(plan: SearchRewindPlan, hasReads = false): CustomMessage[] {
 		const messages: CustomMessage[] = plan.materials.map(material => ({
 			role: "custom",
 			customType: SEARCH_MATERIAL,
@@ -8396,7 +8401,11 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		messages.push({
 			role: "custom",
 			customType: SEARCH_DECISION,
-			content: prompt.render(observationRewindTemplate, { note: plan.note, nextAction: plan.nextAction }),
+			content: prompt.render(observationRewindTemplate, {
+				note: plan.note,
+				nextAction: plan.nextAction,
+				hasReads,
+			}),
 			display: false,
 			attribution: "agent",
 			timestamp: Date.now(),
@@ -8435,11 +8444,20 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		};
 	}
 
-	async #applySearchRewind(input: SearchRewindInput, messages: AgentMessage[], signal?: AbortSignal): Promise<void> {
+	async #applySearchRewind(
+		input: SearchRewindInput,
+		messages: AgentMessage[],
+		signal?: AbortSignal,
+		sourceReads?: RewindToolDetails["sourceReads"],
+	): Promise<void> {
 		const generation = this.#promptGeneration;
 		let committedLeaf = this.sessionManager.getLeafId();
 		const checkpoint = this.#checkpointState;
 		let restoredCheckpoint = checkpoint;
+		const assistant = sourceReads?.length
+			? messages.findLast((message): message is AssistantMessage => message.role === "assistant")
+			: undefined;
+		if (sourceReads?.length && !assistant) throw new ToolError("Source reads have no owning assistant turn.");
 		await this.sessionManager.appendEntriesAtomically(
 			() => {
 				this.validateSearchRewind(input);
@@ -8460,7 +8478,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 					{ activeRefs: plan.activeRefs },
 					"agent",
 				);
-				for (const message of this.#searchRewindMessages(plan)) {
+				for (const message of this.#searchRewindMessages(plan, Boolean(sourceReads?.length))) {
 					this.sessionManager.appendCustomMessageEntry(
 						message.customType,
 						message.content,
@@ -8483,6 +8501,27 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 					"agent",
 				);
 				if (mode?.type === "mode_change") this.sessionManager.appendModeChange(mode.mode, mode.data);
+				if (sourceReads?.length && assistant) {
+					// The model requested these reads inside rewind; no extra provider request or usage is incurred.
+					this.sessionManager.appendMessage({
+						role: "assistant",
+						content: sourceReads.map(read => read.call),
+						api: assistant.api,
+						provider: assistant.provider,
+						model: assistant.model,
+						usage: {
+							input: 0,
+							output: 0,
+							cacheRead: 0,
+							cacheWrite: 0,
+							totalTokens: 0,
+							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+						},
+						stopReason: "toolUse",
+						timestamp: sourceReads[0].result.timestamp,
+					});
+					for (const read of sourceReads) this.sessionManager.appendMessage(read.result);
+				}
 				committedLeaf = this.sessionManager.getLeafId();
 			},
 			{

@@ -12,22 +12,27 @@
 
 Every completed tool result, including failures, returns an `observationId` (`o…`), except lifecycle tools `rewind`, `checkpoint`, and `todo`. Successful reads also return a `readId` (`r…`) for source selections. No separate checkpoint, work-package contract, report, or todo outcome is needed.
 
-Use the result to decide the next action, then rewind **before** executing it. For example: search → choose a read → rewind → read. A wrong read follows the same loop: record a brief exclusion in `note`, retire the read, then open the alternative. Tests, bash commands, browser and Computer Use observations—including failed checks or actions—are equally eligible.
+Prefer a small cut for noisy searches or wrong reads; skip it for tiny/useful output. Optional `read: string[]` fuses retirement with ordinary read paths and inline selectors, preferably bounded source ranges. `note` is a one-line location/exclusion; `nextAction` names the work **after** these reads. This gives the next provider turn the note plus original source with paths, numbered lines and edit tags, not pointers alone or model-rewritten code. No intervening provider round is needed to request the reads. Tests, bash commands, browser and Computer Use observations—including failures—are also eligible.
+
+Examples below assume the indicated refs and evidence were delivered; copy actual returned refs. Search result `o1` located the handler and its caller:
 
 ```json
 {
-  "observationId": "<returned observationId>",
-  "note": "The request handler is in src/entry.ts, not the CLI wrapper.",
-  "nextAction": "Read src/entry.ts:82-95"
+  "observationId": "o1",
+  "note": "Request handling is in src/entry.ts; src/router.ts calls it.",
+  "read": ["src/entry.ts:82-95", "src/router.ts:20-35"],
+  "nextAction": "Inspect the delivered handler and caller, then update request handling"
 }
 ```
 
-Optional evidence selections preserve original delivered content:
+Fused reads use the enabled canonical `read` tool with its normal permission checks and output format. A disabled reader rejects the request before reading or cutting. Successful reads and full read failures are preserved as ordinary observations with their normal IDs; one failed path does not discard successful reads. Inspect errors before continuing; do not claim unread source or repeat successful reads merely to execute `nextAction`. This is not a general tool-sequencing API.
 
-- `retain: [{"readId": "<returned readId>", "path": "src/entry.ts", "from": 82, "to": 95}]` carries exact, fully displayed numbered rows, their path and edit tag. It does not reread the current file or ask the model to rewrite code. Raw reads, omitted/truncated rows, and selections outside the affected observations are rejected.
-- `keep: [{"observationId": "<returned observationId>", "text": "Exact delivered error text", "images": [0]}]` carries exact text and images. `text` must be a nonempty substring of one delivered text part. `images` uses zero-based indexes among that result's delivered image parts, not indexes among all content parts. Either field can be omitted; select at least one text or image. Only actually delivered content can be kept, not model-created snapshots or paraphrases.
+Optional evidence selections preserve already-delivered content without reading again:
 
-Previously selected materials survive later hops. Use returned material references in `release` to remove obsolete code, or `demote: [{"ref": "<material>", "note": "Concise fact or exclusion reason"}]` to retain only a fact and source location. Prior decision notes and action receipts also survive. Released code does not reappear on rebuild; original history remains in the journal.
+- `retain: [{"readId": "r1", "path": "src/entry.ts", "from": 82, "to": 95}]`, assuming `r1` delivered those rows, carries exact, fully displayed numbered rows, their path and edit tag. Raw reads, omitted/truncated rows, and selections outside the affected observations are rejected.
+- `keep: [{"observationId": "o3", "text": "Connection refused", "images": [0]}]`, assuming `o3` delivered that text and an image, carries exact evidence. `text` must be a nonempty substring of one delivered text part. Image indexes are zero-based among delivered image parts, not all content parts. Select text, images, or both; never model-created snapshots or paraphrases.
+
+Previously selected materials survive later hops. Use returned material references in `release` to remove obsolete code, or `demote` entries with the returned `ref` and a concise fact/exclusion `note` to retain only that fact and source location. Prior decision notes and action receipts also survive. Released code does not reappear on rebuild; original history remains in the journal.
 
 Rewind changes context, not execution. Read/grep/find/glob arguments and unselected outputs can be retired. For other or unknown tools, the runtime automatically retains a receipt containing the original tool name and arguments, `isError`, and complete structured details, including asynchronous handles. This records the attempted action, not business success: even `isError: false` is not proof of success. If outcome details were discarded, they are unknown. Do not automatically repeat an action because its output was retired; rewind neither undoes nor replays it. Keep exact output evidence when the next decision needs it.
 
@@ -38,7 +43,7 @@ Source selection is limited to 32 ranges, each at most 2000 lines; up to 128 act
 ### Work-package handoffs
 
 
-`checkpointId`, `report`, and `nextAction` are required nonblank strings. Macro handoffs cannot mix in `observationId`, `note`, `retain`, `keep`, `release`, or `demote`. Only the active stack-top package can close.
+`checkpointId`, `report`, and `nextAction` are required nonblank strings. Macro handoffs cannot mix in `observationId`, `note`, `read`, `retain`, `keep`, `release`, or `demote`. Only the active stack-top package can close.
 
 | Field | Meaning |
 | --- | --- |
@@ -48,11 +53,11 @@ Source selection is limited to 32 ranges, each at most 2000 lines; up to 128 act
 | `outcome` | Required for a todo-bound package: `completed`, `blocked`, or `in_progress`. |
 | `reason` | Required when `outcome` is `blocked`. |
 
-For example, after completing a todo-bound package:
+For example, after completing a todo-bound package whose checkpoint returned the illustrative ID `c1`:
 
 ```json
 {
-  "checkpointId": "<copy the ID returned by checkpoint>",
+  "checkpointId": "c1",
   "report": "Updated the model-facing prompts and checked the nested transaction contract.",
   "outcome": "completed",
   "nextAction": "Update the user documentation"
@@ -67,7 +72,7 @@ When closing the parent, consolidate still-needed child findings and indexes int
 
 ## Outputs and application
 
-Small-decision results identify the observation boundary and retained materials for later release/demotion. Continue from their `nextAction`; they do not commit todo progress. For macro handoffs, structured result details contain:
+Small-decision results identify the observation boundary and retained materials for later release/demotion; they do not commit todo progress. Requested source reads are persisted after the cut in the same branch transaction, and the next provider turn receives their original output before continuing with `nextAction`. Recovery restores those observations without replaying reads. For macro handoffs, structured result details contain:
 
 - `checkpointId`: the targeted active checkpoint.
 - `report`: the retained handoff body; `nextAction` is rendered separately.
@@ -86,7 +91,7 @@ Continue package B from `nextAction`. Rewinding A does not finish the overall ta
 The runtime validates the request before changing context:
 
 - For a macro handoff, the ID must match the active stack top; anchors and todo bindings must still resolve. Canonical source entry identity and fingerprint prevent concurrent replanning or delete-and-recreate from silently rebinding a package.
-- User input since the boundary prevents rewinding across that input. Incomplete batches and stale boundaries fail closed; macro mixed-batch restrictions remain unchanged.
+- User input since the boundary prevents rewinding across that input. Incomplete batches and stale boundaries fail closed; macro mixed-batch restrictions remain unchanged. Small-cut boundary and savings validation precede read I/O. New input or stale generation during reads, or persistence failure, cannot commit a stale branch.
 - The estimated replacement must shrink context for a cut; the strict savings baseline excludes the newly generated report, so a long report cannot manufacture savings. With an explicit outcome, no savings can still commit progress without a cut.
 - `report`, `nextAction`, and any blocker `reason` together must fit within 4096 estimated tokens.
 

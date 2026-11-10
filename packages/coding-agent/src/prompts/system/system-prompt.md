@@ -135,14 +135,14 @@ NEVER open guessed files.{{#has tools "find"}} Read `{{toolRefs.find}}` hits onl
 
 {{#has tools "rewind"}}
 # Observation Decisions
-- Search → decide the next read → `{{toolRefs.rewind}}` BEFORE that read, using the returned observationId and concrete nextAction. Wrong read → retire it with a brief exclusion note before another read. Apply the same lightweight loop to tests/bash, browser and Computer Use results, including failures.
+- Prefer `{{toolRefs.rewind}}` for noisy searches or wrong reads; skip cuts for tiny/useful output. Supply the returned observationId, a one-line location/exclusion note, optional read paths/selectors, and nextAction AFTER those reads. With read, one call delivers original source with paths/lines/edit tags before the next provider turn—not pointers alone or rewritten code. Tests/bash, browser and Computer Use results are eligible too, including failures.
 - Small decisions need no checkpoint, intent paragraph, report or todo outcome. Optionally keep a brief conclusion in note, exact text/images through keep, or displayed code through retain (readId/path/ranges). Image indexes are zero-based among delivered image parts. Inherit useful materials across hops; release/demote obsolete ones. NEVER reread merely to preserve code.
 - Call rewind alone after affected tool batches settle. It never undoes actions: non-read/grep/find/glob tools retain original arguments and structured status receipts, not proof of success. Retired outcome details may be unknown; NEVER auto-repeat an action because its output was discarded.
 {{#has tools "checkpoint"}}
 # Work Packages
 - For longer research or implementation, MUST plan bounded packages A→B and record the overall objective, constraints, and plan before the anchor. Small observation decisions can close inside a package without finishing it or its todo.
 - Before A's FIRST search/read/edit, MUST call `{{toolRefs.checkpoint}}` with its goal, finishWhen, and carryForward contract. These are FUTURE work/acceptance/handoff requirements, not findings: NEVER investigate first to fill them. The anchor marks the START of disposable work.
-- At A's finishWhen, MUST call `{{toolRefs.rewind}}` with its checkpointId, evidence-backed report, nextAction and, when todo-bound, outcome BEFORE starting B. A blocked outcome requires reason. NEVER separately finish the bound todo first.
+- At A's finishWhen, MUST call `{{toolRefs.rewind}}` with its checkpointId, evidence-backed report, nextAction and, when todo-bound, outcome BEFORE starting B. A blocked outcome requires reason. NEVER mix small-observation fields (including read) into a macro handoff or separately finish the bound todo first.
 - Packages nest under the active parent (maximum 32); close the stack top and resume the parent. Phase completion requires all children complete and the phase's own acceptance evidence.
 - A no-savings macro outcome can commit progress without changing context; do not call it compaction or retry it. Small decisions never finish todos or close packages.
 - Preserve valuable unresolved work in the handoff or durable artifacts; NEVER treat rewind as file or authoritative todo rollback or overall-task completion.

@@ -3,4 +3,4 @@ File-only selector: `src/foo.ts:50-100`. Literal `\n`/`\\n` enables cross-line.
 Bare glob `*.ts` matches any depth; `dir/*.ts` only `dir`'s direct children (`dir/**/*.ts` recurses). A `!glob` entry excludes matching files and folders below the searched paths (`src;!**/*.test.ts`).
 {{#if hasFind}}Behavior/unknown symbol → `find`; literals/regex → `grep`.{{/if}}
 {{#if eagerDelegation}}Multi-round search MUST use {{#if scoutAvailable}}Task + scout{{else}}Task{{/if}}, not chained calls.{{/if}}
-With `rewind` available, use the returned `observationId`: search → decide the next read → rewind BEFORE that read. Keep a brief conclusion in `note` and the concrete read in `nextAction`; no checkpoint or handoff report.
+With `rewind` available, prefer fusing noisy-search retirement with `read: ["path:start-end"]`, the returned `observationId`, a one-line location `note`, and `nextAction` AFTER those reads. This delivers original source, not pointers alone. Skip cuts for tiny/useful output.

@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, spyOn } from "bun:test";
 import * as path from "node:path";
 import { type } from "@oh-my-pi/omptype";
-import { Agent, type AgentMessage, type AgentTool } from "@oh-my-pi/pi-agent-core";
+import { Agent, type AgentMessage, type AgentTool, type AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage, Message, ThinkingContent } from "@oh-my-pi/pi-ai";
 import {
 	createMockModel,
@@ -151,6 +151,7 @@ async function createHarness(
 				session.validateRewind(checkpointId, report, nextAction, outcome, reason),
 			bindCheckpointTodo: options.todoBinding ? target => session.bindCheckpointTodo(target) : undefined,
 			validateSearchRewind: input => session.validateSearchRewind(input),
+			getToolForEvalBridge: name => session.getToolForEvalBridge(name),
 		});
 		tools = [new CheckpointTool(toolSession) as AgentTool, new RewindTool(toolSession) as AgentTool, ...tools];
 		if (options.realSearchTools)
@@ -1074,6 +1075,594 @@ describe("AgentSession checkpoint rewind branch context", () => {
 			`readId=${searchReference("r", "wrong")}`,
 		);
 		expect(session.messages).toEqual(session.sessionManager.buildSessionContext().messages);
+	});
+
+	it("delivers fused source reads to the very next provider request and reloads them without rereading", async () => {
+		const note = "source.ts contains the implementation; generated matches are excluded.";
+		const nextAction = "Use the displayed implementation to make the requested change.";
+		const harness = await createHarness(
+			[
+				{
+					content: [
+						{
+							type: "toolCall",
+							id: "fused_search",
+							name: "grep",
+							arguments: { pattern: "FUSED_SEARCH_NOISE", path: "." },
+						},
+					],
+					stopReason: "toolUse",
+				},
+				{
+					content: [
+						{
+							type: "toolCall",
+							id: "fused_cut",
+							name: "rewind",
+							arguments: {
+								observationId: searchReference("o", "fused_search"),
+								note,
+								nextAction,
+								read: ["source.ts:2-4"],
+							},
+						},
+					],
+					stopReason: "toolUse",
+				},
+				{ content: ["Continue directly from the source."], stopReason: "stop" },
+			],
+			[],
+			{ realTools: true, realSearchTools: true, persist: true },
+		);
+		const { session, mock, tempDir, authStorage, extraSessions } = harness;
+		await Bun.write(
+			path.join(tempDir.path(), "noise.ts"),
+			Array.from({ length: 190 }, (_, i) => `export const noise${i} = "FUSED_SEARCH_NOISE_${i}";`).join("\n"),
+		);
+		await Bun.write(
+			path.join(tempDir.path(), "source.ts"),
+			'export function render(value: string) {\n\tif (value) {\n\t\treturn "EXACT_FUSED_SOURCE";\n\t}\n\treturn value;\n}\n',
+		);
+		const reader = session.agent.state.tools.find(tool => tool.name === "read");
+		if (!reader) throw new Error("Missing canonical reader");
+		const reads = spyOn(reader, "execute");
+		try {
+			await session.prompt("Locate the implementation and continue without a separate read turn.");
+			expect(mock.calls).toHaveLength(3);
+			expect(reads).toHaveBeenCalledTimes(1);
+			expect(reads.mock.calls[0]?.[1]).toEqual({ path: "source.ts:2-4" });
+			const request = mock.calls[2]!.context.messages;
+			const text = request.map(messageText).join("\n");
+			expect(text).toContain(note);
+			expect(text).toContain(nextAction);
+			expect(text).toMatch(/\[source\.ts#[0-9a-f]{4}\]/i);
+			expect(text).toContain('3:\t\treturn "EXACT_FUSED_SOURCE";');
+			expect(text).toContain("2:\tif (value) {");
+			expect(text).not.toContain("FUSED_SEARCH_NOISE_");
+			expect(request.some(message => message.role === "toolResult" && message.toolName === "grep")).toBe(false);
+			const sourceResults = request.filter(message => message.role === "toolResult" && message.toolName === "read");
+			expect(sourceResults).toHaveLength(1);
+			const source = sourceResults[0]!;
+			if (source.role !== "toolResult") throw new Error("Missing fused source result");
+			expect(source.toolCallId).toBe("fused_cut:read:0");
+			expect(source.isError).toBe(false);
+			expect(messageText(source)).toContain(`observationId=${searchReference("o", source.toolCallId)}`);
+			expect(messageText(source)).toContain(`readId=${searchReference("r", source.toolCallId)}`);
+			const sourceCalls = request.flatMap(message =>
+				message.role === "assistant"
+					? message.content.filter(block => block.type === "toolCall" && block.name === "read")
+					: [],
+			);
+			expect(sourceCalls).toEqual([
+				{ type: "toolCall", id: source.toolCallId, name: "read", arguments: { path: "source.ts:2-4" } },
+			]);
+			expect(session.messages).toEqual(session.sessionManager.buildSessionContext().messages);
+			const committed = structuredClone(
+				session.messages.filter(message => message.role === "toolResult" && message.toolName === "read"),
+			);
+			const file = session.sessionManager.getSessionFile();
+			if (!file) throw new Error("Missing durable fused-read session");
+			await session.dispose();
+			await Bun.write(path.join(tempDir.path(), "source.ts"), "SOURCE_CHANGED_AFTER_FUSED_READ\n");
+			const manager = await SessionManager.open(file);
+			const model = createMockModel({
+				responses: [{ content: ["Continue from the saved source."], stopReason: "stop" }],
+			});
+			const settings = Settings.isolated({
+				"compaction.enabled": false,
+				"retry.enabled": false,
+				"todo.reminders": false,
+			});
+			settings.setModelRole("default", `${model.provider}/${model.id}`);
+			const reloaded = new AgentSession({
+				agent: new Agent({
+					getApiKey: () => "test-key",
+					initialState: {
+						model,
+						tools: [reader],
+						messages: manager.buildSessionContext().messages,
+						systemPrompt: ["Test"],
+					},
+					streamFn: model.stream,
+					convertToLlm,
+				}),
+				sessionManager: manager,
+				settings,
+				modelRegistry: new ModelRegistry(authStorage, path.join(tempDir.path(), "fused-reload.yml")),
+				toolRegistry: new Map([[reader.name, reader]]),
+			});
+			extraSessions.push(reloaded);
+			expect(
+				reloaded.messages.filter(message => message.role === "toolResult" && message.toolName === "read"),
+			).toEqual(committed);
+			await reloaded.prompt("Continue from the saved implementation.");
+			const resumedText = model.calls[0]!.context.messages.map(messageText).join("\n");
+			expect(resumedText).toContain('3:\t\treturn "EXACT_FUSED_SOURCE";');
+			expect(resumedText).toMatch(/\[source\.ts#[0-9a-f]{4}\]/i);
+			expect(resumedText).not.toContain("SOURCE_CHANGED_AFTER_FUSED_READ");
+			expect(resumedText).not.toContain("FUSED_SEARCH_NOISE_");
+			expect(reads).toHaveBeenCalledTimes(1);
+		} finally {
+			reads.mockRestore();
+		}
+	});
+
+	it("keeps successful fused ranges and a canonical read failure together without another model round", async () => {
+		const paths = ["entry.ts:2-3", "missing.ts:1-2", "worker.ts:2-4", "entry.ts:9-10"];
+		const { session, mock, tempDir } = await createHarness(
+			[
+				{
+					content: [
+						{
+							type: "toolCall",
+							id: "ranges_search",
+							name: "grep",
+							arguments: { pattern: "RANGES_NOISE", path: "." },
+						},
+					],
+					stopReason: "toolUse",
+				},
+				{
+					content: [
+						{
+							type: "toolCall",
+							id: "ranges_cut",
+							name: "rewind",
+							arguments: {
+								observationId: searchReference("o", "ranges_search"),
+								note: "Entry and worker own the implementation; missing.ts remains unverified.",
+								nextAction: "Compare the displayed sources and account for the missing-file error.",
+								read: paths,
+							},
+						},
+					],
+					stopReason: "toolUse",
+				},
+				{ content: ["Use available source and investigate the error."], stopReason: "stop" },
+			],
+			[],
+			{ realTools: true, realSearchTools: true },
+		);
+		await Bun.write(
+			path.join(tempDir.path(), "noise.ts"),
+			Array.from({ length: 190 }, (_, i) => `export const noise${i} = "RANGES_NOISE_${i}";`).join("\n"),
+		);
+		await Bun.write(
+			path.join(tempDir.path(), "entry.ts"),
+			Array.from({ length: 15 }, (_, i) => `export const entry${i + 1} = "ENTRY_EXACT_${i + 1}";`).join("\n"),
+		);
+		await Bun.write(
+			path.join(tempDir.path(), "worker.ts"),
+			'export function worker() {\n\tconst value = "WORKER_EXACT_SOURCE";\n\treturn value;\n}\n',
+		);
+		const reader = session.agent.state.tools.find(tool => tool.name === "read");
+		if (!reader) throw new Error("Missing canonical reader");
+		const reads = spyOn(reader, "execute");
+		try {
+			await session.prompt("Locate both implementations, preserving any read error.");
+			expect(mock.calls).toHaveLength(3);
+			expect(reads).toHaveBeenCalledTimes(paths.length);
+			expect(reads.mock.calls.map(call => call[1])).toEqual(paths.map(path => ({ path })));
+			const request = mock.calls[2]!.context.messages;
+			const results = request.filter(message => message.role === "toolResult" && message.toolName === "read");
+			expect(results).toHaveLength(paths.length);
+			expect(new Set(results.map(result => result.role === "toolResult" && result.toolCallId)).size).toBe(
+				paths.length,
+			);
+			expect(results.map(result => result.role === "toolResult" && result.isError)).toEqual([
+				false,
+				true,
+				false,
+				false,
+			]);
+			expect(messageText(results[0]!)).toContain('2:export const entry2 = "ENTRY_EXACT_2";');
+			expect(messageText(results[2]!)).toContain('2:\tconst value = "WORKER_EXACT_SOURCE";');
+			expect(messageText(results[3]!)).toContain('9:export const entry9 = "ENTRY_EXACT_9";');
+			expect(messageText(results[0]!)).toMatch(/\[entry\.ts#[0-9a-f]{4}\]/i);
+			expect(messageText(results[2]!)).toMatch(/\[worker\.ts#[0-9a-f]{4}\]/i);
+			const failure = results[1]!;
+			const canonicalFailure = await Promise.resolve(reads.mock.results[1]!.value as Promise<AgentToolResult>).then(
+				result => ({ result }),
+				(error: unknown) => ({ error }),
+			);
+			if (failure.role !== "toolResult") throw new Error("Missing failed read result");
+			if ("error" in canonicalFailure) {
+				const error = canonicalFailure.error;
+				expect(messageText(failure)).toContain(error instanceof Error ? error.message : String(error));
+			} else {
+				for (const block of canonicalFailure.result.content) {
+					if (block.type === "text") expect(messageText(failure)).toContain(block.text);
+				}
+			}
+			expect(messageText(failure)).toContain("missing.ts");
+			expect(request.map(messageText).join("\n")).not.toContain("RANGES_NOISE_");
+			expect(request.some(message => message.role === "toolResult" && message.toolName === "grep")).toBe(false);
+			expect(session.messages).toEqual(session.sessionManager.buildSessionContext().messages);
+		} finally {
+			reads.mockRestore();
+		}
+	});
+
+	it("rejects invalid boundaries and disabled fused readers before reading or changing the branch", async () => {
+		const { session, tempDir } = await createHarness(
+			[
+				{
+					content: [
+						{
+							type: "toolCall",
+							id: "disabled_search",
+							name: "grep",
+							arguments: { pattern: "DISABLED_NOISE", path: "." },
+						},
+					],
+					stopReason: "toolUse",
+				},
+				{ content: ["Located the source."], stopReason: "stop" },
+			],
+			[],
+			{ realTools: true, realSearchTools: true },
+		);
+		await Bun.write(
+			path.join(tempDir.path(), "source.ts"),
+			Array.from({ length: 190 }, (_, i) => `export const value${i} = "DISABLED_NOISE_${i}";`).join("\n"),
+		);
+		await session.prompt("Locate the source.");
+		const reader = session.agent.state.tools.find(tool => tool.name === "read");
+		const rewind = session.agent.state.tools.find(tool => tool.name === "rewind");
+		if (!reader || !rewind) throw new Error("Missing real rewind/read tools");
+		const reads = spyOn(reader, "execute");
+		try {
+			const beforeInvalid = rewindMutationSnapshot(session);
+			await expect(
+				rewind.execute("invalid_fused_cut", {
+					observationId: searchReference("o", "never_delivered"),
+					nextAction: "Implement the change.",
+					read: ["source.ts:1-2"],
+				}),
+			).rejects.toThrow();
+			expect(reads).toHaveBeenCalledTimes(0);
+			expect(rewindMutationSnapshot(session)).toEqual(beforeInvalid);
+			await session.setActiveToolsByName(["checkpoint", "rewind", "grep"]);
+			expect(session.getToolForEvalBridge("read")).toBeUndefined();
+			const beforeDisabled = rewindMutationSnapshot(session);
+			await expect(
+				rewind.execute("disabled_fused_cut", {
+					observationId: searchReference("o", "disabled_search"),
+					nextAction: "Implement the change.",
+					read: ["source.ts:1-2"],
+				}),
+			).rejects.toThrow(/read/i);
+			expect(reads).toHaveBeenCalledTimes(0);
+			expect(rewindMutationSnapshot(session)).toEqual(beforeDisabled);
+		} finally {
+			reads.mockRestore();
+		}
+	});
+
+	it("rejects fused reads on macro rewind without performing I/O or consuming the checkpoint", async () => {
+		const { session } = await createActiveWorkPackage();
+		const rewind = session.agent.state.tools.find(tool => tool.name === "rewind");
+		if (!rewind) throw new Error("Missing real rewind tool");
+		const bridge = spyOn(session, "getToolForEvalBridge");
+		const before = rewindMutationSnapshot(session);
+		try {
+			await expect(
+				rewind.execute("macro_read_cut", {
+					checkpointId: "package_a",
+					report: "A implemented.",
+					nextAction: "Continue B.",
+					read: ["source.ts:1-2"],
+				}),
+			).rejects.toThrow(/read|observation|macro/i);
+			expect(bridge).toHaveBeenCalledTimes(0);
+			expect(rewindMutationSnapshot(session)).toEqual(before);
+		} finally {
+			bridge.mockRestore();
+		}
+	});
+
+	it("can retire a wrong fused source and retain a later fused source using its ordinary read identity", async () => {
+		let wrongCallId = "";
+		let correctCallId = "";
+		async function* responses() {
+			yield {
+				content: [
+					{
+						type: "toolCall",
+						id: "identity_search",
+						name: "grep",
+						arguments: { pattern: "IDENTITY_NOISE", path: "." },
+					},
+				],
+				stopReason: "toolUse" as const,
+			};
+			yield {
+				content: [
+					{
+						type: "toolCall",
+						id: "identity_cut",
+						name: "rewind",
+						arguments: {
+							observationId: searchReference("o", "identity_search"),
+							note: "Two candidate implementations located.",
+							nextAction: "Determine whether the displayed candidate owns the behavior.",
+							read: ["wrong.ts:1-140"],
+						},
+					},
+				],
+				stopReason: "toolUse" as const,
+			};
+			const wrong = session.messages.findLast(
+				message => message.role === "toolResult" && message.toolName === "read",
+			);
+			if (wrong?.role !== "toolResult") throw new Error("Missing wrong fused source observation");
+			wrongCallId = wrong.toolCallId;
+			yield {
+				content: [
+					{
+						type: "toolCall",
+						id: "wrong_fused_cut",
+						name: "rewind",
+						arguments: {
+							observationId: searchReference("o", wrongCallId),
+							note: "Exclude wrong.ts: generated fixtures do not own the implementation.",
+							nextAction: "Use the displayed correct implementation to follow its dependency.",
+							read: ["correct.ts:1-4"],
+						},
+					},
+				],
+				stopReason: "toolUse" as const,
+			};
+			const correct = session.messages.findLast(
+				message => message.role === "toolResult" && message.toolName === "read",
+			);
+			if (correct?.role !== "toolResult") throw new Error("Missing correct fused source observation");
+			correctCallId = correct.toolCallId;
+			yield {
+				content: [
+					{
+						type: "toolCall",
+						id: "dependency_search",
+						name: "grep",
+						arguments: { pattern: "IDENTITY_NOISE", path: "." },
+					},
+				],
+				stopReason: "toolUse" as const,
+			};
+			yield {
+				content: [
+					{
+						type: "toolCall",
+						id: "retain_fused_cut",
+						name: "rewind",
+						arguments: {
+							observationId: searchReference("o", correctCallId),
+							retain: [{ readId: searchReference("r", correctCallId), path: "correct.ts", from: 1, to: 4 }],
+							note: "The dependency search adds no implementation evidence.",
+							nextAction: "Implement against the retained correct source.",
+						},
+					},
+				],
+				stopReason: "toolUse" as const,
+			};
+			yield { content: ["Proceed with the retained implementation."], stopReason: "stop" as const };
+		}
+		const harness = await createHarness(responses() as MockResponseSource, [], {
+			realTools: true,
+			realSearchTools: true,
+		});
+		const session = harness.session;
+		const { mock, tempDir } = harness;
+		await Bun.write(
+			path.join(tempDir.path(), "noise.ts"),
+			Array.from({ length: 190 }, (_, i) => `export const noise${i} = "IDENTITY_NOISE_${i}";`).join("\n"),
+		);
+		await Bun.write(
+			path.join(tempDir.path(), "wrong.ts"),
+			Array.from({ length: 160 }, (_, i) => `export const fixture${i} = "WRONG_FUSED_BODY_${i}";`).join("\n"),
+		);
+		await Bun.write(
+			path.join(tempDir.path(), "correct.ts"),
+			'export function correct() {\n\tconst value = "RETAINED_FUSED_SOURCE";\n\treturn value;\n}\n',
+		);
+		const reader = session.agent.state.tools.find(tool => tool.name === "read");
+		if (!reader) throw new Error("Missing canonical reader");
+		const reads = spyOn(reader, "execute");
+		try {
+			await session.prompt(
+				"Locate the implementation, excluding generated candidates and retaining the correct source.",
+			);
+			expect(mock.calls).toHaveLength(6);
+			expect(reads).toHaveBeenCalledTimes(2);
+			expect(wrongCallId).toBe("identity_cut:read:0");
+			expect(correctCallId).toBe("wrong_fused_cut:read:0");
+			const afterWrong = mock.calls[2]!.context.messages.map(messageText).join("\n");
+			expect(afterWrong).toContain('1:export const fixture0 = "WRONG_FUSED_BODY_0";');
+			expect(afterWrong).toContain(`observationId=${searchReference("o", wrongCallId)}`);
+			const afterCorrect = mock.calls[3]!.context.messages.map(messageText).join("\n");
+			expect(afterCorrect).not.toContain("WRONG_FUSED_BODY_");
+			expect(afterCorrect).toContain("Exclude wrong.ts: generated fixtures do not own the implementation.");
+			expect(afterCorrect).toContain('2:\tconst value = "RETAINED_FUSED_SOURCE";');
+			expect(afterCorrect).toContain(`readId=${searchReference("r", correctCallId)}`);
+			const afterRetain = mock.calls[5]!.context.messages;
+			const finalText = afterRetain.map(messageText).join("\n");
+			expect(finalText).toContain('2:\tconst value = "RETAINED_FUSED_SOURCE";');
+			expect(finalText).toMatch(/\[correct\.ts#[0-9a-f]{4}\]/i);
+			expect(finalText).not.toContain("WRONG_FUSED_BODY_");
+			expect(finalText).not.toContain("IDENTITY_NOISE_");
+			expect(afterRetain.some(message => message.role === "toolResult" && message.toolName === "read")).toBe(false);
+			expect(session.messages).toEqual(session.sessionManager.buildSessionContext().messages);
+		} finally {
+			reads.mockRestore();
+		}
+	});
+
+	it("does not commit a stale cut when new user input arrives while a fused read is pending", async () => {
+		const { session, tempDir } = await createHarness(
+			[
+				{
+					content: [
+						{
+							type: "toolCall",
+							id: "pending_search",
+							name: "grep",
+							arguments: { pattern: "PENDING_NOISE", path: "." },
+						},
+					],
+					stopReason: "toolUse",
+				},
+				{
+					content: [
+						{
+							type: "toolCall",
+							id: "pending_cut",
+							name: "rewind",
+							arguments: {
+								observationId: searchReference("o", "pending_search"),
+								nextAction: "Implement the displayed source.",
+								read: ["source.ts:1-2"],
+							},
+						},
+					],
+					stopReason: "toolUse",
+				},
+				{ content: ["Preserve the new instructions and exploration."], stopReason: "stop" },
+			],
+			[],
+			{ realTools: true, realSearchTools: true },
+		);
+		await Bun.write(
+			path.join(tempDir.path(), "noise.ts"),
+			Array.from({ length: 190 }, (_, i) => `export const noise${i} = "PENDING_NOISE_${i}";`).join("\n"),
+		);
+		await Bun.write(path.join(tempDir.path(), "source.ts"), 'export const source = "STALE_FUSED_SOURCE";\n');
+		const reader = session.agent.state.tools.find(tool => tool.name === "read");
+		if (!reader) throw new Error("Missing canonical reader");
+		const execute = reader.execute.bind(reader);
+		const { promise: reading, resolve: announceRead } = Promise.withResolvers<void>();
+		const { promise: pending, resolve: releaseRead } = Promise.withResolvers<void>();
+		const reads = spyOn(reader, "execute").mockImplementationOnce(async (...args) => {
+			announceRead();
+			await pending;
+			return execute(...args);
+		});
+		try {
+			const run = session.prompt("Locate and read the implementation.");
+			await reading;
+			const instruction = {
+				role: "user" as const,
+				content: "NEW_USER_INPUT: preserve this exploration and do not apply the old cut.",
+				timestamp: Date.now(),
+			};
+			session.sessionManager.appendMessage(instruction);
+			session.agent.appendMessage(instruction);
+			releaseRead();
+			await run.catch(() => undefined);
+			expect(reads).toHaveBeenCalledTimes(1);
+			expect(session.sessionManager.getBranch().some(entry => entry.type === "branch_summary")).toBe(false);
+			const rebuilt = session.sessionManager.buildSessionContext().messages;
+			const text = convertToLlm(rebuilt).map(messageText).join("\n");
+			expect(text).toContain("NEW_USER_INPUT: preserve this exploration");
+			expect(text).toContain("PENDING_NOISE_");
+			expect(rebuilt.some(message => message.role === "toolResult" && message.toolName === "read")).toBe(false);
+			expect(session.messages.some(message => message.role === "toolResult" && message.toolName === "read")).toBe(
+				false,
+			);
+		} finally {
+			releaseRead();
+			reads.mockRestore();
+		}
+	});
+
+	it("does not persist fused source calls or results when the branch transaction fails", async () => {
+		const { session, tempDir } = await createHarness(
+			[
+				{
+					content: [
+						{
+							type: "toolCall",
+							id: "atomic_search",
+							name: "grep",
+							arguments: { pattern: "ATOMIC_NOISE", path: "." },
+						},
+					],
+					stopReason: "toolUse",
+				},
+				{
+					content: [
+						{
+							type: "toolCall",
+							id: "atomic_cut",
+							name: "rewind",
+							arguments: {
+								observationId: searchReference("o", "atomic_search"),
+								nextAction: "Implement the displayed source.",
+								read: ["source.ts:1-2"],
+							},
+						},
+					],
+					stopReason: "toolUse",
+				},
+				{ content: ["The exploration remains available."], stopReason: "stop" },
+			],
+			[],
+			{ realTools: true, realSearchTools: true, persist: true },
+		);
+		await Bun.write(
+			path.join(tempDir.path(), "noise.ts"),
+			Array.from({ length: 190 }, (_, i) => `export const noise${i} = "ATOMIC_NOISE_${i}";`).join("\n"),
+		);
+		await Bun.write(path.join(tempDir.path(), "source.ts"), 'export const source = "UNCOMMITTED_FUSED_SOURCE";\n');
+		const reader = session.agent.state.tools.find(tool => tool.name === "read");
+		if (!reader) throw new Error("Missing canonical reader");
+		const reads = spyOn(reader, "execute");
+		const failure = spyOn(session.sessionManager, "appendEntriesAtomically").mockRejectedValueOnce(
+			new Error("fused-read storage unavailable"),
+		);
+		try {
+			await session.prompt("Locate and read the implementation atomically.").catch(() => undefined);
+			expect(reads).toHaveBeenCalledTimes(1);
+			expect(failure).toHaveBeenCalledTimes(1);
+			expect(session.sessionManager.getBranch().some(entry => entry.type === "branch_summary")).toBe(false);
+			const persistedMessages = session.sessionManager
+				.getEntries()
+				.flatMap(entry => (entry.type === "message" ? [entry.message] : []));
+			expect(
+				persistedMessages.some(message => message.role === "toolResult" && message.toolCallId === "atomic_search"),
+			).toBe(true);
+			expect(
+				persistedMessages.some(
+					message =>
+						(message.role === "toolResult" && message.toolName === "read") ||
+						(message.role === "assistant" &&
+							message.content.some(block => block.type === "toolCall" && block.name === "read")),
+				),
+			).toBe(false);
+			expect(convertToLlm(session.messages).map(messageText).join("\n")).toContain("ATOMIC_NOISE_");
+		} finally {
+			failure.mockRestore();
+			reads.mockRestore();
+		}
 	});
 
 	it("retires failed and uncertain action logs while exact receipts, selected error text and images survive hops and reload", async () => {

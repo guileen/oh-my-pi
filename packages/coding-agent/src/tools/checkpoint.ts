@@ -1,11 +1,12 @@
 import { type } from "@oh-my-pi/omptype";
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@oh-my-pi/pi-agent-core";
-import { prompt } from "@oh-my-pi/pi-utils";
+import type { ToolCall, ToolResultMessage } from "@oh-my-pi/pi-ai";
+import { prompt, toError } from "@oh-my-pi/pi-utils";
 import checkpointDescription from "../prompts/tools/checkpoint.md" with { type: "text" };
 import rewindDescription from "../prompts/tools/rewind.md" with { type: "text" };
 import type { ToolSession } from ".";
 import type { OutputMeta } from "@oh-my-pi/pi-tui/tools/output-meta";
-import type { SearchRewindInput } from "../session/search-rewind";
+import { annotateSearchResult, type SearchRewindInput } from "../session/search-rewind";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { toolResult } from "./tool-result";
 import type { WorkPackageOutcome, WorkPackageTodoBinding } from "./todo";
@@ -60,6 +61,9 @@ const rewindSchema = type({
 	"keep?": type({ observationId: "string", "text?": "string", "images?": "number[]" })
 		.array()
 		.describe("exact delivered text substring and/or zero-based image indexes to retain"),
+	"read?": type("string")
+		.array()
+		.describe("read these paths with inline selectors in this same call; nextAction follows the reads"),
 	"report?": type("string").describe("work-package facts/evidence; not needed for a small observation"),
 	"outcome?": type('"completed" | "blocked" | "in_progress"').describe(
 		"explicit work result for the bound todo; does not apply to small observations",
@@ -97,6 +101,11 @@ export interface RewindContextEstimate {
 	willCompact?: boolean;
 }
 
+interface RewindSourceRead {
+	call: ToolCall;
+	result: ToolResultMessage;
+}
+
 export interface RewindToolDetails {
 	report: string;
 	rewound: boolean;
@@ -104,6 +113,7 @@ export interface RewindToolDetails {
 	nextAction?: string;
 	estimate?: RewindContextEstimate;
 	search?: SearchRewindInput;
+	sourceReads?: RewindSourceRead[];
 	outcome?: WorkPackageOutcome;
 	reason?: string;
 	meta?: OutputMeta;
@@ -191,11 +201,11 @@ export class RewindTool implements AgentTool<typeof rewindSchema, RewindToolDeta
 	}
 
 	async execute(
-		_toolCallId: string,
+		toolCallId: string,
 		params: RewindParams,
-		_signal?: AbortSignal,
+		signal?: AbortSignal,
 		_onUpdate?: AgentToolUpdateCallback<RewindToolDetails>,
-		_context?: AgentToolContext,
+		context?: AgentToolContext,
 	): Promise<AgentToolResult<RewindToolDetails>> {
 		if (params.observationId !== undefined) {
 			if (
@@ -216,10 +226,57 @@ export class RewindTool implements AgentTool<typeof rewindSchema, RewindToolDeta
 				demote: params.demote,
 				nextAction: params.nextAction,
 			};
-			const estimate = this.session.validateSearchRewind(search);
-			return toolResult<RewindToolDetails>({ report: "", rewound: true, search, estimate })
-				.text(`Observation rewind requested: ${estimate.beforeTokens} → ${estimate.afterTokens} estimated tokens.`)
-				.done();
+			if (
+				params.read &&
+				(params.read.length < 1 || params.read.length > 32 || params.read.some(path => !path.trim()))
+			)
+				throw new ToolError("Select between 1 and 32 nonempty read paths with inline selectors.");
+			let estimate = this.session.validateSearchRewind(search);
+			const sourceReads: RewindSourceRead[] | undefined = params.read ? [] : undefined;
+			if (params.read && sourceReads) {
+				const reader = this.session.getToolForEvalBridge?.("read");
+				if (!reader) throw new ToolError("Read is not available in this session; no rewind was applied.");
+				for (const [index, path] of params.read.entries()) {
+					signal?.throwIfAborted();
+					const call: ToolCall = {
+						type: "toolCall",
+						id: `${toolCallId}:read:${index}`,
+						name: "read",
+						arguments: { path },
+					};
+					let result: AgentToolResult;
+					try {
+						result = await reader.execute(call.id, call.arguments, signal, undefined, context);
+					} catch (error) {
+						signal?.throwIfAborted();
+						result = { content: [{ type: "text", text: toError(error).message }], isError: true };
+					}
+					const message: ToolResultMessage = {
+						role: "toolResult",
+						toolCallId: call.id,
+						toolName: call.name,
+						content: result.content,
+						details: result.details,
+						isError: result.isError === true,
+						timestamp: Date.now(),
+					};
+					annotateSearchResult(message);
+					sourceReads.push({ call, result: message });
+				}
+				estimate = this.session.validateSearchRewind(search);
+			}
+			const summary = `Observation rewind requested: ${estimate.beforeTokens} → ${estimate.afterTokens} estimated tokens.`;
+			const result = toolResult<RewindToolDetails>({
+				report: "",
+				rewound: true,
+				search,
+				estimate,
+				sourceReads,
+			}).text(summary);
+			if (sourceReads) {
+				result.content([{ type: "text", text: summary }, ...sourceReads.flatMap(read => read.result.content)]);
+			}
+			return result.done();
 		}
 		if (
 			!params.checkpointId ||
@@ -228,7 +285,8 @@ export class RewindTool implements AgentTool<typeof rewindSchema, RewindToolDeta
 			params.release ||
 			params.demote ||
 			params.note !== undefined ||
-			params.keep
+			params.keep ||
+			params.read
 		) {
 			throw new ToolError("Use observationId with nextAction, or checkpointId with report and nextAction.");
 		}

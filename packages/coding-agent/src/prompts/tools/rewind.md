@@ -2,8 +2,9 @@ Retire completed observations, or close a planned work package, then continue.
 
 ## Small observation
 
-- Use the returned `observationId` (`o…`), including failed results; `rewind`, `checkpoint`, and `todo` do not provide one. Search → decide the next read → rewind BEFORE that read. Wrong read → retire it with an exclusion `note` before another read. Tests/bash, browser and Computer Use outputs use the same loop.
-- Supply `observationId` and `nextAction`; optionally add a brief conclusion/exclusion `note`. No checkpoint, intent paragraph, report, or todo outcome. A small cut never completes a todo or closes its package.
+- Use the returned `observationId` (`o…`), including failed results; `rewind`, `checkpoint`, and `todo` do not provide one. Prefer retiring noisy searches or wrong reads; skip cuts for tiny/useful output. Tests/bash, browser and Computer Use results are also eligible.
+- Supply `observationId` and `nextAction`; optionally add a one-line location/exclusion `note` and `read: string[]` of ordinary read paths/selectors, preferably bounded ranges. One rewind call retires noise and delivers original read output before the next provider turn; `nextAction` is AFTER those reads. No checkpoint, report or todo outcome; a small cut never closes a package.
+- For source-location context, keep the one-line note plus real source with paths, numbered lines and edit tags—not pointers alone or model-rewritten code. Fused reads use normal read permissions; disabled read rejects before reading/cutting. Successful reads and full read errors remain available; NEVER claim failed reads succeeded or reread successful paths merely to continue.
 - `retain: [{readId, path, from, to}]` carries exact already-displayed source rows and edit anchors without rereading. `keep: [{observationId, text?, images?}]` carries a nonempty exact substring of one delivered text part and/or zero-based indexes among delivered image parts. NEVER paraphrase kept text or recreate images.
 - Selected materials survive later hops. `release` drops returned material references; `demote` replaces their code with a concise fact/exclusion reason and source location. Prior notes and action receipts survive. Preserve caller constraints that later code does not replace.
 - Call alone after every tool call in affected batches has a final result. Mixed completed tools are allowed. New input, lifecycle/context boundaries, incomplete batches, invalid selections and no net reduction reject the cut. Unrelated async notifications remain available.
@@ -11,14 +12,14 @@ Retire completed observations, or close a planned work package, then continue.
 
 Examples assume the indicated refs and content were delivered; copy actual returned refs.
 
-Search returned `o1` locating the handler; rewind before reading it:
+Search returned `o1` locating the handler; fuse the source read:
 ```json
-{"observationId":"o1","note":"Handler is in src/handler.ts.","nextAction":"Read src/handler.ts:82-95"}
+{"observationId":"o1","note":"Request handling is in src/handler.ts.","read":["src/handler.ts:82-95"],"nextAction":"Inspect the delivered handler and update request handling"}
 ```
 
-Read returned `o2` showing the wrong implementation:
+Read returned `o2` showing the wrong implementation; exclude it and read the alternative:
 ```json
-{"observationId":"o2","note":"CLI wrapper only; excludes request handling.","nextAction":"Read src/handler.ts:82-95"}
+{"observationId":"o2","note":"CLI wrapper only; excludes request handling.","read":["src/handler.ts:82-95"],"nextAction":"Inspect the delivered handler"}
 ```
 
 Failed browser action returned `o3`, text `Connection refused` and an image; keep that evidence without retrying:
@@ -28,7 +29,7 @@ Failed browser action returned `o3`, text `Connection refused` and an image; kee
 
 ## Work package
 
-- Use `checkpointId`, evidence-backed `report`, and `nextAction`; a bound package also requires `outcome`, and `blocked` requires `reason`. NEVER mix in `observationId`, `note`, `retain`, `keep`, `release`, or `demote`. Call alone; only the active stack top closes.
+- Use `checkpointId`, evidence-backed `report`, and `nextAction`; a bound package also requires `outcome`, and `blocked` requires `reason`. NEVER mix in `observationId`, `note`, `read`, `retain`, `keep`, `release`, or `demote`. Call alone; only the active stack top closes.
 - Commit progress through rewind, not a separate todo mutation. Report only what the parent and later siblings need: shared constraints, verified contracts/decisions, compact file/symbol or artifact indexes, verification evidence, and unresolved risks. Omit private exploration and irrelevant code.
 - Macro cuts do not automatically carry selected observation materials. Closing a parent? Consolidate still-needed child findings and indexes into its report; do not merely announce completion.
 - New input, stale boundaries and unsafe mixed batches fail closed. An explicit macro outcome can commit progress and close the scope without a cut when there is no net reduction. Accepted is not committed: `contextChanged` is the actual macro result. NEVER retry an unchanged rejected handoff.
@@ -36,4 +37,4 @@ Failed browser action returned `o3`, text `Connection refused` and an image; kee
 ## After either mode
 
 - Rewind changes context, never files, external effects or authoritative todo history; it never undoes or replays actions. Parent cuts replace child traces and summaries when beneficial. Cache eligibility is an estimate, not a hit; only usage confirms caching.
-- After success, execute `nextAction` immediately from retained context. Reopen evidence only for missing detail, changed sources, or contradiction.
+- After success, execute `nextAction` from retained context and any delivered reads. Reopen evidence only for missing detail, changed sources, or contradiction.
