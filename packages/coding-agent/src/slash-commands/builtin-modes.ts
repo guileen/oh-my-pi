@@ -373,7 +373,7 @@ export const BUILTIN_MODE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 		name: "loop",
 		icon: "loop",
 		get description() {
-			return `Toggle loop mode. While enabled, the next prompt you send re-submits after every yield. Bound it with a count/duration, or gate it with \`--until '<cmd>'\` / \`--while '<cmd>'\` — the command's exit status decides whether the next iteration runs. ${formatKeyHint("escape")} suspends the ongoing loop; /loop again to disable.`;
+			return `Toggle loop mode. While enabled, the next prompt you send re-submits after every yield. Bound it with a count/duration, or gate it with \`--until '<cmd>'\` / \`--while '<cmd>'\` — the command's exit status decides whether the next iteration runs. ${formatKeyHint("escape")} suspends the ongoing loop; /stop-loop disables it without interrupting the current turn.`;
 		},
 		inlineHint: "[count|duration] [--while|--until '<cmd>'] [prompt]",
 		allowArgs: true,
@@ -394,6 +394,15 @@ export const BUILTIN_MODE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 			// Surface any inline prompt so the dispatcher returns it and the normal
 			// submit flow runs the first loop iteration (recording it as the loop prompt).
 			if (prompt) return { prompt };
+		},
+	},
+	{
+		name: "stop-loop",
+		icon: "loop",
+		description: "Stop future loop iterations without interrupting the current turn",
+		handleTui: async (_command, runtime) => {
+			runtime.ctx.disableLoopMode();
+			clearSubmittedText(runtime);
 		},
 	},
 	{

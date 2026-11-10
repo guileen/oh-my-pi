@@ -1467,11 +1467,11 @@ export interface SessionModeState {
 }
 
 /**
- * Outcome of `ctx.sessionModes.set()`. `busy`: a turn, compaction, or another mode transition is
- * running, the session is still restoring its saved modes (startup or a session switch), or a
- * completed goal is still being torn down — retry once idle. `conflict`: another mode blocks this one
- * (exit it first). `disabled`: a setting gates it (`extensionHandlers.modeControl`, `plan.enabled`,
- * `goal.enabled`). `invalid_request`: malformed or not applicable now.
+ * Outcome of `ctx.sessionModes.set()`. `busy`: a turn or compaction is running (except for loop
+ * `exit`), another mode transition is running, the session is still restoring its saved modes
+ * (startup or a session switch), or a completed goal is still being torn down — retry once settled.
+ * `conflict`: another mode blocks this one (exit it first). `disabled`: a setting gates it
+ * (`extensionHandlers.modeControl`, `plan.enabled`, `goal.enabled`). `invalid_request`: malformed or not applicable now.
  */
 export type SessionModeResult =
 	| { ok: true; changed: boolean; state: SessionModeState }

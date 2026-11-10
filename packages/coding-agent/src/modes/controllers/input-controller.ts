@@ -2161,6 +2161,12 @@ export class InputController {
 		// A compaction queued for the next yield holds later follow-ups the same
 		// way, so they run after it.
 		this.releaseStaleYieldCompaction();
+		// Unlike queued follow-ups, stopping a loop must take effect before compaction ends.
+		if (parseSlashCommand(text)?.name === "stop-loop" && this.#matchesBuiltinSlashCommand(text)) {
+			await executeBuiltinSlashCommand(text, { ctx: this.ctx, draftDetached: true });
+			if (!shouldSkipHistory(text)) this.ctx.editor.addToHistory(text);
+			return;
+		}
 		if (this.ctx.session.isCompacting || this.ctx.yieldCompaction) {
 			if (
 				text &&

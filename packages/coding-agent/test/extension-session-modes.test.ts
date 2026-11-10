@@ -201,6 +201,47 @@ describe("ctx.sessionModes in the interactive TUI", () => {
 		expect(changed(await modes.set({ mode: "plan", action: "enter" }))).toBe(true);
 	});
 
+	it("stops future loop iterations during a turn without aborting it or enabling on repeat", async () => {
+		const { session, provider, modes, mode } = await tui();
+		const started = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		provider.fallback = async () => {
+			started.resolve();
+			await release.promise;
+			return { content: ["released"] };
+		};
+		expect(changed(await modes.set({ mode: "loop", action: "enter", prompt: "repeat" }))).toBe(true);
+		const turn = session.prompt("hold");
+		await started.promise;
+		try {
+			expect(changed(await modes.set({ mode: "loop", action: "exit" }))).toBe(true);
+			expect(changed(await modes.set({ mode: "loop", action: "exit" }))).toBe(false);
+			expect(refusal(await modes.set({ mode: "loop", action: "enter" }))).toBe("busy");
+			expect(session.isStreaming).toBe(true);
+			expect(mode.loopPrompt).toBeUndefined();
+			expect(modes.getState().loop.status).toBe("inactive");
+		} finally {
+			release.resolve();
+			await turn;
+		}
+		expect(provider.calls).toHaveLength(1);
+	});
+
+	it("exits a paused loop during compaction while other transitions remain guarded", async () => {
+		const { session, mode, modes } = await tui();
+		expect(changed(await modes.set({ mode: "loop", action: "enter", prompt: "repeat" }))).toBe(true);
+		mode.pauseLoop();
+		Object.defineProperty(session, "isCompacting", { configurable: true, get: () => true });
+		try {
+			expect(refusal(await modes.set({ mode: "vibe", action: "enter" }))).toBe("busy");
+			expect(changed(await modes.set({ mode: "loop", action: "exit" }))).toBe(true);
+			expect(changed(await modes.set({ mode: "loop", action: "exit" }))).toBe(false);
+			expect(modes.getState().loop.status).toBe("inactive");
+		} finally {
+			Reflect.deleteProperty(session, "isCompacting");
+		}
+	});
+
 	it("runs the goal lifecycle with a budget, submits no prompt, and restores tools on drop", async () => {
 		const { session, provider, modes } = await tui();
 		const tools = session.getEnabledToolNames();
@@ -387,6 +428,7 @@ describe("ctx.sessionModes in the interactive TUI", () => {
 		// A request racing the switch is refused instead of landing in either session.
 		const switching = session.newSession();
 		expect(refusal(await modes.set({ mode: "vibe", action: "enter" }))).toBe("busy");
+		expect(refusal(await modes.set({ mode: "loop", action: "exit" }))).toBe("busy");
 		await switching;
 		await Bun.sleep(0);
 		expect(modes.getState().vibe.status).toBe("inactive");

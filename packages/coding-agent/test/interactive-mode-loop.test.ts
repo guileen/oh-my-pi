@@ -14,6 +14,7 @@ import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
 
+import { executeBuiltinSlashCommand } from "@oh-my-pi/pi-coding-agent/slash-commands/builtin-registry";
 import { cfgLoopMode } from "@oh-my-pi/pi-coding-agent/modes/settings";
 
 async function flushMicrotasks(): Promise<void> {
@@ -77,6 +78,22 @@ describe("InteractiveMode loop auto-submit", () => {
 		authStorage.close();
 		tempDir.removeSync();
 		resetSettingsForTest();
+	});
+
+	it("/stop-loop cancels a scheduled iteration and never re-enables an inactive loop", async () => {
+		vi.useFakeTimers();
+		await mode.handleLoopCommand("repeat this");
+		mode.setLoopPrompt("repeat this");
+		const resolved: SubmittedUserInput[] = [];
+		pendingInput = mode.getUserInput();
+		void pendingInput.then(input => resolved.push(input));
+		await executeBuiltinSlashCommand("/stop-loop", { ctx: mode });
+		await executeBuiltinSlashCommand("/stop-loop", { ctx: mode });
+		vi.advanceTimersByTime(1600);
+		await flushMicrotasks();
+		expect(mode.loopModeEnabled).toBe(false);
+		expect(mode.loopPrompt).toBeUndefined();
+		expect(resolved).toEqual([]);
 	});
 
 	it("does not resolve the next loop prompt while compaction is running", async () => {

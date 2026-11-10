@@ -770,6 +770,24 @@ describe("InputController keybinding setup", () => {
 		return { handleCompactCommand, queueCompactionMessage };
 	}
 
+	it("dispatches /stop-loop immediately on Enter and Ctrl+Enter during compaction", async () => {
+		const { InputController, ctx, editor, spies } = await createContext();
+		const { queueCompactionMessage } = withCompactionQueue(ctx);
+		const disableLoopMode = vi.fn();
+		Object.assign(ctx, { disableLoopMode, skillCommands: new Map(), fileSlashCommands: new Map() });
+		Object.assign(ctx.session, { isCompacting: true, customCommands: [], promptTemplates: [] });
+		const controller = new InputController(ctx);
+		controller.setupEditorSubmitHandler();
+
+		await editor.onSubmit?.("/stop-loop");
+		editor.setText("/stop-loop");
+		await controller.handleFollowUp();
+
+		expect(disableLoopMode).toHaveBeenCalledTimes(2);
+		expect(queueCompactionMessage).not.toHaveBeenCalled();
+		expect(spies.prompt).not.toHaveBeenCalled();
+	});
+
 	it("queues a follow-up /compact for the next yield instead of interrupting the run", async () => {
 		const { InputController, ctx, editor, spies } = await createContext();
 		const { handleCompactCommand, queueCompactionMessage } = withCompactionQueue(ctx);

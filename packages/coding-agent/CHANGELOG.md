@@ -4,6 +4,7 @@
 
 ### Added
 
+- `/stop-loop` cancels future loop iterations without interrupting the current turn, even during compaction; interactive extensions can also exit loop mode via `ctx.sessionModes.set()` while work is running.
 - Lightweight observation rewind can retire search/read, test, browser and Computer Use results, including failures, before the next action; exact text/images and source anchors can be retained, with non-undo action receipts preserving uncertain outcomes.
 - QA rollover checkpoints now stay visible in the transcript after compaction, showing the recorded summary and next action instead of disappearing with the old context
 - Added opt-in auto-update (`update.auto`, offered by a new setup wizard step): a launch that finds a newer release installs it in the background through whatever installed omp (standalone binary, Homebrew, mise, bun, npm), shows the version and download progress beside the welcome banner's version, and the next launch runs it. Quitting mid-update does not interrupt it. Skipped under Tern, which updates its omp itself, and on Nix and source checkouts

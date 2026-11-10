@@ -3674,7 +3674,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		const transition = this.#planSessionModeTransition(request);
 		if (transition === undefined) return { ok: true, changed: false, state: this.#getSessionModeState() };
 		if (typeof transition !== "function") return refuse(transition.code, transition.message);
-		if (this.session.isBusyForSnapshot) {
+		if (this.session.isBusyForSnapshot && !(request.mode === "loop" && request.action === "exit")) {
 			return refuse("busy", "The session is busy with a turn or compaction; retry once it is idle.");
 		}
 		const before = JSON.stringify(this.#getSessionModeState());
