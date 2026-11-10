@@ -166,8 +166,8 @@ export class IdleMaintenance {
 	}
 
 	/**
-	 * Nothing is live, admitted, queued or scheduled. Background work may still wake the session;
-	 * both recap and idle compaction additionally require {@link #isSettled}.
+	 * Nothing is live, admitted, queued or scheduled. Background work may still wake the session: that holds
+	 * back only idle compaction (see {@link #isSettled}), as it did before the scheduler owned this work.
 	 */
 	#isQuiet(): boolean {
 		const session = this.#session;
@@ -216,14 +216,13 @@ export class IdleMaintenance {
 			if (!isCurrent()) return;
 		}
 		if (this.#isBlocked() || !this.#isQuiet()) return;
-		// Both recap and compaction wait for settlement: a background job can still wake the session and
-		// invalidate what either would produce.
+		this.#armRecap();
+		// Compacting while a background result is still due would rewrite the context that result wakes into.
 		const settled = await waitForSessionSettlement(session, {
 			isCurrent,
 			scheduledTurn: this.#options.scheduledTurn,
 		});
 		if (!settled || this.#isBlocked()) return;
-		this.#armRecap();
 		this.#armCompaction();
 	}
 
@@ -315,7 +314,7 @@ export class IdleMaintenance {
 		this.#recapTimer = undefined;
 		if (!this.#pending?.recap || this.#recapRun) return;
 		if (this.#isBlocked()) return;
-		if (!this.#isSettled()) {
+		if (!this.#isQuiet()) {
 			this.#schedule();
 			return;
 		}
@@ -346,7 +345,7 @@ export class IdleMaintenance {
 			const { replyText } = await session.runEphemeralTurn({ promptText, signal: run.signal });
 			if (this.#recapRun !== run || run.signal.aborted) return;
 			if (this.#isBlocked()) return;
-			if (!this.#isSettled()) {
+			if (!this.#isQuiet()) {
 				this.#recapRun = undefined;
 				this.#schedule();
 				return;

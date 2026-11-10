@@ -29,7 +29,6 @@ import {
 	cfgProvidersMuseCodeStoreResponses,
 	cfgProvidersOpenaiCodexDaybreak,
 	cfgProvidersOpenaiLiveSteering,
-	cfgProvidersOpenaiResponsesWebsockets,
 	cfgProvidersOpenaiWebsockets,
 	cfgProvidersOpenrouterVariant,
 	cfgProvidersStreamFirstEventTimeoutSeconds,
@@ -39,22 +38,10 @@ import {
 	validateProviderMaxInFlightRequests,
 } from "./settings";
 
-/** Apply each API's setting once; standard Responses preferences can only narrow it. */
-export function resolveWebsocketPreference(
-	settings: Settings,
-	model: Model | undefined,
-	requestPreference?: boolean,
-): boolean | undefined {
-	if (model?.api === "openai-responses") {
-		return (
-			cfgProvidersOpenaiResponsesWebsockets.get(settings) &&
-			model.preferWebsockets !== false &&
-			requestPreference !== false
-		);
-	}
-	if (model?.api !== "openai-codex-responses") return requestPreference;
+/** Map `providers.openaiWebsockets` to the provider `preferWebsockets` hint (`auto` → model default). */
+export function resolveOpenAIWebsocketPreference(settings: Settings): boolean | undefined {
 	const setting = cfgProvidersOpenaiWebsockets.get(settings);
-	return requestPreference ?? (setting === "on" ? true : setting === "off" ? false : undefined);
+	return setting === "on" ? true : setting === "off" ? false : undefined;
 }
 
 function timeoutSecondsToMs(value: number): number | undefined {
@@ -81,9 +68,9 @@ export interface SettingsStreamSlowModeContext {
  * Build a {@link StreamFn} that reads provider routing/guard settings from
  * `settings` per call and forwards to `base` (defaults to `streamSimple`).
  *
- * Caller-supplied `streamOptions` normally win. Standard Responses WS requires
- * its opt-in setting and honors either explicit false; the output cap is lowered
- * when prompt plus cap would exceed the model's context window (see
+ * Caller-supplied `streamOptions` always win — the helper only fills holes.
+ * The one exception is the output cap, which is lowered when prompt plus cap
+ * would exceed the model's context window (see
  * {@link fitOutputTokensToContextWindow}); every request this session drives,
  * including side turns like `/btw`, goes through here.
  */
@@ -174,7 +161,6 @@ export function createSettingsAwareStreamFn(
 		const merged: SimpleStreamOptions = {
 			...streamOptions,
 			maxTokens,
-			preferWebsockets: resolveWebsocketPreference(settings, model, streamOptions?.preferWebsockets),
 			openrouterVariant: streamOptions?.openrouterVariant ?? openrouterVariant,
 			antigravityEndpointMode: streamOptions?.antigravityEndpointMode ?? antigravityEndpointMode,
 			textVerbosity: streamOptions?.textVerbosity ?? textVerbosity,

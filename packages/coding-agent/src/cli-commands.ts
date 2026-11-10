@@ -68,6 +68,11 @@ export const commands: CommandEntry[] = [
 		help: commandHelp.benchHelp,
 	},
 	{
+		name: "bot",
+		load: () => import("./commands/bot").then(m => m.default),
+		help: commandHelp.botHelp,
+	},
+	{
 		name: "browser-relay",
 		load: () => import("./commands/browser-relay").then(m => m.default),
 		help: commandHelp.browserRelayHelp,
@@ -225,23 +230,6 @@ export const commands: CommandEntry[] = [
 		name: "shell",
 		load: () => import("./commands/shell").then(m => m.default),
 		help: commandHelp.shellHelp,
-	},
-	// `cli.ts` runs these before the command framework (raw argv passthrough);
-	// the entries list them in `omp --help` and the completions.
-	{
-		name: "zsh",
-		load: () => import("./commands/native-shell").then(m => m.Zsh),
-		help: commandHelp.nativeShellHelp("zsh"),
-	},
-	{
-		name: "bash",
-		load: () => import("./commands/native-shell").then(m => m.Bash),
-		help: commandHelp.nativeShellHelp("bash"),
-	},
-	{
-		name: "sh",
-		load: () => import("./commands/native-shell").then(m => m.Sh),
-		help: commandHelp.nativeShellHelp("sh"),
 	},
 	{
 		name: "read",

@@ -486,8 +486,8 @@ export interface SessionAdvisorsHost {
 	yieldQueue: YieldQueue;
 	obfuscator(): SecretObfuscator | undefined;
 	providerSessionState: Map<string, ProviderSessionState>;
-	/** Per-model WebSocket preference from the live transport settings (Codex and standard Responses). */
-	preferWebsockets(model: Model): boolean | undefined;
+	/** Live `providers.openaiWebsockets` hint for provider calls. */
+	preferWebsockets(): boolean | undefined;
 	onPayload: SimpleStreamOptions["onPayload"] | undefined;
 	onResponse: SimpleStreamOptions["onResponse"] | undefined;
 	onSseEvent: SimpleStreamOptions["onSseEvent"] | undefined;
@@ -1435,10 +1435,10 @@ export class SessionAdvisors {
 			});
 			const baseAdvisorStreamFn = this.#advisorStreamFn ?? streamSimple;
 			const advisorStreamFn: StreamFn = (requestModel, context, streamOptions) => {
-				// Read per request so transport setting changes reach existing advisors.
+				// Read per request so a mid-session `providers.openaiWebsockets` change reaches advisors.
 				const options = {
 					...streamOptions,
-					preferWebsockets: streamOptions?.preferWebsockets ?? this.#host.preferWebsockets(requestModel),
+					preferWebsockets: streamOptions?.preferWebsockets ?? this.#host.preferWebsockets(),
 				};
 				if (requestModel.api === "openai-codex-responses") {
 					return baseAdvisorStreamFn(requestModel, context, {
@@ -2405,6 +2405,11 @@ export class SessionAdvisors {
 		if (!configuredCompaction.enabled || methods.length === 0) {
 			return false;
 		}
+		// Advisors have no QA checkpoint lifecycle. A QA-first configuration
+		// authorizes a paid summary only when a later engine method is explicit.
+		if (methods.includes("qaonly") && !methods.some(method => method === "remote" || method === "soft")) {
+			return false;
+		}
 		const compactionMethod = methods.includes("remote") ? "remote" : "soft";
 		let advisorModel = agent.state.model;
 		let compactionSettings = resolveMethodSettings(
@@ -2599,7 +2604,7 @@ export class SessionAdvisors {
 						promptCacheKey: advisorProviderSessionId,
 						metadata: advisorMetadata,
 						providerSessionState: this.#host.providerSessionState,
-						preferWebsockets: this.#host.preferWebsockets(candidate),
+						preferWebsockets: this.#host.preferWebsockets(),
 						codexAccessPrograms: cfgProvidersOpenaiCodexDaybreak.get(this.#host.settings),
 						codexCompaction,
 					},

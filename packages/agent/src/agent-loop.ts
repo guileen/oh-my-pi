@@ -2207,6 +2207,8 @@ async function streamAssistantResponse(
 
 	try {
 		return await runInActiveSpan(chatSpan, async () => {
+			await config.beforeProviderRequest?.(finalRequestSignal);
+			finalRequestSignal?.throwIfAborted();
 			onProviderStart?.();
 			let response = await streamFunction(model, llmContext, {
 				...config,

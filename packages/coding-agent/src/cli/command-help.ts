@@ -29,6 +29,10 @@ export const benchHelp = {
 		"Benchmark models: TTFT/prefill vs decode throughput with p50/p95, across chat, prefill, generation, and prompt-cache workloads, or single-user vs parallel load (--detailed)",
 } satisfies CommandMetadata;
 
+export const botHelp = {
+	description: "Create restricted named Bots, submit Jobs, and observe or control their durable execution",
+} satisfies CommandMetadata;
+
 export const browserRelayHelp = {
 	description: "Run the local CDP relay that lets the browser prelude drive your own Chrome tabs",
 } satisfies CommandMetadata;
@@ -144,26 +148,6 @@ export const setupHelp = {
 } satisfies CommandMetadata;
 
 export const shellHelp = { description: "Interactive shell console" } satisfies CommandMetadata;
-
-const NATIVE_SHELL_DESCRIPTIONS = {
-	zsh: "Run zsh 5.9 on the built-in pi-shell engine (all arguments go to zsh)",
-	bash: "Run bash 5.3 on the built-in pi-shell engine (all arguments go to bash)",
-	sh: "Run a POSIX sh on the built-in pi-shell engine (all arguments go to sh)",
-} as const;
-
-/** `omp zsh|bash|sh`: the whole command line after the word goes to the shell. */
-export function nativeShellHelp(name: keyof typeof NATIVE_SHELL_DESCRIPTIONS) {
-	return {
-		description: NATIVE_SHELL_DESCRIPTIONS[name],
-		args: {
-			args: {
-				kind: "string",
-				description: `Arguments passed to ${name} unchanged (options, -c COMMAND, a script and its arguments)`,
-				multiple: true,
-			},
-		},
-	} satisfies CommandMetadata;
-}
 
 export const skillHelp = {
 	description: "Install, search, publish, and manage skills on the Skillshare registry (skills.omp.sh)",

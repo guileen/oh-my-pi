@@ -5,7 +5,7 @@ import type { DaemonSnapshot, DaemonSpec } from "@oh-my-pi/pi-tui/tools/daemon";
 import { formatDuration, replaceTabs } from "@oh-my-pi/pi-tui/render/render-utils";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { getDaemonRuntimeDir, logger, sanitizeText } from "@oh-my-pi/pi-utils";
-import { type DaemonBrokerClient, daemonClientForProject } from "./client";
+import { type DaemonBrokerClient, type DaemonCompletionUnregisterOptions, daemonClientForProject } from "./client";
 import { canonicalProjectDir } from "./paths";
 import type { DaemonOperation, DaemonRpcResult } from "./protocol";
 import { renderTerminalOutputIsolated } from "./terminal-output-worker-client";
@@ -36,14 +36,18 @@ interface ServiceSession extends ToolSession {
 	[serviceStateKey]?: {
 		owned: Map<string, { id: string; startedAt: number }>;
 		listeners: Set<() => void>;
-		subscribed: Set<DaemonBrokerClient>;
+		subscribed: Map<
+			DaemonBrokerClient,
+			{ owner: string; unsubscribe: (options?: DaemonCompletionUnregisterOptions) => void }
+		>;
+		owner?: string;
 	};
 }
 function serviceState(session: ToolSession): NonNullable<ServiceSession[typeof serviceStateKey]> {
 	return ((session as ServiceSession)[serviceStateKey] ??= {
 		owned: new Map(),
 		listeners: new Set(),
-		subscribed: new Set(),
+		subscribed: new Map(),
 	});
 }
 
@@ -66,23 +70,28 @@ export function waitForOwnedServiceCompletion(session: ToolSession, signal?: Abo
 }
 
 function serviceOwner(session: ToolSession): string | null | undefined {
-	return session.getSessionId?.() ?? session.getAgentId?.();
+	return (session as ServiceSession)[serviceStateKey]?.owner ?? session.getSessionId?.() ?? session.getAgentId?.();
 }
 
 function track(session: ToolSession, daemon: DaemonSnapshot): void {
 	const owner = serviceOwner(session);
 	if (daemon.owner !== owner) return;
 	const services = serviceState(session).owned;
-	if (TERMINAL_STATES[daemon.state]) services.delete(daemon.name);
-	else services.set(daemon.name, { id: daemon.id, startedAt: daemon.startedAt });
+	const tracked = services.get(daemon.name);
+	if (TERMINAL_STATES[daemon.state]) {
+		if (tracked?.id === daemon.id && tracked.startedAt === daemon.startedAt) services.delete(daemon.name);
+	} else if (!tracked || tracked.startedAt <= daemon.startedAt) {
+		services.set(daemon.name, { id: daemon.id, startedAt: daemon.startedAt });
+	}
 }
 
 function subscribe(session: ToolSession, client: DaemonBrokerClient): void {
 	const owner = serviceOwner(session);
 	if (!owner) return;
 	const clients = serviceState(session).subscribed;
-	if (clients.has(client)) return;
-	clients.add(client);
+	const previous = clients.get(client);
+	if (previous?.owner === owner) return;
+	previous?.unsubscribe({ preservePending: true });
 	const unsubscribe = client.onCompletion(owner, notification => {
 		const tracked = serviceState(session).owned.get(notification.daemon.name);
 		if (tracked?.id === notification.daemon.id && tracked.startedAt === notification.daemon.startedAt) {
@@ -91,18 +100,23 @@ function subscribe(session: ToolSession, client: DaemonBrokerClient): void {
 		}
 		return session.queueLaunchCompletion?.(notification);
 	});
+	clients.set(client, { owner, unsubscribe });
 	session.registerDisposeCallback?.(() => {
+		if (clients.get(client)?.unsubscribe !== unsubscribe) return;
 		unsubscribe({ preservePending: true });
 		clients.delete(client);
 		serviceState(session).owned.clear();
+		serviceState(session).owner = undefined;
 		for (const listener of serviceState(session).listeners) listener();
 	});
 	session.registerSessionChangeCallback?.(() => {
+		if (clients.get(client)?.unsubscribe !== unsubscribe) return;
 		// The previous session stays resumable (`/resume`, fork parent), so keep its
 		// completions queued in the broker for replay when that session id re-subscribes.
 		unsubscribe({ preservePending: true });
 		clients.delete(client);
 		serviceState(session).owned.clear();
+		serviceState(session).owner = undefined;
 		for (const listener of serviceState(session).listeners) listener();
 	});
 }
@@ -112,9 +126,16 @@ async function request(
 	operation: DaemonOperation,
 	signal?: AbortSignal,
 ): Promise<DaemonRpcResult> {
+	let dispatched = operation;
+	if (operation.op === "start" && session.prepareServiceLaunch) {
+		const launch = await session.prepareServiceLaunch(operation);
+		if (serviceOwner(session) !== launch.session_owner_id) serviceState(session).owned.clear();
+		serviceState(session).owner = launch.session_owner_id;
+		dispatched = { ...operation, owner: launch.session_owner_id, launch };
+	}
 	const client = await daemonClientForProject(session.cwd);
 	subscribe(session, client);
-	const result = await client.request(operation, signal);
+	const result = await client.request(dispatched, signal);
 	if (result.op === "list") {
 		const owner = serviceOwner(session);
 		serviceState(session).owned.clear();

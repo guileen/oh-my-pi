@@ -16,6 +16,86 @@ import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream"
 import { createAssistantMessage, createUserMessage } from "./helpers";
 
 describe("Agent", () => {
+	it("awaits each provider-attempt guard before input delivery and transport dispatch", async () => {
+		const toolSchema = type({ value: "string" });
+		const tool: AgentTool<typeof toolSchema> = {
+			name: "echo",
+			label: "Echo",
+			description: "Echo a value",
+			parameters: toolSchema,
+			async execute(_id, params) {
+				return { content: [{ type: "text", text: params.value }] };
+			},
+		};
+		const mock = createMockModel({
+			responses: [
+				{ content: [{ type: "toolCall", id: "guard-tool", name: "echo", arguments: { value: "read" } }] },
+				{ content: ["finished"] },
+			],
+		});
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const order: string[] = [];
+		const deliveredInputs: AgentEvent[] = [];
+		const agent = new Agent({
+			initialState: { model: mock.model, tools: [tool], messages: [] },
+			streamFn: (...args) => {
+				order.push("dispatch");
+				return mock.stream(...args);
+			},
+		});
+		const unsubscribe = agent.subscribe(event => {
+			if (event.type === "message_start" && event.message.role === "user") deliveredInputs.push(event);
+		});
+		let attempts = 0;
+		agent.setBeforeProviderRequest(async signal => {
+			signal?.throwIfAborted();
+			attempts++;
+			order.push(`guard-${attempts}`);
+			if (attempts === 1) {
+				entered.resolve();
+				await release.promise;
+			}
+			order.push(`allowed-${attempts}`);
+		});
+		const running = agent.prompt("echo once");
+		try {
+			await entered.promise;
+			expect(mock.calls).toHaveLength(0);
+			expect(deliveredInputs).toHaveLength(0);
+		} finally {
+			release.resolve();
+			await running;
+			unsubscribe();
+		}
+		expect(mock.calls).toHaveLength(2);
+		expect(attempts).toBe(2);
+		expect(deliveredInputs).toHaveLength(1);
+		expect(order).toEqual(["guard-1", "allowed-1", "dispatch", "guard-2", "allowed-2", "dispatch"]);
+	});
+
+	it("surfaces a rejected provider guard without dispatch and restores dispatch when cleared", async () => {
+		const mock = createMockModel({ responses: [{ content: ["default"] }, { content: ["restored"] }] });
+		const agent = new Agent({
+			initialState: { model: mock.model, messages: [] },
+			streamFn: mock.stream,
+		});
+		await agent.prompt("default no-hook behavior");
+		expect(mock.calls).toHaveLength(1);
+		agent.setBeforeProviderRequest(async () => {
+			throw new Error("QA checkpoint report attempt exhausted");
+		});
+		await agent.prompt("blocked dispatch");
+		expect(mock.calls).toHaveLength(1);
+		const failure = agent.state.messages.at(-1);
+		if (failure?.role !== "assistant") throw new Error("Expected assistant error lifecycle");
+		expect(failure.stopReason).toBe("error");
+		expect(failure.errorMessage).toContain("QA checkpoint report attempt exhausted");
+		agent.setBeforeProviderRequest(undefined);
+		await agent.prompt("dispatch after guard removal");
+		expect(mock.calls).toHaveLength(2);
+	});
+
 	it("classifies agent-authored steering as a parent steering message", async () => {
 		const toolSchema = type({ value: type("string") });
 		const executed: string[] = [];

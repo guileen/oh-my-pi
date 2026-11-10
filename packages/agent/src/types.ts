@@ -438,6 +438,13 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	beforeModelCall?: AgentBeforeModelCall;
 
 	/**
+	 * Runs immediately before each provider stream dispatch, after context and
+	 * credentials are prepared. Throw to prevent the transport attempt; unlike
+	 * beforeModelCall this boundary accounts for actual dispatch attempts.
+	 */
+	beforeProviderRequest?: (signal?: AbortSignal) => void | Promise<void>;
+
+	/**
 	 * Optional transform applied to tool call arguments before execution.
 	 * Use for deobfuscating secrets or rewriting arguments.
 	 */

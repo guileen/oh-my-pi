@@ -29,7 +29,7 @@ import type { ConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
 import * as snapcompact from "@oh-my-pi/snapcompact";
 import { moveFileAcrossDevices } from "../utils/atomic-file";
 import { hasAnnotationDraftsSync } from "../extensibility/custom-commands/bundled/annotate/draft-store";
-import { ArtifactManager, type ArtifactManagerApi } from "./artifacts";
+import { ArtifactManager } from "./artifacts";
 import { type BlobPutOptions, type BlobPutResult, BlobStore, lazyImageDataSync } from "./blob-store";
 import type { CompactionMethod } from "./compaction-methods";
 import {
@@ -84,15 +84,13 @@ import {
 } from "./session-entries";
 import { currentRuntimeIdentity, type RuntimeIdentity } from "./runtime-identity";
 import {
+	filterSessionsForPicker,
 	findMostRecentNonEmptySession,
 	findRecentSessionContinuation,
 	findSessionContinuation,
 	isEmptySession,
 	listAllSessions,
-	listAllSessionsForPicker,
 	listSessions,
-	listSessionsForPicker,
-	type PickerListing,
 	type SessionContinuation,
 	type SessionInfo,
 } from "./session-listing";
@@ -521,11 +519,7 @@ function orderedByTimestamp(a: SessionTreeNode, b: SessionTreeNode): number {
 	return new Date(a.entry.timestamp).getTime() - new Date(b.entry.timestamp).getTime();
 }
 
-/**
- * The most recent model role on `branch`, or undefined when no model change
- * was recorded. `skipEphemeral` passes over temporary switches (retry fallback
- * hops, prewalk, context promotion), returning the role last assigned.
- */
+/** Most recent assigned model role, shared by local and remote branch views. */
 export function lastModelChangeRole(
 	branch: readonly SessionEntry[],
 	options?: { skipEphemeral?: boolean },
@@ -546,8 +540,7 @@ export function lastModelChangeRole(
  * Maintains the derived views over a session's entry list: id lookup, the
  * parent→children adjacency, the resolved label map, the active leaf, and the
  * running usage totals. Kept in lockstep with the manager's `#entries` so reads
- * stay O(1)/O(children) instead of rescanning the whole journal. Also backs
- * the main thread's read-only view of a worker-homed session's entries.
+ * stay O(1)/O(children) instead of rescanning the whole journal.
  */
 export class SessionEntryIndex {
 	#entriesById = new Map<string, SessionEntry>();
@@ -1024,7 +1017,7 @@ export class SessionManager {
 
 	#artifactManager: ArtifactManager | null = null;
 	#artifactManagerSessionFile: string | null = null;
-	#adoptedArtifactManager: ArtifactManagerApi | null = null;
+	#adoptedArtifactManager: ArtifactManager | null = null;
 	#inMemoryArtifacts: Map<string, string> | null = null;
 	#inMemoryArtifactCounter = 0;
 
@@ -1777,14 +1770,14 @@ export class SessionManager {
 	 * synchronous rewrite from being overwritten by the stale body serialized
 	 * before it ran.
 	 */
-	async #rewriteAtomically(): Promise<void> {
+	async #rewriteAtomically(commitGuard?: () => boolean): Promise<void> {
 		if (!this.#persist || !this.#sessionFile) return;
 		if (this.#released) return;
 
 		const startEpoch = this.#diskEpoch;
 		await this.#scheduleDiskWork(
 			async () => {
-				if (await this.#runFencedAtomicRewrite(startEpoch)) {
+				if (await this.#runFencedAtomicRewrite(startEpoch, commitGuard)) {
 					this.#fileIsCurrent = true;
 					this.#materializeBreadcrumb();
 					this.#rewriteRequired = false;
@@ -1804,7 +1797,7 @@ export class SessionManager {
 	 * moved so callers skip current-marking updates; a body that landed before
 	 * that change still advances the durable byte record after readback.
 	 */
-	async #runFencedAtomicRewrite(epoch: number): Promise<boolean> {
+	async #runFencedAtomicRewrite(epoch: number, commitGuard?: () => boolean): Promise<boolean> {
 		if (this.#released) return false;
 		this.#atomicRewriteFenceEpoch = epoch;
 		let recoveries = 0;
@@ -1819,7 +1812,10 @@ export class SessionManager {
 				const body = this.#serializeBody();
 				const options = {
 					expectedSize: this.#expectedDiskSize,
-					commitGuard: () => !this.#released && this.#diskEpoch === epoch,
+					commitGuard: () => {
+						if (commitGuard && !commitGuard()) throw new Error("Atomic session batch was superseded.");
+						return !this.#released && this.#diskEpoch === epoch;
+					},
 				};
 				try {
 					await (this.#storage.writeLinesAtomic
@@ -2216,7 +2212,7 @@ export class SessionManager {
 		}
 	}
 
-	#artifactManagerForSession(): ArtifactManagerApi | null {
+	#artifactManagerForSession(): ArtifactManager | null {
 		if (this.#adoptedArtifactManager) return this.#adoptedArtifactManager;
 
 		const sessionFile = this.#sessionFile;
@@ -2809,11 +2805,12 @@ export class SessionManager {
 	 *
 	 * The callback MUST be synchronous.
 	 */
-	appendEntriesAtomically<T>(append: () => T): Promise<T> {
-		return this.#withAtomicPersistenceLock(() => this.#appendEntriesAtomicallyLocked(append));
+	appendEntriesAtomically<T>(append: () => T, options?: { commitGuard?: () => boolean }): Promise<T> {
+		return this.#withAtomicPersistenceLock(() => this.#appendEntriesAtomicallyLocked(append, options?.commitGuard));
 	}
 
-	async #appendEntriesAtomicallyLocked<T>(append: () => T): Promise<T> {
+	async #appendEntriesAtomicallyLocked<T>(append: () => T, commitGuard?: () => boolean): Promise<T> {
+		if (commitGuard && !commitGuard()) throw new Error("Atomic session batch was superseded.");
 		if (!this.#persist || !this.#sessionFile) return append();
 		if (this.#atomicEntryBatch) throw new Error("Atomic persistence lock ownership was violated.");
 		try {
@@ -2842,7 +2839,7 @@ export class SessionManager {
 			} finally {
 				batch.collecting = false;
 			}
-			await this.#rewriteAtomically();
+			await this.#rewriteAtomically(commitGuard);
 			if (!this.#fileIsCurrent || this.#rewriteRequired) {
 				throw new Error("Atomic session batch was superseded before commit.");
 			}
@@ -3282,11 +3279,11 @@ export class SessionManager {
 		return artifactsDirectoryFor(this.#header?.seanceSource);
 	}
 
-	adoptArtifactManager(manager: ArtifactManagerApi): void {
+	adoptArtifactManager(manager: ArtifactManager): void {
 		this.#adoptedArtifactManager = manager;
 	}
 
-	getArtifactManager(): ArtifactManagerApi | null {
+	getArtifactManager(): ArtifactManager | null {
 		return this.#artifactManagerForSession();
 	}
 
@@ -3373,11 +3370,6 @@ export class SessionManager {
 	/** The source that set the session name: "user" (manual/RPC) or "auto" (generated title). */
 	get titleSource(): SessionTitleSource | undefined {
 		return this.#titleSource;
-	}
-
-	/** Bumped when entries are rewritten in place (`rewriteEntries`, replay sanitizing); appends do not bump it. */
-	get bodyRevision(): number {
-		return this.#bodyRevision;
 	}
 
 	/** Tracks user rename requests; background title updates do not invalidate them. */
@@ -3616,7 +3608,7 @@ export class SessionManager {
 	appendModelUsage(
 		usage: Pick<
 			ModelUsageEntry,
-			"purpose" | "role" | "api" | "provider" | "model" | "usage" | "stopReason" | "errorMessage" | "cacheRefresh"
+			"purpose" | "role" | "api" | "provider" | "model" | "usage" | "stopReason" | "errorMessage"
 		>,
 		owner: { sessionId: string; parentId: string | null },
 	): string | undefined {
@@ -3685,7 +3677,6 @@ export class SessionManager {
 		systemPrompt: string[];
 		task: string;
 		tools: string[];
-		mountedTools?: string[];
 		agent?: string;
 		modelRole?: string;
 		resolvedModel?: string;
@@ -3876,7 +3867,7 @@ export class SessionManager {
 	 * role the session was last assigned.
 	 */
 	getLastModelChangeRole(options?: { skipEphemeral?: boolean }): string | undefined {
-		return lastModelChangeRole(this.#index.branchView(), options);
+		return lastModelChangeRole(this.getBranchView(), options);
 	}
 
 	/**
@@ -4686,10 +4677,8 @@ export class SessionManager {
 	}
 
 	/**
-	 * Picker-facing project listing in recency order (the picker floats pins),
+	 * Picker-facing project list in recency order (the picker floats pins),
 	 * untitled empties dropped. Titled empties stay — a title is user intent worth resuming.
-	 * Arrives in two passes: rows for history.db-indexed titles first, the full
-	 * scan in `complete` (see {@link listSessionsForPicker}).
 	 * By default includes the same folder in the repository's other git worktrees,
 	 * so a session `/wt` moved stays reachable from the checkout it left.
 	 * The directory scope limits the picker to its own session bucket.
@@ -4699,18 +4688,18 @@ export class SessionManager {
 		sessionDir?: string,
 		storage: SessionStorage = new FileSessionStorage(),
 		worktreeScope: "directory" | "repo" = "repo",
-	): Promise<PickerListing> {
+	): Promise<SessionInfo[]> {
 		const dir = sessionDir ?? SessionManager.getDefaultSessionDir(cwd, undefined, storage);
 		const [pinned, siblingDirs] = await Promise.all([
 			loadPinnedSessionIds(),
 			worktreeScope === "repo" ? worktreeSessionDirs(cwd, dir) : [],
 		]);
-		return listSessionsForPicker(dir, storage, pinned, siblingDirs);
+		return filterSessionsForPicker(await listSessions(dir, storage, siblingDirs), pinned);
 	}
 
-	/** Picker-facing cross-project listing, same rules and passes as {@link listForPicker}. */
-	static async listAllForPicker(storage: SessionStorage = new FileSessionStorage()): Promise<PickerListing> {
-		return listAllSessionsForPicker(storage, await loadPinnedSessionIds());
+	/** Picker-facing cross-project list, same empty-session rule as {@link listForPicker}. */
+	static async listAllForPicker(storage: SessionStorage = new FileSessionStorage()): Promise<SessionInfo[]> {
+		return filterSessionsForPicker(await listAllSessions(storage), await loadPinnedSessionIds());
 	}
 }
 
@@ -4727,7 +4716,6 @@ export interface PersistedSessionInit {
 	systemPrompt: string[];
 	task: string;
 	tools: string[];
-	mountedTools?: string[];
 	agent?: string;
 	modelRole?: string;
 	resolvedModel?: string;
@@ -4759,7 +4747,6 @@ export function extractSessionInit(entries: readonly FileEntry[]): PersistedSess
 			systemPrompt: typeof entry.systemPrompt === "string" ? [entry.systemPrompt] : entry.systemPrompt,
 			task: entry.task,
 			tools: entry.tools,
-			mountedTools: entry.mountedTools,
 			agent: entry.agent,
 			modelRole: entry.modelRole,
 			resolvedModel: entry.resolvedModel,

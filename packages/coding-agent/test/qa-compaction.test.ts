@@ -5,7 +5,7 @@ import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
-import { parseCompactArgs } from "@oh-my-pi/pi-coding-agent/session/compact-modes";
+import { parseCompactArgs, QA_TOOL_TIP_TYPE } from "@oh-my-pi/pi-coding-agent/session/compact-modes";
 import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
@@ -20,7 +20,7 @@ afterEach(async () => {
 	temp.removeSync();
 });
 
-it("keeps journal Q&A without a model call and injects temporary activity after the next user", async () => {
+it("keeps journal Q&A without a model call and exposes deduplicated activity immediately and after reopen", async () => {
 	expect(parseCompactArgs("qaonly")).toEqual({ mode: "qaonly", instructions: undefined });
 	expect(parseCompactArgs("qaonly focus")).toHaveProperty("error");
 	const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
@@ -61,7 +61,7 @@ it("keeps journal Q&A without a model call and injects temporary activity after 
 	const compacted = await session.compact(undefined, { mode: "qaonly" });
 	expect(compacted.summary).toContain("first instruction");
 	expect(compacted.summary).toContain("final answer");
-	expect(compacted.summary).not.toContain("Earlier tool activity");
+	expect(compacted.summary).not.toContain("a.ts");
 	expect(stream).not.toHaveBeenCalled();
 	const before = convertToLlm(session.messages);
 	const beforeText = JSON.stringify(before);
@@ -69,14 +69,22 @@ it("keeps journal Q&A without a model call and injects temporary activity after 
 	expect(beforeText).toContain("final answer");
 	expect(beforeText).not.toContain("intermediate");
 	expect(beforeText).not.toContain("private reasoning");
-	expect(beforeText).not.toContain("Earlier tool activity");
+	const beforeActivity = session.messages.filter(message => message.role === "custom" && message.customType === QA_TOOL_TIP_TYPE);
+	expect(beforeActivity).toHaveLength(1);
+	expect(beforeText.match(/a\.ts/g)?.length).toBe(1);
+	expect(beforeText).toContain("nested.ts");
+	expect(beforeText).toContain("nested-out.ts");
 
 	await manager.flush();
 	const reopened = await SessionManager.open(manager.getSessionFile()!, temp.join("sessions"));
 	reopened.appendMessage({ role: "user", content: "next instruction", timestamp: Date.now() });
-	const after = convertToLlm(reopened.buildSessionContext().messages);
+	const reopenedMessages = reopened.buildSessionContext().messages;
+	const afterActivity = reopenedMessages.filter(message => message.role === "custom" && message.customType === QA_TOOL_TIP_TYPE);
+	expect(afterActivity).toEqual(beforeActivity);
+	expect(reopenedMessages.findIndex(message => message.role === "custom" && message.customType === QA_TOOL_TIP_TYPE))
+		.toBeLessThan(reopenedMessages.findIndex(message => message.role === "user" && message.content === "next instruction"));
+	const after = convertToLlm(reopenedMessages);
 	const text = JSON.stringify(after);
-	expect(text.indexOf("next instruction")).toBeLessThan(text.indexOf("Earlier tool activity"));
 	expect(text.match(/a\.ts/g)?.length).toBe(1);
 	expect(text).toContain("nested.ts");
 	expect(text).toContain("nested-out.ts");
@@ -89,11 +97,13 @@ it("keeps journal Q&A without a model call and injects temporary activity after 
 
 	manager.appendMessage({ role: "user", content: "next instruction", timestamp: Date.now() });
 	await session.compact(undefined, { mode: "qaonly" });
-	const twice = JSON.stringify(convertToLlm(manager.buildSessionContext().messages));
+	const twiceMessages = manager.buildSessionContext().messages;
+	const twice = JSON.stringify(convertToLlm(twiceMessages));
 	expect(twice).toContain("first instruction");
 	expect(twice).toContain("final answer");
 	expect(twice).toContain("next instruction");
-	expect(twice).not.toContain("Earlier tool activity");
+	expect(twiceMessages.some(message => message.role === "custom" && message.customType === QA_TOOL_TIP_TYPE)).toBe(false);
+	expect(twice).not.toContain("a.ts");
 	manager.appendCompaction("older lossy summary", undefined, "", 0);
 	await session.compact(undefined, { mode: "qaonly" });
 	const recovered = JSON.stringify(convertToLlm(manager.buildSessionContext().messages));

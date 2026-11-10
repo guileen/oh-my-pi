@@ -16,6 +16,7 @@ import type { CompactionMethod } from "./compaction-methods";
 export type CompactMode = "soft" | "remote" | "snapcompact" | "relay" | "qaonly";
 
 export const QA_TOOL_TIP_TYPE = "qa-compaction-tool-tip";
+export const QA_STATE_TYPE = "qa-compaction-state";
 
 /**
  * Per-invocation ordered methods merged over the configured
@@ -61,7 +62,7 @@ export const COMPACT_MODES: readonly CompactModeDef[] = [
 	},
 	{
 		name: "qaonly",
-		description: "Keep user instructions and final answers without a model call",
+		description: "Keep Q&A and operational state without model calls",
 		overrides: {},
 		rejectsFocus: true,
 	},

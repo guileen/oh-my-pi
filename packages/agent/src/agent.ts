@@ -514,6 +514,7 @@ export class Agent {
 	#onTurnEnd?: (messages: AgentMessage[], signal?: AbortSignal, context?: AgentTurnEndContext) => Promise<void> | void;
 	#onModelCallSystemPrompt?: (systemPrompt: string[]) => void;
 	#beforeModelCall?: AgentBeforeModelCall;
+	#beforeProviderRequest?: AgentLoopConfig["beforeProviderRequest"];
 	#additionalBeforeModelCalls = new Set<AgentBeforeModelCall>();
 	#asideMessageProvider?: (boundary: AsideBoundary) => AsideMessage[] | Promise<AsideMessage[]>;
 	#telemetry?: AgentLoopConfig["telemetry"];
@@ -1251,6 +1252,11 @@ export class Agent {
 	 */
 	setBeforeModelCall(fn: AgentBeforeModelCall | undefined): void {
 		this.#beforeModelCall = fn;
+	}
+
+	/** Install a transport-attempt guard, or remove it with undefined. */
+	setBeforeProviderRequest(fn: AgentLoopConfig["beforeProviderRequest"]): void {
+		this.#beforeProviderRequest = fn;
 	}
 
 	/**
@@ -2053,6 +2059,7 @@ export class Agent {
 							return undefined;
 						}
 					: undefined,
+			beforeProviderRequest: this.#beforeProviderRequest,
 			cursorExecHandlers: this.#cursorExecHandlers,
 			cursorOnToolResult,
 			cwd: this.#cwd,
