@@ -54,11 +54,15 @@ const checkpointSchema = type({
 type CheckpointParams = typeof checkpointSchema.infer;
 
 const rewindSchema = type({
-	"checkpointId?": type("string").describe("work-package checkpoint; mutually exclusive with searchId"),
-	"searchId?": type("string").describe("pre-search boundary returned by grep/find; no separate checkpoint needed"),
-	"report?": type("string").describe("work-package facts/evidence; not needed for a small search decision"),
+	"checkpointId?": type("string").describe("work-package checkpoint; mutually exclusive with observationId"),
+	"observationId?": type("string").describe("completed tool observation to retire; no checkpoint needed"),
+	"note?": type("string").describe("brief decision or scoped exclusion that must survive the observation"),
+	"keep?": type({ observationId: "string", "text?": "string", "images?": "number[]" })
+		.array()
+		.describe("exact delivered text substring and/or zero-based image indexes to retain"),
+	"report?": type("string").describe("work-package facts/evidence; not needed for a small observation"),
 	"outcome?": type('"completed" | "blocked" | "in_progress"').describe(
-		"explicit work result for the bound todo; does not apply to small search decisions",
+		"explicit work result for the bound todo; does not apply to small observations",
 	),
 	"reason?": type("string").describe("required blocker reason when outcome is blocked"),
 	"retain?": type({ readId: "string", path: "string", from: "number", to: "number" })
@@ -145,7 +149,7 @@ export class CheckpointTool implements AgentTool<typeof checkpointSchema, Checkp
 				scope.todoBinding.task === todoBinding.task
 			) {
 				throw new ToolError(
-					"This todo already has an active package; use a small search decision or bind a distinct child task.",
+					"This todo already has an active package; use a small observation rewind or bind a distinct child task.",
 				);
 			}
 		}
@@ -171,7 +175,7 @@ export class RewindTool implements AgentTool<typeof rewindSchema, RewindToolDeta
 	readonly name = "rewind";
 	readonly approval = "read" as const;
 	readonly label = "Rewind";
-	readonly summary = "Replace a completed work package with its handoff and continue";
+	readonly summary = "Clear a decided observation or close a work package, then continue";
 	readonly description: string;
 	readonly parameters = rewindSchema;
 	readonly strict = true;
@@ -193,18 +197,20 @@ export class RewindTool implements AgentTool<typeof rewindSchema, RewindToolDeta
 		_onUpdate?: AgentToolUpdateCallback<RewindToolDetails>,
 		_context?: AgentToolContext,
 	): Promise<AgentToolResult<RewindToolDetails>> {
-		if (params.searchId !== undefined) {
+		if (params.observationId !== undefined) {
 			if (
 				params.checkpointId !== undefined ||
 				params.report !== undefined ||
 				params.outcome !== undefined ||
 				params.reason !== undefined
 			) {
-				throw new ToolError("Choose either a search decision or a work-package handoff, not both.");
+				throw new ToolError("Choose either an observation decision or a work-package handoff, not both.");
 			}
-			if (!this.session.validateSearchRewind) throw new ToolError("Search rewind requires a live session.");
+			if (!this.session.validateSearchRewind) throw new ToolError("Observation rewind requires a live session.");
 			const search: SearchRewindInput = {
-				searchId: params.searchId,
+				observationId: params.observationId,
+				note: params.note,
+				keep: params.keep,
 				retain: params.retain,
 				release: params.release,
 				demote: params.demote,
@@ -212,11 +218,19 @@ export class RewindTool implements AgentTool<typeof rewindSchema, RewindToolDeta
 			};
 			const estimate = this.session.validateSearchRewind(search);
 			return toolResult<RewindToolDetails>({ report: "", rewound: true, search, estimate })
-				.text(`Search rewind requested: ${estimate.beforeTokens} → ${estimate.afterTokens} estimated tokens.`)
+				.text(`Observation rewind requested: ${estimate.beforeTokens} → ${estimate.afterTokens} estimated tokens.`)
 				.done();
 		}
-		if (!params.checkpointId || params.report === undefined || params.retain || params.release || params.demote) {
-			throw new ToolError("Use searchId with selected source, or checkpointId with report and nextAction.");
+		if (
+			!params.checkpointId ||
+			params.report === undefined ||
+			params.retain ||
+			params.release ||
+			params.demote ||
+			params.note !== undefined ||
+			params.keep
+		) {
+			throw new ToolError("Use observationId with nextAction, or checkpointId with report and nextAction.");
 		}
 		const state = this.session.getCheckpointState?.();
 		if (!state) {

@@ -210,6 +210,7 @@ import planModeActivePrompt from "../prompts/system/plan-mode-active.md" with { 
 import planModeReferencePrompt from "../prompts/system/plan-mode-reference.md" with { type: "text" };
 import planModeToolDecisionReminderPrompt from "../prompts/system/plan-mode-tool-decision-reminder.md" with { type: "text" };
 import rewindReportTemplate from "../prompts/system/rewind-report.md" with { type: "text" };
+import observationRewindTemplate from "../prompts/system/observation-rewind.md" with { type: "text" };
 import sessionStopBlockedPrompt from "../prompts/system/session-stop-blocked.md" with { type: "text" };
 import sideChannelNoToolsReminder from "../prompts/system/side-channel-no-tools.md" with { type: "text" };
 import titleCardPrompt from "../prompts/system/title-card.md" with { type: "text" };
@@ -5915,7 +5916,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			};
 		}
 		if (calls.length > 1 && calls.some(isSearchRewindCall)) {
-			return { block: true, reason: "Call a search rewind alone after its search/read batch has settled." };
+			return { block: true, reason: "Call an observation rewind alone after its tool batch has settled." };
 		}
 		if (semanticCheckpointCall(ctx.toolCall)) await this.#messageEndPersistenceTail;
 		const runner = this.#extensionRunner;
@@ -8391,10 +8392,11 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			attribution: "agent",
 			timestamp: Date.now(),
 		}));
+		messages.push(...plan.carried);
 		messages.push({
 			role: "custom",
 			customType: SEARCH_DECISION,
-			content: plan.nextAction,
+			content: prompt.render(observationRewindTemplate, { note: plan.note, nextAction: plan.nextAction }),
 			display: false,
 			attribution: "agent",
 			timestamp: Date.now(),
@@ -8422,7 +8424,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		const after = this.agent.tokenizer.countMessages(projected, { excludeEncryptedReasoning: true });
 		if (after >= before)
 			throw new ToolError(
-				`Search rewind would not shrink context (${before} → ${after}). Keep working without cutting.`,
+				`Observation rewind would not shrink context (${before} → ${after}). Keep working without cutting.`,
 			);
 		const fixed = computeNonMessageTokens(this, this.agent.tokenizer, this.settings.revision);
 		return {
@@ -8448,7 +8450,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				this.#bash.withBranchTransition(() =>
 					this.sessionManager.branchWithSummary(plan.anchorId, "", {
 						kind: SEARCH_REWIND_KIND,
-						searchId: input.searchId,
+						observationId: input.observationId,
 					}),
 				);
 				this.sessionManager.appendCustomMessageEntry(
@@ -8462,9 +8464,9 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 					this.sessionManager.appendCustomMessageEntry(
 						message.customType,
 						message.content,
-						false,
+						message.display,
 						message.details,
-						"agent",
+						message.attribution,
 					);
 				}
 				this.sessionManager.appendCustomEntry(USER_TODO_EDIT_CUSTOM_TYPE, { phases });

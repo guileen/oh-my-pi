@@ -1,9 +1,13 @@
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
-import type { ToolCall, ToolResultMessage } from "@oh-my-pi/pi-ai";
+import type { ImageContent, TextContent, ToolCall, ToolResultMessage } from "@oh-my-pi/pi-ai";
 import { isRecord, prompt } from "@oh-my-pi/pi-utils";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { stripXdUrlPrefix } from "@oh-my-pi/pi-tui/tools/xd-url";
 import materialTemplate from "../prompts/system/search-material.md" with { type: "text" };
+import observationTemplate from "../prompts/system/observation-material.md" with { type: "text" };
+import receiptTemplate from "../prompts/system/observation-receipt.md" with { type: "text" };
+import { CHECKPOINT_ACTIVE_REMINDER_TYPE, type CustomMessage, REWIND_REPORT_MESSAGE_TYPE } from "./messages";
+import { WORK_PACKAGE_STATE_TYPE } from "./work-package-state";
 import { writeDeviceDispatch } from "../tools/resolve";
 import type { SessionEntry } from "./session-entries";
 
@@ -12,6 +16,7 @@ export const SEARCH_REWIND_STATE = "search-rewind-state";
 export const SEARCH_DECISION = "search-decision";
 export const SEARCH_REWIND_KIND = "search-rewind";
 
+export const OBSERVATION_RECEIPT = "observation-receipt";
 export interface SourceSelection {
 	readId: string;
 	path: string;
@@ -19,8 +24,16 @@ export interface SourceSelection {
 	to: number;
 }
 
+export interface ObservationSelection {
+	observationId: string;
+	text?: string;
+	images?: number[];
+}
+
 export interface SearchRewindInput {
-	searchId: string;
+	observationId: string;
+	note?: string;
+	keep?: ObservationSelection[];
 	retain?: SourceSelection[];
 	release?: string[];
 	demote?: { ref: string; note: string }[];
@@ -41,12 +54,14 @@ export interface SearchRewindPlan {
 	anchorId: string;
 	anchorIndex: number;
 	materials: SearchMaterial[];
+	carried: CustomMessage[];
+	note?: string;
 	activeRefs: string[];
 	nextAction: string;
 }
 
 /** Short references are derived from persisted call identities, never model-authored offsets. */
-export function searchReference(kind: "s" | "r", callId: string): string {
+export function searchReference(kind: "o" | "r", callId: string): string {
 	return `${kind}${Bun.hash(callId).toString(36)}`;
 }
 
@@ -69,18 +84,17 @@ function normalizedCall(call: ToolCall): { name: string; args: Record<string, un
 
 export function isSearchRewindCall(call: ToolCall): boolean {
 	const normalized = normalizedCall(call);
-	return normalized.name === "rewind" && typeof normalized.args.searchId === "string";
+	return normalized.name === "rewind" && typeof normalized.args.observationId === "string";
 }
 
 /** Annotate the actual delivered result before persistence; recovery needs no mutable reference registry. */
 export function annotateSearchResult(message: ToolResultMessage): void {
-	if (message.isError) return;
 	const kind = resultKind(message);
-	if (kind !== "grep" && kind !== "find" && kind !== "read") return;
-	const label = kind === "read" ? "readId" : "searchId";
-	const ref = searchReference(kind === "read" ? "r" : "s", message.toolCallId);
-	const text = `${label}=${ref}`;
-	if (message.content.some(part => part.type === "text" && part.text.endsWith(text))) return;
+	if (["rewind", "checkpoint", "todo"].includes(kind)) return;
+	const refs = [`observationId=${searchReference("o", message.toolCallId)}`];
+	if (kind === "read" && !message.isError) refs.push(`readId=${searchReference("r", message.toolCallId)}`);
+	const text = refs.join("\n");
+	if (message.content.some(part => part.type === "text" && part.text === text)) return;
 	message.content.push({ type: "text", text });
 }
 
@@ -181,19 +195,25 @@ function selectMaterial(message: ToolResultMessage, selection: SourceSelection):
 export function buildSearchRewindPlan(branch: readonly SessionEntry[], input: SearchRewindInput): SearchRewindPlan {
 	const nextAction = input.nextAction.trim();
 	if (!nextAction) throw new ToolError("nextAction must name the next concrete action.");
-	if ((input.retain?.length ?? 0) > 32 || (input.demote?.length ?? 0) > 32 || (input.release?.length ?? 0) > 128)
-		throw new ToolError("Select at most 32 ranges/demotions and 128 releases per decision.");
+	if (input.note !== undefined && !input.note.trim())
+		throw new ToolError("note must contain a decision or exclusion.");
+	if (
+		(input.retain?.length ?? 0) > 32 ||
+		(input.keep?.length ?? 0) > 32 ||
+		(input.demote?.length ?? 0) > 32 ||
+		(input.release?.length ?? 0) > 128
+	)
+		throw new ToolError("Select at most 32 ranges/observations/demotions and 128 releases per decision.");
 	const matches = branch.flatMap((entry, index) =>
 		entry.type === "message" &&
 		entry.message.role === "toolResult" &&
-		!entry.message.isError &&
-		["grep", "find"].includes(resultKind(entry.message)) &&
-		searchReference("s", entry.message.toolCallId) === input.searchId
-			? [{ entry, index, message: entry.message }]
+		!["rewind", "checkpoint", "todo"].includes(resultKind(entry.message)) &&
+		searchReference("o", entry.message.toolCallId) === input.observationId
+			? [{ index, message: entry.message }]
 			: [],
 	);
 	if (matches.length !== 1)
-		throw new ToolError("Search reference is missing, ambiguous, or no longer on the active branch.");
+		throw new ToolError("Observation reference is missing, ambiguous, or no longer on the active branch.");
 	const target = matches[0];
 	let callIndex = target.index - 1;
 	for (; callIndex >= 0; callIndex--) {
@@ -205,51 +225,61 @@ export function buildSearchRewindPlan(branch: readonly SessionEntry[], input: Se
 		)
 			break;
 	}
-	if (callIndex <= 0) throw new ToolError("Search has no safe pre-call boundary.");
-	const callEntry = branch[callIndex];
-	if (callEntry.type !== "message" || callEntry.message.role !== "assistant")
-		throw new ToolError("Missing search call.");
-	const pureBatch = callEntry.message.content.every(
-		part => part.type !== "toolCall" || ["read", "grep", "find", "glob"].includes(normalizedCall(part).name),
-	);
-	if (!pureBatch)
-		throw new ToolError("Search shared a batch with other operations; use a standalone read-only search boundary.");
-	const suffix = branch.slice(callIndex + 1);
+	if (callIndex <= 0) throw new ToolError("Observation has no safe pre-call boundary.");
+	const suffix = branch.slice(callIndex);
 	if (
 		suffix.some(
 			entry =>
 				entry.type === "compaction" ||
 				entry.type === "reset_boundary" ||
 				entry.type === "branch_summary" ||
-				(entry.type === "message" && entry.message.role === "user"),
-		)
-	) {
-		throw new ToolError(
-			"New user input or a context boundary superseded this search. Current context was not changed.",
-		);
-	}
-	if (
-		suffix.some(
-			entry =>
-				(entry.type === "custom_message" &&
-					![SEARCH_MATERIAL, SEARCH_REWIND_STATE, SEARCH_DECISION].includes(entry.customType)) ||
 				(entry.type === "message" &&
-					entry.message.role === "assistant" &&
-					entry.message.content.some(
-						part =>
-							part.type === "toolCall" &&
-							!["read", "grep", "find", "glob", "rewind", "todo"].includes(normalizedCall(part).name),
-					)),
+					(entry.message.role === "user" ||
+						(entry.message.role === "custom" && entry.message.attribution === "user"))) ||
+				(entry.type === "custom_message" &&
+					(entry.attribution === "user" ||
+						[CHECKPOINT_ACTIVE_REMINDER_TYPE, REWIND_REPORT_MESSAGE_TYPE, WORK_PACKAGE_STATE_TYPE].includes(
+							entry.customType,
+						))),
 		)
-	) {
-		throw new ToolError(
-			"This boundary includes non-search work or delivered context. Keep it and use a fresh search boundary.",
-		);
+	)
+		throw new ToolError("New user input or a context/work-package boundary superseded this observation.");
+	const calls = new Map<string, ToolCall>();
+	const results = new Map<string, ToolResultMessage>();
+	for (const entry of suffix) {
+		if (entry.type !== "message") continue;
+		const message = entry.message;
+		if (message.role === "assistant") {
+			for (const part of message.content) {
+				if (part.type !== "toolCall") continue;
+				if (["checkpoint", "new_context"].includes(normalizedCall(part).name))
+					throw new ToolError("A work-package or context transition cannot be retired as an observation.");
+				if (calls.has(part.id)) throw new ToolError("Observation contains ambiguous tool-call identities.");
+				calls.set(part.id, part);
+			}
+		} else if (message.role === "toolResult") {
+			if (results.has(message.toolCallId)) throw new ToolError("Observation contains duplicate tool results.");
+			results.set(message.toolCallId, message);
+		} else if (message.role !== "custom") {
+			throw new ToolError("Delivered context cannot be retired as a tool observation.");
+		}
 	}
-	const anchor = branch[callIndex - 1];
+	const pendingRewind = suffix.findLast(entry => entry.type === "message" && entry.message.role === "assistant");
+	const pendingCalls =
+		pendingRewind?.type === "message" && pendingRewind.message.role === "assistant"
+			? pendingRewind.message.content.filter(part => part.type === "toolCall")
+			: [];
+	for (const [id, call] of calls) {
+		if (!results.has(id) && !(pendingCalls.length === 1 && pendingCalls[0].id === id && isSearchRewindCall(call)))
+			throw new ToolError("Observation batch is incomplete; wait for every tool result before rewinding.");
+	}
+	for (const id of results.keys()) {
+		if (!calls.has(id)) throw new ToolError("Observation contains a result from an earlier unfinished batch.");
+	}
 	const previousRefs = activeSearchMaterialRefs(branch) ?? new Set<string>();
 	const active = new Set(previousRefs);
 	const materials: SearchMaterial[] = [];
+	const carried: CustomMessage[] = [];
 	for (const ref of [...(input.release ?? []), ...(input.demote ?? []).map(item => item.ref)]) {
 		if (!active.delete(ref)) throw new ToolError(`Retained material ${ref} is not active.`);
 	}
@@ -262,24 +292,110 @@ export function buildSearchRewindPlan(branch: readonly SessionEntry[], input: Se
 		active.add(material.ref);
 	}
 	for (const selection of input.retain ?? []) {
-		const reads = branch
-			.slice(callIndex + 1)
-			.flatMap(entry =>
-				entry.type === "message" &&
-				entry.message.role === "toolResult" &&
-				!entry.message.isError &&
-				resultKind(entry.message) === "read" &&
-				searchReference("r", entry.message.toolCallId) === selection.readId
-					? [entry.message]
-					: [],
-			);
-		if (reads.length !== 1)
-			throw new ToolError("Read reference is missing, ambiguous, or outside this search decision.");
+		const reads = [...results.values()].filter(
+			message =>
+				!message.isError &&
+				resultKind(message) === "read" &&
+				searchReference("r", message.toolCallId) === selection.readId,
+		);
+		if (reads.length !== 1) throw new ToolError("Read reference is missing, ambiguous, or outside this observation.");
 		const material = selectMaterial(reads[0], selection);
 		if (!active.has(material.ref)) materials.push(material);
 		active.add(material.ref);
 	}
+	for (const selection of input.keep ?? []) {
+		const observations = [...results.values()].filter(
+			message => searchReference("o", message.toolCallId) === selection.observationId,
+		);
+		if (observations.length !== 1)
+			throw new ToolError("Kept observation is missing, ambiguous, or outside the retired interval.");
+		const message = observations[0];
+		const images = message.content.filter((part): part is ImageContent => part.type === "image");
+		const text = selection.text;
+		if (
+			text !== undefined &&
+			(!text.trim() || !message.content.some(part => part.type === "text" && part.text.includes(text)))
+		)
+			throw new ToolError("Keep an exact nonempty substring from one delivered text part.");
+		if (
+			(selection.images?.length ?? 0) > 32 ||
+			selection.images?.some(index => !Number.isSafeInteger(index) || index < 0 || index >= images.length)
+		)
+			throw new ToolError("Select zero-based image indexes from the delivered observation.");
+		if (selection.text === undefined && !selection.images?.length)
+			throw new ToolError("A kept observation needs exact text or at least one image.");
+		const indexes = [...new Set(selection.images ?? [])];
+		const ref = `m${Bun.hash(JSON.stringify([message.toolCallId, selection.text, indexes])).toString(36)}`;
+		if (!active.has(ref)) {
+			const content: (TextContent | ImageContent)[] = [
+				{ type: "text", text: prompt.render(observationTemplate, { ...selection, ref }) },
+				...indexes.map(index => images[index]),
+			];
+			carried.push({
+				role: "custom",
+				customType: SEARCH_MATERIAL,
+				content,
+				details: { ref, observationId: selection.observationId },
+				display: false,
+				attribution: "agent",
+				timestamp: message.timestamp,
+			});
+		}
+		active.add(ref);
+	}
+	for (const entry of suffix) {
+		if (entry.type === "custom_message") {
+			if (
+				entry.customType === SEARCH_REWIND_STATE ||
+				(entry.customType === SEARCH_MATERIAL &&
+					(!isRecord(entry.details) || typeof entry.details.ref !== "string" || !active.has(entry.details.ref)))
+			)
+				continue;
+			carried.push({
+				role: "custom",
+				customType: entry.customType,
+				content: entry.content,
+				details: entry.details,
+				display: entry.display,
+				attribution: entry.attribution,
+				timestamp: Date.parse(entry.timestamp),
+			});
+		} else if (entry.type === "message" && entry.message.role === "custom") {
+			carried.push(entry.message);
+		}
+	}
+	for (const [id, call] of calls) {
+		const normalized = normalizedCall(call);
+		if (["read", "grep", "find", "glob", "rewind", "todo"].includes(normalized.name)) continue;
+		const result = results.get(id);
+		if (!result) continue;
+		const receipt = {
+			observationId: searchReference("o", id),
+			toolCallId: id,
+			name: call.name,
+			arguments: call.arguments,
+			isError: result.isError,
+			details: result.details,
+		};
+		carried.push({
+			role: "custom",
+			customType: OBSERVATION_RECEIPT,
+			content: prompt.render(receiptTemplate, { receipt: JSON.stringify(receipt) }),
+			details: receipt,
+			display: false,
+			attribution: "agent",
+			timestamp: result.timestamp,
+		});
+	}
 	if (active.size > 128)
 		throw new ToolError("Too many retained materials; release or demote completed evidence first.");
-	return { anchorId: anchor.id, anchorIndex: callIndex - 1, materials, activeRefs: [...active], nextAction };
+	return {
+		anchorId: branch[callIndex - 1].id,
+		anchorIndex: callIndex - 1,
+		materials,
+		carried,
+		activeRefs: [...active],
+		nextAction,
+		note: input.note?.trim(),
+	};
 }

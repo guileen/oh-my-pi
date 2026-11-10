@@ -1,35 +1,44 @@
 # rewind
 
-> Replace a locating decision with selected original code, or close a work package with its handoff, then continue.
+> Retire completed observations while keeping needed evidence, or close a work package with its handoff, then continue.
 
 ## Availability
 
-`rewind` shares the `checkpoint.enabled` gate, essential tool visibility, and explicit-subagent restrictions of [checkpoint](./checkpoint.md). Registration treats them as a pair. Nested work packages can contain multiple small search decisions.
+`rewind` shares the `checkpoint.enabled` gate, essential tool visibility, and explicit-subagent restrictions of [checkpoint](./checkpoint.md). Registration treats them as a pair. Small observation decisions need no checkpoint and can occur inside nested work packages.
 
 ## Inputs
 
-### Small search decisions
+### Small observation decisions
 
-Successful `grep`/`find` results return a `searchId`; numbered `read` results return a `readId`. No separate checkpoint is needed. Call rewind alone after locating useful code:
+Every completed tool result, including failures, returns an `observationId` (`o…`), except lifecycle tools `rewind`, `checkpoint`, and `todo`. Successful reads also return a `readId` (`r…`) for source selections. No separate checkpoint, work-package contract, report, or todo outcome is needed.
+
+Use the result to decide the next action, then rewind **before** executing it. For example: search → choose a read → rewind → read. A wrong read follows the same loop: record a brief exclusion in `note`, retire the read, then open the alternative. Tests, bash commands, browser and Computer Use observations—including failed checks or actions—are equally eligible.
 
 ```json
 {
-  "searchId": "<returned searchId>",
-  "retain": [{"readId": "<returned readId>", "path": "src/entry.ts", "from": 82, "to": 95}],
-  "nextAction": "Located the entry; follow its worker"
+  "observationId": "<returned observationId>",
+  "note": "The request handler is in src/entry.ts, not the CLI wrapper.",
+  "nextAction": "Read src/entry.ts:82-95"
 }
 ```
 
-The runtime extracts those exact, fully displayed rows from the delivered snapshot, including path, line numbers and edit tag. It does not reread the current file or ask the model to rewrite code. Raw reads, omitted/truncated rows and selections outside this search are rejected. A decision needs no intent paragraph or report.
+Optional evidence selections preserve original delivered content:
 
-Previously selected materials survive later hops. Use returned material references in `release` to remove obsolete code, or `demote: [{"ref": "<material>", "note": "Concise fact or exclusion reason"}]` to retain only a fact and source location. Released code does not reappear on rebuild. The original journal retains the abandoned search path.
+- `retain: [{"readId": "<returned readId>", "path": "src/entry.ts", "from": 82, "to": 95}]` carries exact, fully displayed numbered rows, their path and edit tag. It does not reread the current file or ask the model to rewrite code. Raw reads, omitted/truncated rows, and selections outside the affected observations are rejected.
+- `keep: [{"observationId": "<returned observationId>", "text": "Exact delivered error text", "images": [0]}]` carries exact text and images. `text` must be a nonempty substring of one delivered text part. `images` uses zero-based indexes among that result's delivered image parts, not indexes among all content parts. Either field can be omitted; select at least one text or image. Only actually delivered content can be kept, not model-created snapshots or paraphrases.
 
-Boundaries spanning new user input, compaction, delivered context, or non-search operations are rejected. A search batched with non-search calls is not a safe boundary. Selection is limited to 32 ranges, each at most 2000 lines; up to 128 active materials. The full replacement must shrink context, excluding the generated rewind call from the savings baseline. A small cut preserves current todos and does not close the enclosing package or mark work complete.
+Previously selected materials survive later hops. Use returned material references in `release` to remove obsolete code, or `demote: [{"ref": "<material>", "note": "Concise fact or exclusion reason"}]` to retain only a fact and source location. Prior decision notes and action receipts also survive. Released code does not reappear on rebuild; original history remains in the journal.
+
+Rewind changes context, not execution. Read/grep/find/glob arguments and unselected outputs can be retired. For other or unknown tools, the runtime automatically retains a receipt containing the original tool name and arguments, `isError`, and complete structured details, including asynchronous handles. This records the attempted action, not business success: even `isError: false` is not proof of success. If outcome details were discarded, they are unknown. Do not automatically repeat an action because its output was retired; rewind neither undoes nor replays it. Keep exact output evidence when the next decision needs it.
+
+Call rewind alone after every tool call in the affected batches has a final result. The boundary includes the target call's batch and following completed observations. Mixed completed tools are allowed; incomplete batches, new user input, compaction/reset/branch-summary boundaries, and checkpoint/work-package changes reject the cut. Unrelated asynchronous notifications and current lifecycle state are preserved.
+
+Source selection is limited to 32 ranges, each at most 2000 lines; up to 128 active materials. The full replacement must shrink context, excluding the generated rewind call from the savings baseline. A small cut preserves current todos and does not close the enclosing package or mark work complete.
 
 ### Work-package handoffs
 
 
-`checkpointId`, `report`, and `nextAction` are required nonblank strings and cannot be mixed with `searchId`. Only the active stack-top package can close.
+`checkpointId`, `report`, and `nextAction` are required nonblank strings. Macro handoffs cannot mix in `observationId`, `note`, `retain`, `keep`, `release`, or `demote`. Only the active stack-top package can close.
 
 | Field | Meaning |
 | --- | --- |
@@ -52,13 +61,13 @@ For example, after completing a todo-bound package:
 
 Reach the package's `finishWhen` before completing it. Commit the report and todo outcome together; do not separately mark the todo done first. Completing a task starts the next pending task; blocked tasks do not restart automatically. Completing a phase requires all children completed and evidence of the phase's own acceptance. Preserve unmet boundaries and blockers explicitly.
 
-Before closing a child, select what its parent and later siblings need: shared constraints, verified contracts and decisions, a compact file/symbol or artifact index, verification evidence, and unresolved risks. Include those in `report`, not private exploration or unrelated code. The retained report stays available to later siblings across their cuts. Selected search materials inside the child are not automatically carried through a macro cut; preserve needed facts and locations in the report instead.
+Before closing a child, select what its parent and later siblings need: shared constraints, verified contracts and decisions, a compact file/symbol or artifact index, verification evidence, and unresolved risks. Include those in `report`, not private exploration or unrelated code. The retained report stays available to later siblings across their cuts. Selected observation materials inside the child are not automatically carried through a macro cut; preserve needed facts and locations in the report instead.
 
 When closing the parent, consolidate still-needed child findings and indexes into the parent's report. Parent cuts replace child reports rather than copying their accumulated history. An index locates evidence; it is not a current source snapshot or edit anchor.
 
 ## Outputs and application
 
-Structured result details contain:
+Small-decision results identify the observation boundary and retained materials for later release/demotion. Continue from their `nextAction`; they do not commit todo progress. For macro handoffs, structured result details contain:
 
 - `checkpointId`: the targeted active checkpoint.
 - `report`: the retained handoff body; `nextAction` is rendered separately.
@@ -76,8 +85,8 @@ Continue package B from `nextAction`. Rewinding A does not finish the overall ta
 
 The runtime validates the request before changing context:
 
-- The ID must match the active stack top; anchors and todo bindings must still resolve. Canonical source entry identity and fingerprint prevent concurrent replanning or delete-and-recreate from silently rebinding a package.
-- User input since the anchor prevents rewinding across that input. Unsafe mixed batches and stale boundaries fail closed.
+- For a macro handoff, the ID must match the active stack top; anchors and todo bindings must still resolve. Canonical source entry identity and fingerprint prevent concurrent replanning or delete-and-recreate from silently rebinding a package.
+- User input since the boundary prevents rewinding across that input. Incomplete batches and stale boundaries fail closed; macro mixed-batch restrictions remain unchanged.
 - The estimated replacement must shrink context for a cut; the strict savings baseline excludes the newly generated report, so a long report cannot manufacture savings. With an explicit outcome, no savings can still commit progress without a cut.
 - `report`, `nextAction`, and any blocker `reason` together must fit within 4096 estimated tokens.
 

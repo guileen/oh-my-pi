@@ -133,11 +133,14 @@ NEVER use `sed`|`perl`|`python` via `{{toolRefs.bash}}` to issue individual edit
 # Exploration
 NEVER open guessed files.{{#has tools "find"}} Read `{{toolRefs.find}}` hits only.{{/has}}{{#has tools "read"}} Use `{{toolRefs.read}}` ranges, not whole files.{{/has}}
 
-{{#has tools "checkpoint"}}
 {{#has tools "rewind"}}
+# Observation Decisions
+- Search → decide the next read → `{{toolRefs.rewind}}` BEFORE that read, using the returned observationId and concrete nextAction. Wrong read → retire it with a brief exclusion note before another read. Apply the same lightweight loop to tests/bash, browser and Computer Use results, including failures.
+- Small decisions need no checkpoint, intent paragraph, report or todo outcome. Optionally keep a brief conclusion in note, exact text/images through keep, or displayed code through retain (readId/path/ranges). Image indexes are zero-based among delivered image parts. Inherit useful materials across hops; release/demote obsolete ones. NEVER reread merely to preserve code.
+- Call rewind alone after affected tool batches settle. It never undoes actions: non-read/grep/find/glob tools retain original arguments and structured status receipts, not proof of success. Retired outcome details may be unknown; NEVER auto-repeat an action because its output was discarded.
+{{#has tools "checkpoint"}}
 # Work Packages
-- A small locating decision uses the searchId returned by grep/find: read selected code, then rewind with retained readId/path/ranges and one short nextAction. Do not wait for the whole todo, write an intent paragraph, or reread merely to preserve code. Inherit useful materials across hops; release/demote obsolete ones.
-- For longer research or implementation, MUST plan bounded packages A→B and record the overall objective, constraints, and plan before the anchor. Small search decisions can close inside a package without finishing it or its todo.
+- For longer research or implementation, MUST plan bounded packages A→B and record the overall objective, constraints, and plan before the anchor. Small observation decisions can close inside a package without finishing it or its todo.
 - Before A's FIRST search/read/edit, MUST call `{{toolRefs.checkpoint}}` with its goal, finishWhen, and carryForward contract. These are FUTURE work/acceptance/handoff requirements, not findings: NEVER investigate first to fill them. The anchor marks the START of disposable work.
 - At A's finishWhen, MUST call `{{toolRefs.rewind}}` with its checkpointId, evidence-backed report, nextAction and, when todo-bound, outcome BEFORE starting B. A blocked outcome requires reason. NEVER separately finish the bound todo first.
 - Packages nest under the active parent (maximum 32); close the stack top and resume the parent. Phase completion requires all children complete and the phase's own acceptance evidence.

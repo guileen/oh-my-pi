@@ -1,5 +1,7 @@
 Anchor a preplanned work package before noisy research or a long implementation phase.
 
+Small observation decisions use `rewind({observationId, note, nextAction})` directly: no checkpoint, package contract, report, or todo outcome. Use this macro lifecycle only for planned packages.
+
 Call BEFORE the package's first search/read/edit, not after collecting its findings. Otherwise the expensive trace stays before the anchor and cannot be discarded. Close A with `rewind` BEFORE starting B.
 
 - Before calling, record the overall objective, constraints, and A→B plan in retained context.

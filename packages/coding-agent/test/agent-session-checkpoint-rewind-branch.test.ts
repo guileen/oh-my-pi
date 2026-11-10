@@ -303,6 +303,13 @@ function rewindMutationSnapshot(session: AgentSession) {
 	});
 }
 
+function expectJsonInText(text: string, value: unknown): void {
+	// Accept receipt formatting differences without weakening exact string/numeric values.
+	const tokens = JSON.stringify(value).match(/"(?:\\.|[^"\\])*"|[^\s]/g) ?? [];
+	const pattern = tokens.map(token => token.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("\\s*");
+	expect(text).toMatch(new RegExp(pattern));
+}
+
 async function expectNoActiveCheckpointError(session: AgentSession): Promise<void> {
 	await expect(
 		rewindToolForSession(session).execute("repeat_rewind", {
@@ -777,7 +784,7 @@ describe("AgentSession checkpoint rewind branch context", () => {
 						id: "cut_a",
 						name: "rewind",
 						arguments: {
-							searchId: searchReference("s", "search_a"),
+							observationId: searchReference("o", "search_a"),
 							retain: [{ readId: searchReference("r", "source_a"), path: "entry.ts", from: 1, to: 4 }],
 							nextAction: "Located entry; follow its worker.",
 						},
@@ -802,7 +809,7 @@ describe("AgentSession checkpoint rewind branch context", () => {
 						id: "cut_b",
 						name: "rewind",
 						arguments: {
-							searchId: searchReference("s", "search_b"),
+							observationId: searchReference("o", "search_b"),
 							retain: [{ readId: searchReference("r", "source_b"), path: "worker.ts", from: 1, to: 4 }],
 							nextAction: "Located worker; implement the fix.",
 						},
@@ -909,7 +916,7 @@ describe("AgentSession checkpoint rewind branch context", () => {
 						id: "close1",
 						name: "rewind",
 						arguments: {
-							searchId: searchReference("s", "find1"),
+							observationId: searchReference("o", "find1"),
 							retain: [{ readId: searchReference("r", "read1"), path: "one.ts", from: 1, to: 2 }],
 							nextAction: "Follow dependency.",
 						},
@@ -933,7 +940,7 @@ describe("AgentSession checkpoint rewind branch context", () => {
 						id: "close2",
 						name: "rewind",
 						arguments: {
-							searchId: searchReference("s", "find2"),
+							observationId: searchReference("o", "find2"),
 							retain: [{ readId: searchReference("r", "read2"), path: "two.ts", from: 1, to: 2 }],
 							demote: [{ ref: first, note: "The entry delegates to the worker." }],
 							nextAction: "Check remaining candidates.",
@@ -954,7 +961,7 @@ describe("AgentSession checkpoint rewind branch context", () => {
 						id: "close3",
 						name: "rewind",
 						arguments: {
-							searchId: searchReference("s", "find3"),
+							observationId: searchReference("o", "find3"),
 							release: [second],
 							nextAction: "Located the relevant path; continue.",
 						},
@@ -986,6 +993,388 @@ describe("AgentSession checkpoint rewind branch context", () => {
 		expect(session.messages).toEqual(session.sessionManager.buildSessionContext().messages);
 	});
 
+	it("rewinds search before reading, then excludes a standalone wrong read before the next read", async () => {
+		const chosen = 'export const chosen = "CORRECT_SOURCE";';
+		const responses = (async function* () {
+			yield {
+				content: [{ type: "toolCall", id: "locate", name: "grep", arguments: { pattern: "CANDIDATE", path: "." } }],
+				stopReason: "toolUse" as const,
+			};
+			yield {
+				content: [
+					{
+						type: "toolCall",
+						id: "locate_cut",
+						name: "rewind",
+						arguments: {
+							observationId: searchReference("o", "locate"),
+							note: "Two candidates located; inspect the first.",
+							nextAction: "Read wrong.ts.",
+						},
+					},
+				],
+				stopReason: "toolUse" as const,
+			};
+			yield {
+				content: [{ type: "toolCall", id: "wrong", name: "read", arguments: { path: "wrong.ts" } }],
+				stopReason: "toolUse" as const,
+			};
+			yield {
+				content: [
+					{
+						type: "toolCall",
+						id: "wrong_cut",
+						name: "rewind",
+						arguments: {
+							observationId: searchReference("o", "wrong"),
+							note: "Exclude wrong.ts: it is generated test data, not the implementation.",
+							nextAction: "Read correct.ts.",
+						},
+					},
+				],
+				stopReason: "toolUse" as const,
+			};
+			yield {
+				content: [{ type: "toolCall", id: "correct", name: "read", arguments: { path: "correct.ts:1-2" } }],
+				stopReason: "toolUse" as const,
+			};
+			yield { content: ["Located the implementation."], stopReason: "stop" as const };
+		})() as MockResponseSource;
+		const { session, mock, tempDir } = await createHarness(responses, [], {
+			realTools: true,
+			realSearchTools: true,
+		});
+		await Bun.write(
+			path.join(tempDir.path(), "wrong.ts"),
+			Array.from({ length: 180 }, (_, i) => `export const item${i} = "CANDIDATE_WRONG_READ_${i}";`).join("\n"),
+		);
+		await Bun.write(path.join(tempDir.path(), "correct.ts"), `${chosen}\nexport const ready = true;\n`);
+		await session.prompt("Locate the implementation, retiring each observation before the next read.");
+		const beforeWrong = mock.calls[2]!.context.messages;
+		expect(beforeWrong.map(messageText).join("\n")).not.toContain("CANDIDATE_WRONG_READ_");
+		expect(beforeWrong.some(message => message.role === "toolResult" && message.toolName === "read")).toBe(false);
+		const beforeCorrect = mock.calls[4]!.context.messages;
+		const beforeCorrectText = beforeCorrect.map(messageText).join("\n");
+		expect(beforeCorrectText).toContain("Two candidates located; inspect the first.");
+		expect(beforeCorrectText).toContain("Exclude wrong.ts: it is generated test data, not the implementation.");
+		expect(beforeCorrectText).not.toContain("CANDIDATE_WRONG_READ_");
+		expect(beforeCorrect.some(message => message.role === "toolResult" && message.toolName === "read")).toBe(false);
+		expect(beforeCorrectText).not.toContain(chosen);
+		expect(mock.calls[5]!.context.messages.map(messageText).join("\n")).toContain(chosen);
+		const originalResults = session.sessionManager
+			.getEntries()
+			.flatMap(entry => (entry.type === "message" && entry.message.role === "toolResult" ? [entry.message] : []));
+		expect(messageText(originalResults.find(result => result.toolCallId === "locate")!)).toContain(
+			`observationId=${searchReference("o", "locate")}`,
+		);
+		expect(messageText(originalResults.find(result => result.toolCallId === "wrong")!)).toContain(
+			`observationId=${searchReference("o", "wrong")}`,
+		);
+		expect(messageText(originalResults.find(result => result.toolCallId === "wrong")!)).toContain(
+			`readId=${searchReference("r", "wrong")}`,
+		);
+		expect(session.messages).toEqual(session.sessionManager.buildSessionContext().messages);
+	});
+
+	it("retires failed and uncertain action logs while exact receipts, selected error text and images survive hops and reload", async () => {
+		const schema = type({ request: "string", options: { label: "string", flags: "string[]" } });
+		const cases = [
+			{
+				name: "bash",
+				id: "failed_test",
+				isError: true,
+				args: {
+					request: "bun test 'edge case.test.ts'\n# preserve exactly",
+					options: { label: "test run", flags: ["--timeout=19", "a b"] },
+				},
+				details: { exitCode: 1, async: { id: "bg_exact_17", status: "still-running" }, signal: null },
+			},
+			{
+				name: "browser",
+				id: "failed_browser",
+				isError: true,
+				args: {
+					request: "await page.click('[data-action=\"save\"]')",
+					options: { label: "save attempt", flags: ["do not replay"] },
+				},
+				details: {
+					targetId: "tab_exact_9",
+					action: { status: "uncertain", submitted: true },
+					errors: ["navigation timeout"],
+				},
+			},
+			{
+				name: "probe",
+				id: "unknown_action",
+				isError: false,
+				args: {
+					request: "dispatch action with unknown outcome",
+					options: { label: "not proof of success", flags: [] },
+				},
+				details: { handle: "job_exact_42", status: "accepted", businessSuccess: null },
+			},
+		];
+		const selectedError = "ASSERTION_EXACT: expected 3, received 4.";
+		const keptImage = { type: "image" as const, data: "a2VlcC1pbWFnZQ==", mimeType: "image/png" };
+		const droppedImage = { type: "image" as const, data: "ZHJvcC1pbWFnZQ==", mimeType: "image/png" };
+		const invocations: string[] = [];
+		const tools = cases.map(item => ({
+			name: item.name,
+			label: item.name,
+			description: "Action receipt fixture",
+			parameters: schema,
+			async execute() {
+				invocations.push(item.id);
+				if (item.name === "browser") {
+					session.sessionManager.appendCustomMessageEntry(
+						"async-result",
+						"ASYNC_NOTIFICATION_MUST_SURVIVE",
+						false,
+						{ jobId: "unrelated_job_23", status: "completed" },
+						"agent",
+					);
+					session.agent.appendMessage({
+						role: "custom",
+						customType: "async-result",
+						content: "ASYNC_NOTIFICATION_MUST_SURVIVE",
+						display: false,
+						attribution: "agent",
+						details: { jobId: "unrelated_job_23", status: "completed" },
+						timestamp: Date.now(),
+					});
+				}
+				return {
+					content: [
+						{ type: "text" as const, text: `${item.id}_PRIVATE_LOG\n`.repeat(900) },
+						{
+							type: "text" as const,
+							text: item.name === "bash" ? `prefix\n${selectedError}\nsuffix` : "unselected result",
+						},
+						...(item.name === "browser" ? [droppedImage, keptImage] : []),
+					],
+					details: item.details,
+					isError: item.isError,
+				};
+			},
+		})) as AgentTool[];
+		const { session, mock, tempDir, authStorage, extraSessions } = await createHarness(
+			[
+				{
+					content: cases.map(item => ({ type: "toolCall", id: item.id, name: item.name, arguments: item.args })),
+					stopReason: "toolUse",
+				},
+				{
+					content: [
+						{
+							type: "toolCall",
+							id: "actions_cut",
+							name: "rewind",
+							arguments: {
+								observationId: searchReference("o", "failed_test"),
+								note: "Test failed; browser action outcome is uncertain. Do not repeat either action.",
+								keep: [
+									{ observationId: searchReference("o", "failed_test"), text: selectedError },
+									{ observationId: searchReference("o", "failed_browser"), images: [1] },
+								],
+								nextAction: "Locate the cause without replaying actions.",
+							},
+						},
+					],
+					stopReason: "toolUse",
+				},
+				{
+					content: [
+						{
+							type: "toolCall",
+							id: "followup_search",
+							name: "grep",
+							arguments: { pattern: "FOLLOWUP_NOISE", path: "." },
+						},
+					],
+					stopReason: "toolUse",
+				},
+				{
+					content: [
+						{
+							type: "toolCall",
+							id: "followup_cut",
+							name: "rewind",
+							arguments: {
+								observationId: searchReference("o", "followup_search"),
+								note: "Excluded generated diagnostics; investigate the assertion.",
+								nextAction: "Inspect the assertion source.",
+							},
+						},
+					],
+					stopReason: "toolUse",
+				},
+				{ content: ["Proceed without replaying side effects."], stopReason: "stop" },
+			],
+			tools,
+			{ realTools: true, realSearchTools: true, persist: true },
+		);
+		await Bun.write(
+			path.join(tempDir.path(), "noise.ts"),
+			Array.from({ length: 180 }, (_, i) => `export const n${i} = "FOLLOWUP_NOISE_${i}";`).join("\n"),
+		);
+		await session.prompt("Investigate failures; preserve action receipts and exact selected evidence.");
+		const assertEvidence = (messages: Message[]) => {
+			const text = messages.map(messageText).join("\n");
+			expect(text).toContain(selectedError);
+			expect(text).toContain("Test failed; browser action outcome is uncertain. Do not repeat either action.");
+			expect(text).toContain("ASYNC_NOTIFICATION_MUST_SURVIVE");
+			for (const item of cases) {
+				expect(text).not.toContain(`${item.id}_PRIVATE_LOG`);
+				expect(text).toContain(item.name);
+				expectJsonInText(text, item.args);
+				expectJsonInText(text, item.details);
+			}
+			expect(text).toMatch(/"isError"\s*:\s*true/);
+			expect(text).toMatch(/"isError"\s*:\s*false/);
+			const images = messages.flatMap(message =>
+				typeof message.content === "string" ? [] : message.content.filter(block => block.type === "image"),
+			);
+			expect(images).toEqual([keptImage]);
+			expect(text).not.toContain("prefix");
+			expect(text).not.toContain("suffix");
+			expect(text).not.toContain("unselected result");
+			expect(
+				messages.some(
+					message => message.role === "toolResult" && cases.some(item => item.id === message.toolCallId),
+				),
+			).toBe(false);
+		};
+		assertEvidence(mock.calls[2]!.context.messages);
+		assertEvidence(mock.calls[4]!.context.messages);
+		expect(mock.calls[4]!.context.messages.map(messageText).join("\n")).not.toContain("FOLLOWUP_NOISE_");
+		expect(mock.calls[4]!.context.messages.map(messageText).join("\n")).toContain(
+			"Excluded generated diagnostics; investigate the assertion.",
+		);
+		expect(invocations.sort()).toEqual(cases.map(item => item.id).sort());
+		const results = session.sessionManager
+			.getEntries()
+			.flatMap(entry => (entry.type === "message" && entry.message.role === "toolResult" ? [entry.message] : []));
+		for (const item of cases) {
+			const result = results.find(message => message.toolCallId === item.id)!;
+			expect(result.isError).toBe(item.isError);
+			expect(messageText(result)).toContain(`observationId=${searchReference("o", item.id)}`);
+		}
+		expect(messageText(results.find(result => result.toolCallId === "actions_cut")!)).not.toContain("observationId=");
+		const committed = structuredClone(session.messages.filter(message => message.role === "custom"));
+		const file = session.sessionManager.getSessionFile();
+		if (!file) throw new Error("Missing durable observation session");
+		await session.dispose();
+		const manager = await SessionManager.open(file);
+		const model = createMockModel({ responses: [] });
+		const reloaded = new AgentSession({
+			agent: new Agent({
+				initialState: {
+					model,
+					tools: [],
+					messages: manager.buildSessionContext().messages,
+					systemPrompt: ["Test"],
+				},
+				streamFn: model.stream,
+				convertToLlm,
+			}),
+			sessionManager: manager,
+			settings: Settings.isolated({ "compaction.enabled": false, "todo.reminders": false }),
+			modelRegistry: new ModelRegistry(authStorage, path.join(tempDir.path(), "observation-reload.yml")),
+		});
+		extraSessions.push(reloaded);
+		expect(reloaded.messages.filter(message => message.role === "custom")).toEqual(committed);
+		expect(reloaded.messages).toEqual(manager.buildSessionContext().messages);
+		assertEvidence(convertToLlm(reloaded.messages));
+	});
+
+	it("rejects invented kept text, cross-part text and undelivered images without mutating history", async () => {
+		const tool: AgentTool = {
+			name: "browser",
+			label: "Browser",
+			description: "Deliver exact evidence",
+			parameters: type({}),
+			async execute() {
+				return {
+					content: [
+						{ type: "text", text: "FIRST_DELIVERED_PART\n".repeat(700) },
+						{ type: "text", text: "SECOND_DELIVERED_PART" },
+						{ type: "image", data: "aW1hZ2U=", mimeType: "image/png" },
+					],
+					details: { target: "exact-tab" },
+					isError: true,
+				};
+			},
+		};
+		const { session } = await createHarness(
+			[
+				{ content: [{ type: "toolCall", id: "evidence", name: "browser", arguments: {} }], stopReason: "toolUse" },
+				{ content: ["Decide what to retain."], stopReason: "stop" },
+			],
+			[tool],
+			{ realTools: true },
+		);
+		await session.prompt("Inspect delivered evidence.");
+		const before = rewindMutationSnapshot(session);
+		const observationId = searchReference("o", "evidence");
+		for (const keep of [
+			[{ observationId, text: "MODEL_INVENTED_TEXT" }],
+			[{ observationId, text: "FIRST_DELIVERED_PART\nSECOND_DELIVERED_PART" }],
+			[{ observationId, images: [1] }],
+			[{ observationId: searchReference("o", "not_delivered"), text: "SECOND_DELIVERED_PART" }],
+		]) {
+			expect(() => session.validateSearchRewind({ observationId, keep, nextAction: "Continue." })).toThrow();
+			expect(rewindMutationSnapshot(session)).toEqual(before);
+		}
+	});
+
+	it("rejects an incomplete later parallel batch without retiring an earlier completed observation", async () => {
+		const { session, tempDir } = await createHarness(
+			[
+				{
+					content: [
+						{
+							type: "toolCall",
+							id: "completed_search",
+							name: "grep",
+							arguments: { pattern: "NOISE", path: "." },
+						},
+					],
+					stopReason: "toolUse",
+				},
+				{ content: ["Search complete."], stopReason: "stop" },
+			],
+			[],
+			{ realTools: true, realSearchTools: true },
+		);
+		await Bun.write(
+			path.join(tempDir.path(), "noise.ts"),
+			Array.from({ length: 180 }, (_, i) => `export const noise${i} = "NOISE_${i}";`).join("\n"),
+		);
+		await session.prompt("Locate the source.");
+		session.sessionManager.appendMessage(
+			assistantFixture([
+				{ type: "toolCall", id: "finished_sibling", name: "read", arguments: { path: "noise.ts" } },
+				{ type: "toolCall", id: "unfinished_sibling", name: "browser", arguments: { action: "inspect" } },
+			]),
+		);
+		session.sessionManager.appendMessage({
+			role: "toolResult",
+			toolCallId: "finished_sibling",
+			toolName: "read",
+			content: [{ type: "text", text: "Completed sibling only." }],
+			isError: false,
+			timestamp: Date.now(),
+		});
+		const before = rewindMutationSnapshot(session);
+		expect(() =>
+			session.validateSearchRewind({
+				observationId: searchReference("o", "completed_search"),
+				nextAction: "Inspect the source.",
+			}),
+		).toThrow(/incomplete|unfinished|pending|final result|completed result|missing.*result/i);
+		expect(rewindMutationSnapshot(session)).toEqual(before);
+	});
+
 	it("rejects unseen source lines and a search superseded by new user instructions without cutting context", async () => {
 		const { session, tempDir } = await createHarness(
 			[
@@ -1011,7 +1400,7 @@ describe("AgentSession checkpoint rewind branch context", () => {
 		const selection = { readId: searchReference("r", "source"), path: "sample.ts", from: 40, to: 41 };
 		expect(() =>
 			session.validateSearchRewind({
-				searchId: searchReference("s", "search"),
+				observationId: searchReference("o", "search"),
 				retain: [selection],
 				nextAction: "Continue.",
 			}),
@@ -1022,13 +1411,15 @@ describe("AgentSession checkpoint rewind branch context", () => {
 			content: "Keep the current exploration.",
 			timestamp: Date.now(),
 		});
+		const afterUserInput = rewindMutationSnapshot(session);
 		expect(() =>
 			session.validateSearchRewind({
-				searchId: searchReference("s", "search"),
+				observationId: searchReference("o", "search"),
 				retain: [],
 				nextAction: "Continue.",
 			}),
 		).toThrow("New user input");
+		expect(rewindMutationSnapshot(session)).toEqual(afterUserInput);
 		expect(session.sessionManager.getBranch().some(entry => entry.type === "branch_summary")).toBe(false);
 	});
 

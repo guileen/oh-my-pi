@@ -571,7 +571,7 @@ export interface ToolSession {
 	) => RewindContextEstimate;
 	/** Resolve a checkpoint's canonical todo target before work begins. */
 	bindCheckpointTodo?: (target?: { phase?: string; task?: string }) => WorkPackageTodoBinding | undefined;
-	/** Validate a selective search decision against already-delivered snapshots. */
+	/** Validate a lightweight observation cut against delivered results and operation receipts. */
 	validateSearchRewind?: (input: SearchRewindInput) => RewindContextEstimate;
 
 	/** Native snapshots, clipboard registers, and no-op guard shared by edit calls. */
