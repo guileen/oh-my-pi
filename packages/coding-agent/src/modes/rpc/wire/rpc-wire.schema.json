@@ -3644,7 +3644,8 @@
 				"remote",
 				"handoff",
 				"shake",
-				"snapcompact"
+				"snapcompact",
+				"qaonly"
 			],
 			"type": "string"
 		},

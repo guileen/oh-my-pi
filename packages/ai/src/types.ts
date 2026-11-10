@@ -508,6 +508,12 @@ export interface StreamOptions {
 	maxTokens?: number;
 	signal?: AbortSignal;
 	/**
+	 * Admit each actual inference request immediately before dispatch, including
+	 * transport retries. Authentication, discovery, and response deltas do not
+	 * invoke this hook. Throwing cancels this request and all of its retries.
+	 */
+	beforeProviderRequest?: (model: Model<Api>, signal?: AbortSignal) => void | Promise<void>;
+	/**
 	 * OpenAI chat-completions HTTP attempt budget. When set, transient provider
 	 * errors are not replayed above the transport, so retries share this limit.
 	 */

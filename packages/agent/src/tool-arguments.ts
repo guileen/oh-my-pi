@@ -15,6 +15,8 @@ export type ToolArgumentSource = "parsed" | "payload";
  * {@link AgentTool.lenientArgValidation}: a lenient tool keeps unknown root
  * keys its closed schema would heal away, and on a schema mismatch receives its
  * raw arguments minus the internal `__parseError`/`__rawJson` sentinels.
+ * `"raw"` delegates all parsed argument validation to the tool, preserving
+ * nested fields and exact values that shared schema repair would change.
  * Malformed JSON from a provider stream is never lenient.
  *
  * @throws the validation error when the tool is strict or the arguments failed to parse.
@@ -24,8 +26,18 @@ export function validateAgentToolArguments(
 	toolCall: ToolCall,
 	source: ToolArgumentSource = "parsed",
 ): ToolCall["arguments"] {
+	if (tool.lenientArgValidation === "raw") {
+		const args = toolCall.arguments;
+		if (source === "parsed" && args !== null && typeof args === "object" && "__parseError" in args) {
+			// Reuse the ordinary parse-error envelope; never execute unparsed JSON.
+			return validateToolArguments(tool, toolCall);
+		}
+		return withoutSentinels(args);
+	}
 	try {
-		const validated = validateToolArguments(tool, toolCall, { keepUnknownRootKeys: tool.lenientArgValidation });
+		const validated = validateToolArguments(tool, toolCall, {
+			keepUnknownRootKeys: tool.lenientArgValidation === true,
+		});
 		// Kept unknown root keys must not smuggle the internal sentinels past validation.
 		return tool.lenientArgValidation ? withoutSentinels(validated) : validated;
 	} catch (error) {

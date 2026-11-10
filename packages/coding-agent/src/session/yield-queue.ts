@@ -45,9 +45,15 @@ export class YieldQueue {
 	readonly #dispatchers = new Map<string, StoredDispatcher>();
 	readonly #entries = new Map<string, StoredEntry[]>();
 	#idleFlushPending = false;
+	#idleDeliveryGate: (() => Promise<void>) | undefined;
 
 	constructor(options: YieldQueueOptions) {
 		this.#options = options;
+	}
+
+	/** Acquire an external execution permit before an idle delivery starts a new turn. */
+	setIdleDeliveryGate(gate: (() => Promise<void>) | undefined): void {
+		this.#idleDeliveryGate = gate;
 	}
 
 	register<P>(kind: string, dispatcher: YieldDispatcher<P>): () => void {
@@ -160,6 +166,7 @@ export class YieldQueue {
 		if (mode === "idle" && idleMessages.length > 0) {
 			for (const item of idleMessages) this.#attachEntrySettlement(item);
 			try {
+				await this.#idleDeliveryGate?.();
 				await this.#options.injectIdle(idleMessages.map(item => item.message));
 				for (const item of idleMessages) {
 					(item.message as AgentMessage & { [ASIDE_MESSAGE_COMMIT]?: () => void })[ASIDE_MESSAGE_COMMIT]?.();

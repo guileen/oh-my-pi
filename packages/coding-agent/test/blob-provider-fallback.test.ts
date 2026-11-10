@@ -7,6 +7,9 @@ import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { resolveInlineImageByteBudget } from "@oh-my-pi/pi-catalog/compat/request-size";
 import { ImageUrlService } from "@oh-my-pi/pi-coding-agent/blob-broker/service";
 import { wrapStreamFnWithBlobUrlFallback } from "@oh-my-pi/pi-coding-agent/blob-broker/stream-fallback";
+import { withOfficialAnthropicEndpoint } from "./helpers/anthropic-endpoint";
+
+withOfficialAnthropicEndpoint();
 
 const model: Model = buildModel({
 	id: "gpt-4.1",

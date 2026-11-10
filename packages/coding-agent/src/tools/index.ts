@@ -21,7 +21,7 @@ import type { GoalModeState, GoalRuntime } from "../goals";
 import { GoalTool } from "../goals/tools/goal-tool";
 import type { HindsightSessionState } from "../hindsight/state";
 import type { LocalProtocolOptions } from "../internal-urls";
-import type { DaemonCompletionNotification } from "../launch/protocol";
+import type { DaemonCompletionNotification, DaemonLaunchMetadata, DaemonOperation } from "../launch/protocol";
 import { LspTool } from "../lsp";
 import type { MCPManagerApi } from "../mcp";
 import { MEMORY_BACKEND_TOOL_NAMES } from "../memory-backend/tool-names";
@@ -34,6 +34,7 @@ import type { ArtifactManagerApi } from "../session/artifacts";
 import type { ClientBridge } from "../session/client-bridge";
 import type { CostGateApi } from "../session/cost-gate";
 import type { CustomMessage } from "../session/messages";
+import type { QaCheckpointAcceptance, QaCheckpointInput } from "../session/qa-rollover";
 import type { UsageStatistics } from "../session/session-entries";
 import type { SessionManager } from "../session/session-manager";
 import type { ToolChoiceQueue } from "../session/tool-choice-queue";
@@ -58,6 +59,7 @@ import { EvalTool } from "./eval";
 import { resolveEvalBackends } from "./eval-backends";
 import { GithubTool } from "./gh";
 import { GlobTool } from "./glob";
+import { GraphManageTool, GraphReadTool, type GraphToolOptions } from "./graph";
 import { GrepTool } from "./grep";
 import { IdaTool } from "./ida";
 import { isIrcEnabled } from "../irc/messaging";
@@ -137,6 +139,7 @@ export * from "./file-mutation-queue";
 export * from "./file-write-fallback";
 export * from "./gh";
 export * from "./glob";
+export * from "./graph";
 export * from "./grep";
 export * from "./jfind";
 export type { AgentActivitySnapshot, CoordinationDetails, JobSnapshot } from "@oh-my-pi/pi-tui/tools/wait";
@@ -210,6 +213,10 @@ export interface DeferredDiagnosticsEntry {
 
 /** Session context for tool factories */
 export interface ToolSession {
+	/** Trusted host authorization for each Graph Run observation; absence denies access. */
+	authorizeGraphRunObservation?: (runId: string) => boolean | Promise<boolean>;
+	/** Trusted Graph policy for the top-level session; subagents inherit nothing. */
+	graph?: GraphToolOptions;
 	/** Current working directory */
 	cwd: string;
 	/** Cost gate of the session tree, forwarded to subagents. */
@@ -231,6 +238,11 @@ export interface ToolSession {
 	tuiTranscript?: boolean;
 	/** Whether this session has begun disposal. */
 	isDisposed?: () => boolean;
+	/** Explicit owner callback; never inherit this from a parent or advisor session. */
+	qaRollover?: {
+		isEnabled(): boolean;
+		accept(checkpoint: QaCheckpointInput, signal?: AbortSignal): Promise<QaCheckpointAcceptance>;
+	};
 	/**
 	 * Suppress the spawn specialization/coordination advisory appended to `task`
 	 * results. Set by internal/programmatic callers (e.g. the commit agent's
@@ -559,6 +571,8 @@ export interface ToolSession {
 	queueDeferredMessage?(message: CustomMessage): void;
 	/** Queue a broker supervised-process completion for the owning session. */
 	queueLaunchCompletion?(notification: DaemonCompletionNotification): Promise<void>;
+	/** Persist owned launch intent before broker dispatch; the returned owner is authoritative. */
+	prepareServiceLaunch?(operation: Extract<DaemonOperation, { op: "start" }>): Promise<DaemonLaunchMetadata>;
 	/** Register cleanup that runs when this session is disposed; returns a handle that removes the cleanup. */
 	registerDisposeCallback?(callback: () => void): (() => void) | void;
 	/** Register cleanup that runs when this ToolSession adopts a different session ID. */
@@ -616,6 +630,9 @@ export const BUILTIN_TOOLS: Record<BuiltinToolName, ToolFactory> = {
 	reflect: MemoryReflectTool.createIf,
 	learn: LearnTool.createIf,
 	manage_skill: ManageSkillTool.createIf,
+	graph_manage: s => new GraphManageTool(s.graph),
+	graph_read: s =>
+		new GraphReadTool({ ...s.graph, authorizeRun: s.authorizeGraphRunObservation ?? s.graph?.authorizeRun }),
 };
 
 export const HIDDEN_TOOLS: Record<HiddenToolName, ToolFactory> = {
@@ -718,6 +735,13 @@ export async function resolveBuiltinToolPlan(session: ToolSession, toolNames?: s
 			if (!requestedTools.includes("context_notes")) requestedTools.push("context_notes");
 			if (!requestedTools.includes("new_context")) requestedTools.push("new_context");
 		}
+		if (
+			!cfgCompactionExperimentalContextManagement.get(session.settings) &&
+			NewContextTool.isSupported(session) &&
+			!requestedTools.includes("new_context")
+		) {
+			requestedTools.push("new_context");
+		}
 		if (goalModeActive && !requestedTools.includes("goal")) {
 			requestedTools.push("goal");
 		}
@@ -793,8 +817,8 @@ export async function resolveBuiltinToolPlan(session: ToolSession, toolNames?: s
 		if (name === "security_scan") return cfgSecurityEnabled.get(session.settings);
 		if (name === "think") return externalThinkingActive;
 		if (name === "ask") return cfgAskEnabled.get(session.settings);
-		if (name === "context_notes" || name === "new_context")
-			return cfgCompactionExperimentalContextManagement.get(session.settings);
+		if (name === "context_notes") return cfgCompactionExperimentalContextManagement.get(session.settings);
+		if (name === "new_context") return NewContextTool.isSupported(session);
 		if (name === "checkpoint" || name === "rewind")
 			return (
 				cfgCheckpointEnabled.get(session.settings) &&

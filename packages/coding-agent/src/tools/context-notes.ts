@@ -7,10 +7,16 @@ import type {
 	ToolApprovalDecision,
 } from "@oh-my-pi/pi-agent-core";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
-import { prompt } from "@oh-my-pi/pi-utils";
+import { isRecord, prompt } from "@oh-my-pi/pi-utils";
 import contextNotesDescription from "../prompts/tools/context-notes.md" with { type: "text" };
 import contextNotesTextDescription from "../prompts/tools/context-notes-text.md" with { type: "text" };
 import newContextDescription from "../prompts/tools/new-context.md" with { type: "text" };
+import newContextQaDescription from "../prompts/tools/new-context-qa.md" with { type: "text" };
+import qaCheckpointDescription from "../prompts/tools/new-context-qa-checkpoint.md" with { type: "text" };
+import qaCycleIdDescription from "../prompts/tools/new-context-qa-cycle-id.md" with { type: "text" };
+import qaDispositionDescription from "../prompts/tools/new-context-qa-disposition.md" with { type: "text" };
+import qaNextActionDescription from "../prompts/tools/new-context-qa-next-action.md" with { type: "text" };
+import qaSummaryDescription from "../prompts/tools/new-context-qa-summary.md" with { type: "text" };
 import {
 	CONTEXT_NOTES_ENTRY_TYPE,
 	type ContextNotesEntry,
@@ -18,6 +24,7 @@ import {
 	MAX_CONTEXT_NOTES_BYTES,
 } from "../session/context-notes";
 import { cfgCompactionExperimentalContextManagement } from "../session/context-settings";
+import { type QaCheckpointAcceptance, qaCheckpointError } from "../session/qa-rollover";
 import type { ToolSession } from ".";
 import { throwIfAborted } from "./tool-errors";
 
@@ -25,10 +32,22 @@ const contextNotesSchema = type({
 	"text?": type("string").describe(prompt.render(contextNotesTextDescription, { maxBytes: MAX_CONTEXT_NOTES_BYTES })),
 });
 
-const newContextSchema = type({});
+const newContextSchema = type({ "+": "reject" });
+// QA keeps one checkpoint shape; execute owns disposition-specific requirements.
+// QA stays non-strict so omitted nextAction never acquires a null placeholder.
+const qaNewContextSchema = type({
+	checkpoint: type({
+		cycleId: type("string > 0").describe(qaCycleIdDescription),
+		summary: type("string > 0").describe(qaSummaryDescription),
+		disposition: type("'continue' | 'complete' | 'blocked'").describe(qaDispositionDescription),
+		"nextAction?": type("string > 0").describe(qaNextActionDescription),
+		"+": "reject",
+	}).describe(qaCheckpointDescription),
+	"+": "reject",
+});
 
 export type ContextNotesParams = typeof contextNotesSchema.infer;
-export type NewContextParams = typeof newContextSchema.infer;
+export type NewContextParams = typeof newContextSchema.infer | typeof qaNewContextSchema.infer;
 
 export interface ContextNotesToolDetails {
 	entryId?: string;
@@ -38,6 +57,7 @@ export interface ContextNotesToolDetails {
 
 export interface NewContextToolDetails {
 	requested: true;
+	checkpoint?: QaCheckpointAcceptance["checkpoint"];
 }
 
 type ExperimentalContextSessionManager = NonNullable<ToolSession["sessionManager"]>;
@@ -50,6 +70,23 @@ function resolveExperimentalContextSession(session: ToolSession): ExperimentalCo
 	const ownerId = session.getSessionId?.();
 	if (!manager || !ownerId || manager.getSessionId?.() !== ownerId) return undefined;
 	return manager;
+}
+
+function supportsQaContext(session: ToolSession): boolean {
+	if (
+		cfgCompactionExperimentalContextManagement.get(session.settings) ||
+		session.isDisposed?.() ||
+		!session.qaRollover?.isEnabled()
+	) {
+		return false;
+	}
+	const ownerId = session.getSessionId?.();
+	return !!ownerId && session.sessionManager?.getSessionId?.() === ownerId;
+}
+
+function checkpointCycleId(params: unknown): string | undefined {
+	if (!isRecord(params) || !isRecord(params.checkpoint)) return undefined;
+	return typeof params.checkpoint.cycleId === "string" ? params.checkpoint.cycleId : undefined;
 }
 
 /**
@@ -67,13 +104,6 @@ export function getExperimentalContextSession(session: ToolSession): Experimenta
 		throw new ToolError("Experimental context management is unavailable because this session is disposed.");
 	}
 	throw new ToolError("Experimental context management is unavailable for this session.");
-}
-
-function createIfSupported<T extends ContextNotesTool | NewContextTool>(
-	session: ToolSession,
-	ToolClass: new (session: ToolSession) => T,
-): T | null {
-	return resolveExperimentalContextSession(session) ? new ToolClass(session) : null;
 }
 
 /** Reads or replaces the current branch's durable experimental notebook. */
@@ -94,7 +124,7 @@ export class ContextNotesTool implements AgentTool<typeof contextNotesSchema, Co
 	constructor(private readonly session: ToolSession) {}
 
 	static createIf(session: ToolSession): ContextNotesTool | null {
-		return createIfSupported(session, ContextNotesTool);
+		return resolveExperimentalContextSession(session) ? new ContextNotesTool(session) : null;
 	}
 
 	async execute(
@@ -151,31 +181,90 @@ export class ContextNotesTool implements AgentTool<typeof contextNotesSchema, Co
 }
 
 /** Requests a fresh context window; the owning lifecycle consumes this turn-local signal. */
-export class NewContextTool implements AgentTool<typeof newContextSchema, NewContextToolDetails> {
+export class NewContextTool implements AgentTool<
+	typeof newContextSchema | typeof qaNewContextSchema,
+	NewContextToolDetails
+> {
 	readonly name = "new_context";
 	readonly approval = "write" as const;
 	readonly label = "New Context";
-	readonly description = newContextDescription;
-	readonly parameters = newContextSchema;
-	readonly strict = true;
+	readonly description: string;
+	readonly parameters: typeof newContextSchema | typeof qaNewContextSchema;
+	readonly strict: boolean;
+	// Validation owns typed QA refusals and must never heal away checkpoint data.
+	readonly lenientArgValidation = "raw" as const;
 	readonly loadMode = "essential" as const;
 	readonly summary = "Request a fresh context window";
 
-	constructor(private readonly session: ToolSession) {}
+	readonly #mode: "experimental" | "qa";
+
+	constructor(private readonly session: ToolSession) {
+		this.#mode = cfgCompactionExperimentalContextManagement.get(session.settings) ? "experimental" : "qa";
+		this.description = this.#mode === "experimental" ? newContextDescription : newContextQaDescription;
+		this.parameters = this.#mode === "experimental" ? newContextSchema : qaNewContextSchema;
+		this.strict = this.#mode === "experimental";
+	}
+
+	static isSupported(session: ToolSession): boolean {
+		return !!resolveExperimentalContextSession(session) || supportsQaContext(session);
+	}
 
 	static createIf(session: ToolSession): NewContextTool | null {
-		return createIfSupported(session, NewContextTool);
+		return NewContextTool.isSupported(session) ? new NewContextTool(session) : null;
 	}
 
 	async execute(
 		_id: string,
-		_params: NewContextParams,
+		params: unknown,
 		signal?: AbortSignal,
 		_onUpdate?: AgentToolUpdateCallback<NewContextToolDetails>,
 		_context?: AgentToolContext,
 	): Promise<AgentToolResult<NewContextToolDetails>> {
-		getExperimentalContextSession(this.session);
 		throwIfAborted(signal);
+		const cycleId = checkpointCycleId(params);
+		if (this.#mode === "qa") {
+			const rollover = this.session.qaRollover;
+			if (!rollover || !supportsQaContext(this.session)) {
+				throw qaCheckpointError("QA_NOT_ACTIVE", "QA rollover is unavailable for this session.", cycleId);
+			}
+			if (!qaNewContextSchema.allows(params)) {
+				throw qaCheckpointError("QA_INVALID_CHECKPOINT", "Invalid QA checkpoint fields or disposition.", cycleId);
+			}
+			const { checkpoint } = qaNewContextSchema.assert(params);
+			if (!checkpoint.cycleId.trim() || !checkpoint.summary.trim()) {
+				throw qaCheckpointError("QA_INVALID_CHECKPOINT", "QA checkpoint fields must not be blank.", cycleId);
+			}
+			if (checkpoint.disposition === "continue" && !checkpoint.nextAction?.trim()) {
+				throw qaCheckpointError(
+					"QA_INVALID_CHECKPOINT",
+					"A continuing QA checkpoint requires a nonblank nextAction.",
+					cycleId,
+				);
+			}
+			if (checkpoint.disposition !== "continue" && Object.hasOwn(checkpoint, "nextAction")) {
+				throw qaCheckpointError(
+					"QA_INVALID_CHECKPOINT",
+					"Complete or blocked QA checkpoints must omit nextAction.",
+					cycleId,
+				);
+			}
+			const details = await rollover.accept(checkpoint, signal);
+			return {
+				content: [{ type: "text", text: "QA checkpoint recorded. Context rollover is pending." }],
+				details,
+			};
+		}
+		if (isRecord(params) && Object.hasOwn(params, "checkpoint")) {
+			throw qaCheckpointError(
+				"QA_NOT_ACTIVE",
+				"QA checkpoints are unavailable in experimental notes mode.",
+				cycleId,
+			);
+		}
+		getExperimentalContextSession(this.session);
+		if (!newContextSchema.allows(params)) {
+			throw new ToolError("Experimental new_context accepts only an empty object.");
+		}
 		return {
 			content: [{ type: "text", text: "New context window requested." }],
 			details: { requested: true },

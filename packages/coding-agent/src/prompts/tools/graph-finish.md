@@ -1,0 +1,1 @@
+As the consulted member, submit the final answer to a Graph consultation using `conversation_id`, `text`, and a stable `request_key`. Include shareable `artifact_refs` when needed. This does not complete the original node.

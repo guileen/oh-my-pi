@@ -78,13 +78,14 @@ export function flagsCell(row: PsDaemonRow): string {
 	const parts: string[] = [];
 	if (row.snapshot.detached) parts.push("detached");
 	else if (row.snapshot.persist) parts.push("persist");
-	if (!row.supervised && !TERMINAL_STATES[row.snapshot.state]) parts.push("unsupervised");
+	if ((!row.supervised || row.snapshot.state === "unknown") && !TERMINAL_STATES[row.snapshot.state])
+		parts.push("unsupervised");
 	return parts.join(",");
 }
 
 /** Display elapsed runtime, or a dash for a terminal process. */
 export function uptimeCell(snapshot: DaemonSnapshot): string {
-	if (TERMINAL_STATES[snapshot.state]) return "-";
+	if (TERMINAL_STATES[snapshot.state] || snapshot.state === "unknown") return "-";
 	return formatDuration(Date.now() - snapshot.startedAt);
 }
 

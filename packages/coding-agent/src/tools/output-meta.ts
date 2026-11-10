@@ -28,6 +28,7 @@ import {
 	type OutputMeta,
 	type TruncationMeta,
 } from "@oh-my-pi/pi-tui/tools/output-meta";
+import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { renderError } from "./tool-errors";
 import {
 	cfgToolsArtifactHeadBytes,
@@ -795,8 +796,13 @@ async function wrappedExecute(
 			};
 		}
 	} catch (e) {
-		// Re-throw with formatted message so agent-loop sets isError flag
-		throw new Error(renderError(e));
+		// Preserve structured failure details while keeping custom model rendering.
+		const message = renderError(e);
+		if (e instanceof ToolError) {
+			if (e.message === message) throw e;
+			throw new ToolError(message, e.context);
+		}
+		throw new Error(message);
 	}
 	// The Spotlight experiment shapes what the agent's own calls return; calls a tool or script makes stay whole.
 	const shape = context?.spotlightShape;

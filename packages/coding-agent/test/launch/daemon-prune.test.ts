@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { pruneDeadDaemonRuntimeDirs } from "../../src/launch/presence";
+import { DAEMON_LAUNCH_LEDGER_FILE, DAEMON_LAUNCH_LEDGER_MARKER } from "../../src/launch/protocol";
 
 const STALE = new Date(Date.now() - 30 * 60_000);
 let deadPid = 0;
@@ -59,6 +60,23 @@ describe("pruneDeadDaemonRuntimeDirs", () => {
 		expect(remaining.has("dddddddddddddddd")).toBe(true); // live client presence
 		expect(remaining.has("eeeeeeeeeeeeeeee")).toBe(true); // within stale grace
 		expect(remaining.has("global")).toBe(true); // non-scope name skipped
+	});
+
+	it("retains launch dispositions and epoch tombstones even without a live broker or client", async () => {
+		using tempDir = TempDir.createSync("@omp-daemon-prune-ledger-");
+		const root = path.join(tempDir.path(), "run", "daemons");
+		const current = await scope(root, "aaaaaaaaaaaaaaaa", { stale: true });
+		const ledger = await scope(root, "bbbbbbbbbbbbbbbb", { pid: "dead" });
+		const lostLedger = await scope(root, "cccccccccccccccc", { pid: "dead" });
+		await Bun.write(path.join(ledger, DAEMON_LAUNCH_LEDGER_FILE), "retained");
+		await Bun.write(path.join(lostLedger, DAEMON_LAUNCH_LEDGER_MARKER), "1\n");
+		await fs.utimes(ledger, STALE, STALE);
+		await fs.utimes(lostLedger, STALE, STALE);
+
+		await pruneDeadDaemonRuntimeDirs(current);
+
+		expect(await fs.exists(ledger)).toBe(true);
+		expect(await fs.exists(lostLedger)).toBe(true);
 	});
 
 	it("does not sweep sibling machine-global service runtimes", async () => {

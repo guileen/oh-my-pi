@@ -70,6 +70,12 @@
 - F2 now opens the rename dialog in the resume picker in Ghostty, kitty and other terminals using the kitty keyboard protocol; F1 and F4 shortcuts work there too ([#17812](https://github.com/can1357/oh-my-pi/issues/17812)).
 - Added `Component.nativeTrailers()`, which lets a transcript block add native blocks of its own directly after it. Trailing blocks stay visible while the block is collapsed.
 
+### Fixed
+
+- Tmux capability queries allow the same two-second timeout as terminal identification, avoiding false negatives when starting a tmux client is slow on a loaded host.
+- Narrow compaction dividers retain the compaction label rather than clipping it behind the decorative icon.
+- Process monitoring now shows unknown ownership separately from running or stopped processes, without a misleading uptime.
+
 ## [18.15.0] - 2026-11-01
 
 ### Breaking Changes

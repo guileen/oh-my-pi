@@ -2405,6 +2405,11 @@ export class SessionAdvisors {
 		if (!configuredCompaction.enabled || methods.length === 0) {
 			return false;
 		}
+		// Advisors have no QA checkpoint lifecycle. A QA-first configuration
+		// authorizes a paid summary only when a later engine method is explicit.
+		if (methods.includes("qaonly") && !methods.some(method => method === "remote" || method === "soft")) {
+			return false;
+		}
 		const compactionMethod = methods.includes("remote") ? "remote" : "soft";
 		let advisorModel = agent.state.model;
 		let compactionSettings = resolveMethodSettings(

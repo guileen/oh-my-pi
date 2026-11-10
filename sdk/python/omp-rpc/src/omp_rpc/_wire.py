@@ -146,8 +146,8 @@ _AUTO_COMPACTION_REASON_VALUES: Final[frozenset[str]] = frozenset({"threshold", 
 _decode_auto_compaction_reason = cast("Decoder[AutoCompactionReason]", literal(_AUTO_COMPACTION_REASON_VALUES))
 
 
-AutoCompactionAction: TypeAlias = Literal["context-full", "remote", "handoff", "shake", "snapcompact"]
-_AUTO_COMPACTION_ACTION_VALUES: Final[frozenset[str]] = frozenset({"context-full", "remote", "handoff", "shake", "snapcompact"})
+AutoCompactionAction: TypeAlias = Literal["context-full", "remote", "handoff", "shake", "snapcompact", "qaonly"]
+_AUTO_COMPACTION_ACTION_VALUES: Final[frozenset[str]] = frozenset({"context-full", "remote", "handoff", "shake", "snapcompact", "qaonly"})
 _decode_auto_compaction_action = cast("Decoder[AutoCompactionAction]", literal(_AUTO_COMPACTION_ACTION_VALUES))
 
 

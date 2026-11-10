@@ -139,6 +139,32 @@ class SocketDaemonClient implements DaemonBrokerClient {
 	}
 
 	async request(operation: DaemonOperation, signal?: AbortSignal): Promise<DaemonRpcResult> {
+		if (operation.op !== "reconcile_launch") return this.#request(operation, signal);
+		try {
+			return await this.#request(operation, signal);
+		} catch (error) {
+			if (signal?.aborted) throw error;
+			if (error instanceof DaemonBrokerRejectedError && error.message.startsWith("idempotency_conflict"))
+				throw error;
+			return {
+				op: "reconcile_launch",
+				disposition: {
+					launch_intent_id: operation.launch_intent_id,
+					state: "unknown",
+					service: null,
+					outcome: null,
+					final: false,
+					error: {
+						code: "cleanup_failed",
+						message: error instanceof Error ? error.message : String(error),
+						retryable: true,
+					},
+				},
+			};
+		}
+	}
+
+	async #request(operation: DaemonOperation, signal?: AbortSignal): Promise<DaemonRpcResult> {
 		if (this.#closed) throw new Error("Daemon broker client is closed");
 		if (signal?.aborted) throw new Error("Daemon broker request aborted");
 		await this.#connect();

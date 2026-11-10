@@ -1859,7 +1859,7 @@ fn register_nonblocking_pipe(reader: fs::File) -> io::Result<tokio::io::unix::As
 }
 
 #[cfg(unix)]
-fn set_nonblocking<T: std::os::fd::AsRawFd>(file: &T) -> io::Result<()> {
+pub(crate) fn set_nonblocking<T: std::os::fd::AsRawFd>(file: &T) -> io::Result<()> {
 	let fd = file.as_raw_fd();
 	// SAFETY: `fd` is owned by `file` and remains valid for the duration of
 	// these `fcntl` calls.

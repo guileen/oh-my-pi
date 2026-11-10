@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import { extractPrintableText } from "@oh-my-pi/pi-tui/keys";
 import { ProcessTerminal, type TerminalStartOptions } from "@oh-my-pi/pi-tui/terminal";
+import { TERMINAL_MULTIPLEXER_ENV_KEYS } from "@oh-my-pi/pi-tui/terminal-multiplexer";
 import {
 	type CellDimensions,
 	getCellDimensions,
@@ -22,7 +23,6 @@ const originalWslInterop = Bun.env.WSL_INTEROP;
 const originalWtSession = Bun.env.WT_SESSION;
 const originalTermProgram = Bun.env.TERM_PROGRAM;
 const originalTmux = Bun.env.TMUX;
-const originalTerm = Bun.env.TERM;
 
 // These suites drive the real ProcessTerminal start()/probe pipeline, so they
 // opt out of the test-default headless suppression and restore it per case.
@@ -883,6 +883,7 @@ describe("ProcessTerminal OSC 11 appearance detection", () => {
 
 describe("ProcessTerminal DECRQM + in-band resize (DEC 2026/2048)", () => {
 	let originalCellDims: CellDimensions;
+	let originalMultiplexerEnv: Map<string, string | undefined>;
 
 	beforeEach(() => {
 		Object.defineProperty(process.stdin, "isTTY", { value: true, configurable: true });
@@ -890,8 +891,10 @@ describe("ProcessTerminal DECRQM + in-band resize (DEC 2026/2048)", () => {
 		Object.defineProperty(process.stdin, "setRawMode", { value: vi.fn(), configurable: true });
 		originalCellDims = { ...getCellDimensions() };
 		previousHeadless = setTerminalHeadless(false);
-		delete Bun.env.TMUX;
-		delete Bun.env.TERM;
+		// Session markers take precedence over TERM; isolate the host so the
+		// TERM-only tmux case models a stripped tmux environment.
+		originalMultiplexerEnv = new Map(TERMINAL_MULTIPLEXER_ENV_KEYS.map(key => [key, Bun.env[key]]));
+		for (const key of TERMINAL_MULTIPLEXER_ENV_KEYS) delete Bun.env[key];
 	});
 
 	afterEach(() => {
@@ -905,8 +908,7 @@ describe("ProcessTerminal DECRQM + in-band resize (DEC 2026/2048)", () => {
 		restoreProperty(process.stdout, "columns", stdoutColumnsDescriptor);
 		restoreProperty(process.stdout, "rows", stdoutRowsDescriptor);
 		setCellDimensions(originalCellDims);
-		restoreEnv("TMUX", originalTmux);
-		restoreEnv("TERM", originalTerm);
+		for (const [key, value] of originalMultiplexerEnv) restoreEnv(key, value);
 	});
 
 	function setup(startOptions?: TerminalStartOptions) {

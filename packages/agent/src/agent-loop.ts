@@ -41,6 +41,7 @@ import {
 	kCursorExecResolved,
 } from "@oh-my-pi/pi-ai/utils/block-symbols";
 import { schemaDefinesProperty } from "@oh-my-pi/pi-ai/utils/schema/json-schema-validator";
+import { withProviderRequestError, withProviderRequestGate } from "@oh-my-pi/pi-ai/utils/provider-request";
 import { stamp } from "@oh-my-pi/pi-ai/utils/schema/stamps";
 import {
 	createHarmonyAuditEvent,
@@ -53,7 +54,7 @@ import {
 	signalListLabel,
 } from "@oh-my-pi/pi-ai/utils/harmony-leak";
 import { isDsmlLeakRecoveryTarget, removeDsmlToolMarkupLeak } from "@oh-my-pi/pi-ai/utils/dsml-leak";
-import { cloneJsonTree, logger, sanitizeText, structuredCloneJSON, toError } from "@oh-my-pi/pi-utils";
+import { cloneJsonTree, isRecord, logger, sanitizeText, structuredCloneJSON, toError } from "@oh-my-pi/pi-utils";
 import { INTENT_FIELD } from "@oh-my-pi/pi-wire";
 import { LiveSteeringChannel } from "./live-steering";
 import { agentPauseGate } from "./pause";
@@ -785,19 +786,21 @@ async function emitTurnEnd(
 	signal?: AbortSignal,
 	context?: Omit<AgentTurnEndContext, "message" | "toolResults">,
 	runHookOnAbortedMessage = false,
-): Promise<void> {
+): Promise<boolean> {
 	stream.push({ type: "turn_end", message, toolResults });
 	const terminalYield = signal?.reason === TERMINAL_TOOL_RESULT_ABORT_REASON;
 	const isAbortedOrError =
 		message.role === "assistant" && (message.stopReason === "aborted" || message.stopReason === "error");
-	if ((signal?.aborted && !terminalYield) || (isAbortedOrError && !runHookOnAbortedMessage)) return;
-	await config.onTurnEnd?.(currentContext.messages, terminalYield ? undefined : signal, {
+	if ((signal?.aborted && !terminalYield) || (isAbortedOrError && !runHookOnAbortedMessage)) return false;
+	const boundary: AgentTurnEndContext = {
 		message,
 		toolResults,
 		additionalMessages: [],
 		willContinue: false,
 		...context,
-	});
+	};
+	await config.onTurnEnd?.(currentContext.messages, terminalYield ? undefined : signal, boundary);
+	return boundary.stop === true;
 }
 
 function createGateStopMessage(model: Model, reason: string | undefined): AssistantMessage {
@@ -1449,13 +1452,24 @@ async function runLoopBody(
 							throw error;
 						}
 					}
+					// A gate may stop an aborted run before the next provider request.
+					// If this run already executed tools, retain an interrupted boundary
+					// after their results so the session can retry the failed batch.
+					if (!turnOpen && signal?.aborted && newMessages.some(message => message.role === "toolResult")) {
+						stream.push({ type: "turn_start" });
+						turnOpen = true;
+					}
 					emitInputMessages(stream, turnMessages);
 					if (turnOpen) {
-						const stopMessage = createGateStopMessage(preparedProviderCall.model, gateResult.reason);
-						currentContext.messages.push(stopMessage);
+						const stopMessage = signal?.aborted
+							? emitAbortedAssistantMessage(null, false, new Set(), currentContext, config, stream, signal)
+							: createGateStopMessage(preparedProviderCall.model, gateResult.reason);
+						if (!signal?.aborted) {
+							currentContext.messages.push(stopMessage);
+							stream.push({ type: "message_start", message: stopMessage });
+							stream.push({ type: "message_end", message: stopMessage });
+						}
 						newMessages.push(stopMessage);
-						stream.push({ type: "message_start", message: stopMessage });
-						stream.push({ type: "message_end", message: stopMessage });
 						await emitTurnEnd(
 							stream,
 							currentContext,
@@ -1472,6 +1486,12 @@ async function runLoopBody(
 					endAgentStream(stream, newMessages, telemetry, stepCounter.count);
 					return;
 				}
+				if (gateResult?.toolChoice !== undefined) {
+					hostToolChoice = gateResult.toolChoice;
+					// Final admission restrictions supersede earlier soft requirements too.
+					softRequiredTool = undefined;
+					softSatisfies = undefined;
+				}
 
 				if (!turnOpen) {
 					stream.push({ type: "turn_start" });
@@ -1486,7 +1506,9 @@ async function runLoopBody(
 					if (agentPauseGate.paused) await waitForProcessPause(config, signal);
 					message = await streamAssistantResponse(
 						currentContext,
-						config,
+						gateResult?.maxTokens === undefined
+							? config
+							: { ...config, maxTokens: Math.min(config.maxTokens ?? Infinity, gateResult.maxTokens) },
 						signal,
 						stream,
 						telemetry,
@@ -1805,11 +1827,15 @@ async function runLoopBody(
 					hasMoreToolCalls = true;
 				}
 
-				await emitTurnEnd(stream, currentContext, message, toolResults, config, signal, {
+				const stopAtBoundary = await emitTurnEnd(stream, currentContext, message, toolResults, config, signal, {
 					additionalMessages,
 					willContinue: hasMoreToolCalls && !isDeadlineExceeded(config.deadline),
 				});
 				turnOpen = false;
+				if (stopAtBoundary) {
+					endAgentStream(stream, newMessages, telemetry, stepCounter.count);
+					return;
+				}
 
 				if (isDeadlineExceeded(config.deadline)) {
 					endAgentStream(stream, newMessages, telemetry, stepCounter.count);
@@ -2208,7 +2234,7 @@ async function streamAssistantResponse(
 	try {
 		return await runInActiveSpan(chatSpan, async () => {
 			onProviderStart?.();
-			let response = await streamFunction(model, llmContext, {
+			const providerOptions = withProviderRequestGate({
 				...config,
 				apiKey,
 				metadata: resolvedMetadata,
@@ -2223,6 +2249,7 @@ async function streamAssistantResponse(
 				cursorOnToolResult: collectCursorToolResult,
 				liveSteering: providerCall.liveSteering,
 			});
+			let response = await streamFunction(model, llmContext, providerOptions);
 			if (promptToolWireTools && ownedDialect) {
 				// Re-materialize in-band tool-call text as native toolCall content blocks
 				// so the rest of the loop executes them unchanged. When the model starts
@@ -2332,7 +2359,10 @@ async function streamAssistantResponse(
 					const event = next.value;
 					if (event.type === "done" || event.type === "error") {
 						let finalMessage = recoverTransientErrorToolTurn(
-							retainCompletedToolCalls(await response.result(), completedToolCallIds),
+							retainCompletedToolCalls(
+								withProviderRequestError(await response.result(), providerOptions.signal),
+								completedToolCallIds,
+							),
 							context.tools ?? [],
 						);
 						if (harmonyMitigationEnabled) {
@@ -2625,7 +2655,10 @@ async function streamAssistantResponse(
 
 			try {
 				let trailing = recoverTransientErrorToolTurn(
-					retainCompletedToolCalls(await response.result(), completedToolCallIds),
+					retainCompletedToolCalls(
+						withProviderRequestError(await response.result(), providerOptions.signal),
+						completedToolCallIds,
+					),
 					context.tools ?? [],
 				);
 				if (harmonyMitigationEnabled) {
@@ -3733,7 +3766,7 @@ async function executeToolCalls(
 				caughtError = e;
 				result = {
 					content: [{ type: "text", text: e instanceof Error ? e.message : String(e) }],
-					details: {},
+					details: e instanceof Error && "context" in e && isRecord(e.context) ? e.context : {},
 				};
 				isError = true;
 			}

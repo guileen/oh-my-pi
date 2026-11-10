@@ -3,7 +3,14 @@ import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import type { ModelSpec } from "@oh-my-pi/pi-catalog/types";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { cfgCompaction } from "@oh-my-pi/pi-coding-agent/session/context-settings";
-import { resolveSpeculationMethod } from "@oh-my-pi/pi-coding-agent/session/compaction-methods";
+import {
+	DEFAULT_COMPACTION_METHOD_ORDER,
+	type EngineCompactionMethod,
+	isCompactionMethod,
+	resolveCompactionMethodOrder,
+	resolveMethodSettings,
+	resolveSpeculationMethod,
+} from "@oh-my-pi/pi-coding-agent/session/compaction-methods";
 
 /** Resolve Bedrock support from the authored identity and compat rules, not generated model data. */
 function getBedrockCompactionModel() {
@@ -30,5 +37,58 @@ describe("Bedrock native compaction method selection", () => {
 
 		expect(resolveSpeculationMethod(model, compaction)).toBe("remote");
 		expect(resolveSpeculationMethod({ ...model, remoteCompaction: { enabled: false } }, compaction)).toBe("soft");
+	});
+});
+
+describe("automatic QA method selection", () => {
+	test.each([{ methodOrder: ["qaonly"] }, { methodOrder: ["qaonly", "soft"] }])(
+		"preserves the configured QA order %j",
+		({ methodOrder }) => {
+			const compaction = cfgCompaction.get(Settings.isolated({ "compaction.methodOrder": methodOrder }));
+			expect(compaction.methodOrder).toEqual(methodOrder);
+			expect(resolveCompactionMethodOrder(compaction.methodOrder)).toEqual([...methodOrder]);
+			expect(isCompactionMethod("qaonly")).toBe(true);
+		},
+	);
+
+	test("filters invalid entries and duplicates without adding a paid fallback", () => {
+		expect(resolveCompactionMethodOrder(["qaonly", "invalid", "qaonly", null])).toEqual(["qaonly"]);
+		expect(resolveCompactionMethodOrder(["qaonly", "soft", "qaonly", "remote"])).toEqual([
+			"qaonly",
+			"soft",
+			"remote",
+		]);
+	});
+
+	test("keeps automatic defaults unchanged", () => {
+		expect(DEFAULT_COMPACTION_METHOD_ORDER).toEqual(["remote", "snapcompact", "handoff", "shake", "soft"]);
+		expect(cfgCompaction.get(Settings.isolated()).methodOrder).toEqual(DEFAULT_COMPACTION_METHOD_ORDER);
+	});
+
+	test.each([
+		{ methodOrder: ["qaonly"] },
+		{ methodOrder: ["qaonly", "soft"] },
+		{ methodOrder: ["remote", "qaonly", "soft"] },
+	])("does not speculate past a selected local QA method %j", ({ methodOrder }) => {
+		const model = { ...getBedrockCompactionModel(), remoteCompaction: { enabled: false } };
+		const compaction = cfgCompaction.get(Settings.isolated({ "compaction.methodOrder": methodOrder }));
+		expect(resolveSpeculationMethod(model, compaction)).toBeUndefined();
+	});
+
+	test("keeps earlier eligible remote speculation ahead of QA", () => {
+		const compaction = cfgCompaction.get(
+			Settings.isolated({ "compaction.methodOrder": ["remote", "qaonly", "soft"] }),
+		);
+		expect(resolveSpeculationMethod(getBedrockCompactionModel(), compaction)).toBe("remote");
+		expect(resolveSpeculationMethod(getBedrockCompactionModel(), compaction, { skipRemote: true })).toBeUndefined();
+	});
+
+	test("rejects QA at the generic summary engine boundary", () => {
+		const compaction = cfgCompaction.get(Settings.isolated({ "compaction.methodOrder": ["qaonly", "soft"] }));
+		expect(() => resolveMethodSettings(compaction, "qaonly" as EngineCompactionMethod)).toThrow();
+		expect(resolveMethodSettings(compaction, "soft")).toMatchObject({
+			strategy: "context-full",
+			remoteEnabled: false,
+		});
 	});
 });

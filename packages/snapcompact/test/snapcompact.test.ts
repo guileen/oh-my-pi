@@ -1444,7 +1444,9 @@ describe("frame data budget", () => {
 		const opus = getBundledModel("anthropic", "claude-opus-5-5");
 		const sol = getBundledModel("openai-codex", "gpt-6.1-sol");
 		const throughProxy = (model: Model) => buildModel({ ...toModelSpec(model), baseUrl: "https://proxy.example/v1" });
-		expect(snapcompact.frameDataBytesBudget(opus)).toBe(60_000_000);
+		withEnv({ ANTHROPIC_BASE_URL: undefined, CLAUDE_CODE_USE_FOUNDRY: undefined }, () => {
+			expect(snapcompact.frameDataBytesBudget(opus)).toBe(60_000_000);
+		});
 		expect(snapcompact.frameDataBytesBudget(sol)).toBe(12_000_000);
 		// A rerouted baseUrl has its own body limit; so does a host without a budget rule.
 		expect(snapcompact.frameDataBytesBudget(throughProxy(opus))).toBe(budget);
@@ -1472,7 +1474,9 @@ describe("frame data budget", () => {
 		// Opus's 1932px frames: 17 under the default, 352 under Anthropic's share.
 		const opusShape = snapcompact.resolveShape(opus);
 		expect(snapcompact.maxFramesForDataBudget(opusShape, budget)).toBe(17);
-		expect(snapcompact.maxFramesForDataBudget(opusShape, snapcompact.frameDataBytesBudget(opus))).toBe(352);
+		withEnv({ ANTHROPIC_BASE_URL: undefined, CLAUDE_CODE_USE_FOUNDRY: undefined }, () => {
+			expect(snapcompact.maxFramesForDataBudget(opusShape, snapcompact.frameDataBytesBudget(opus))).toBe(352);
+		});
 	});
 
 	it.each([
@@ -1832,12 +1836,14 @@ describe("archive helpers", () => {
 		expect(snapcompact.providerFrameBudget(ramp)).toBe(snapcompact.DEFAULT_PROVIDER_IMAGE_BUDGET);
 		// The frame cap never exceeds the default frame count, even under a 600-image budget.
 		const opus = getBundledModel("anthropic", "claude-opus-5-5");
-		expect(snapcompact.providerImageBudget(opus)).toBe(600);
-		expect(snapcompact.providerFrameBudget(opus)).toBe(snapcompact.MAX_FRAMES_DEFAULT);
-		// The strictest Anthropic budget (200k-window models) still holds a full default archive.
-		expect(snapcompact.MAX_FRAMES_DEFAULT).toBeLessThanOrEqual(
-			snapcompact.providerImageBudget(getBundledModel("anthropic", "claude-haiku-4-5")),
-		);
+		withEnv({ ANTHROPIC_BASE_URL: undefined, CLAUDE_CODE_USE_FOUNDRY: undefined }, () => {
+			expect(snapcompact.providerImageBudget(opus)).toBe(600);
+			expect(snapcompact.providerFrameBudget(opus)).toBe(snapcompact.MAX_FRAMES_DEFAULT);
+			// The strictest Anthropic budget (200k-window models) still holds a full default archive.
+			expect(snapcompact.MAX_FRAMES_DEFAULT).toBeLessThanOrEqual(
+				snapcompact.providerImageBudget(getBundledModel("anthropic", "claude-haiku-4-5")),
+			);
+		});
 	});
 });
 

@@ -72,6 +72,7 @@ import { getHeaderCaseInsensitive, resolveCacheRetention } from "./utils";
 import { AssistantMessageEventStream } from "./utils/event-stream";
 import { applyGlyphCodec } from "./utils/glyph-codec";
 import { wrapLeakedThinkingStream } from "./utils/leaked-thinking-stream";
+import { withProviderRequestGate } from "./utils/provider-request";
 import { withThinkingLoopGuard } from "./utils/thinking-loop";
 import { withTransportFetch } from "./utils/transport-fetch";
 
@@ -824,6 +825,7 @@ export function stream<TApi extends Api>(
 	context: Context,
 	options?: OptionsForApi<TApi>,
 ): AssistantMessageEventStream {
+	options = withProviderRequestGate((options ?? {}) as StreamOptions) as OptionsForApi<TApi>;
 	if (model.resolveHeaders) {
 		return withResolvedModelHeaders(model, options?.signal, resolvedModel => stream(resolvedModel, context, options));
 	}
@@ -1165,6 +1167,7 @@ export function streamSimple<TApi extends Api>(
 	context: Context,
 	options?: SimpleStreamOptions,
 ): AssistantMessageEventStream {
+	options = withProviderRequestGate(options ?? {});
 	const sessionOptions = withInferenceSessionId(options);
 	// Unverified thinking is opt-in: without a requested effort the request is
 	// byte-identical to a non-reasoning model's.
@@ -1818,6 +1821,7 @@ function mapOptionsForApi<TApi extends Api>(
 		onSseEvent: options?.onSseEvent,
 		execHandlers: options?.execHandlers,
 		fetch: options?.fetch,
+		beforeProviderRequest: options?.beforeProviderRequest,
 		fallbacks: options?.fallbacks,
 		acceptEmptyResponse: options?.acceptEmptyResponse,
 		anthropicPrefixMismatchBehavior: options?.anthropicPrefixMismatchBehavior,

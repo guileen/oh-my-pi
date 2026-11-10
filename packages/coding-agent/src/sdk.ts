@@ -49,6 +49,7 @@ import {
 	formatAdvisorContextPrompt,
 	formatAdvisorMemoryPrompt,
 } from "./advisor";
+import type { DiscoveredAdvisors } from "./advisor/config";
 import { AsyncJobManager, type AsyncJobManagerApi } from "./async";
 import { AutoLearnController, buildAutoLearnInstructions } from "./autolearn/controller";
 import { createAutoresearchExtension } from "./autoresearch";
@@ -202,6 +203,11 @@ import {
 import type { AuthStorage } from "./session/auth-storage";
 import { CostCapError, type CostGateApi, guardStreamFn } from "./session/cost-gate";
 import {
+	canUseRemoteCompaction,
+	resolveCompactionMethodOrder,
+	resolveMethodSettings,
+} from "./session/compaction-methods";
+import {
 	CREDENTIAL_DISABLED_NOTICE_SOURCE,
 	formatCredentialDisabledNotice,
 } from "./session/credential-disabled-notice";
@@ -226,6 +232,7 @@ import {
 	clampProviderContextImages,
 	dropUnreadableContextImages,
 } from "./session/provider-image-budget";
+import { qaCheckpointError } from "./session/qa-rollover";
 import {
 	expandDefaultRetryFallbackChains,
 	findRetryFallbackCandidates,
@@ -306,6 +313,7 @@ import {
 	supportsExternalThinking,
 	type Tool,
 	type ToolSession,
+	type GraphToolOptions,
 	WebSearchTool,
 	WriteTool,
 	warmupLspServers,
@@ -422,6 +430,11 @@ import {
 import { cfgPlanEnabled } from "./plan-mode/settings";
 import { cfgSecretsEnabled } from "./secrets/settings";
 import {
+	cfgCompaction,
+	cfgCompactionEnabled,
+	cfgCompactionExperimentalContextManagement,
+	cfgCompactionMethodOrder,
+	cfgCompactionMidTurnEnabled,
 	cfgSnapcompactShape,
 	cfgSnapcompactSystemPrompt,
 	cfgSnapcompactToolResults,
@@ -568,8 +581,16 @@ function applyMCPEnvironment(result: { exaApiKeys: string[] }): void {
 
 // Types
 export interface CreateAgentSessionOptions {
+	/** Trusted host authorization for each Graph Run observation. */
+	authorizeGraphRunObservation?: (runId: string) => boolean | Promise<boolean>;
+	/** Trusted Graph policy for the top-level session; subagents receive none. */
+	graph?: GraphToolOptions;
 	/** Working directory for project-local discovery. Default: getProjectDir() */
 	cwd?: string;
+	/** Durable launch admission hook for managed runtimes; ordinary sessions omit it. */
+	prepareServiceLaunch?: ToolSession["prepareServiceLaunch"];
+	/** Move tool argument transforms before host authorization and disable speculation. */
+	requireExactToolArguments?: boolean;
 	/** Additional workspace directories beyond cwd (multi-root), absolute or cwd-relative. */
 	additionalDirectories?: string[];
 	/** Global config directory. Default: ~/.omp/agent */
@@ -971,6 +992,8 @@ export interface CreateAgentSessionOptions {
 	 * (see `title.generator`). Only the interactive TUI sets this; ignored for subagents. Default: false.
 	 */
 	autoTitle?: boolean;
+	/** Disable auxiliary inference and its ambient advisor inputs for isolated runtime hosts. */
+	disableAuxiliaryInference?: boolean;
 	/**
 	 * Defer `confirm` reserve-policy fallback until AgentSession prompt-time UI is configured.
 	 * ACP uses this while capabilities are negotiated without enabling UI-only tools.
@@ -1021,6 +1044,8 @@ export class SessionModelRestoreError extends Error {
 export interface CreateAgentSessionResult {
 	/** The created session */
 	session: AgentSession;
+	/** In exact-argument mode, the host must transform arguments before authorizing them. */
+	prepareToolArguments?: (args: Record<string, unknown>) => Record<string, unknown>;
 	/** Extensions result (loaded extensions + runtime) */
 	extensionsResult: LoadExtensionsResult;
 	/** Update tool UI context (interactive mode) */
@@ -2082,9 +2107,13 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 	};
 	const activeRepoContextPromise = logger.time("resolveActiveRepoContext", resolveRepoContext, cwd);
 	activeRepoContextPromise.catch(() => {});
-	const watchdogFilesPromise = logger.time("discoverWatchdogFiles", () => discoverWatchdogFiles(cwd, agentDir));
+	const watchdogFilesPromise = options.disableAuxiliaryInference
+		? Promise.resolve([])
+		: logger.time("discoverWatchdogFiles", () => discoverWatchdogFiles(cwd, agentDir));
 	watchdogFilesPromise.catch(() => {});
-	const advisorConfigsPromise = logger.time("discoverAdvisorConfigs", () => discoverAdvisorConfigs(cwd, agentDir));
+	const advisorConfigsPromise: Promise<DiscoveredAdvisors> = options.disableAuxiliaryInference
+		? Promise.resolve({ advisors: [], sharedInstructions: undefined, warnings: [] })
+		: logger.time("discoverAdvisorConfigs", () => discoverAdvisorConfigs(cwd, agentDir));
 	advisorConfigsPromise.catch(() => {});
 	const promptTemplatesPromise = options.promptTemplates
 		? Promise.resolve(options.promptTemplates)
@@ -2575,6 +2604,8 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			canPromptUser: options.interactivePrompts ?? options.hasUI ?? false,
 			advertiseHeadlessAsk: options.advertiseHeadlessAsk,
 			settingsApproval: options.settingsApproval === true && !isSubagentSession,
+			authorizeGraphRunObservation: options.authorizeGraphRunObservation,
+			graph: isSubagentSession ? undefined : options.graph,
 			tuiTranscript,
 			// Explicit resolvers retain their existing pass-through contract. Ordinary
 			// sessions inherit stored affinity into the child's own provider session.
@@ -2639,6 +2670,32 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				session ? session.trackEvalExecution(execution, abortController) : execution,
 			getSessionId: () => sessionManager.getSessionId?.() ?? null,
 			isDisposed: () => session?.isDisposed ?? false,
+			qaRollover: {
+				isEnabled: () =>
+					session
+						? session.isQaRolloverEnabled()
+						: cfgCompactionEnabled.get(settings) &&
+							!cfgCompactionExperimentalContextManagement.get(settings) &&
+							(isSubagentSession || cfgCompactionMidTurnEnabled.get(settings)) &&
+							resolveCompactionMethodOrder(cfgCompactionMethodOrder.get(settings)).find(
+								method =>
+									method !== "remote" ||
+									canUseRemoteCompaction(model, resolveMethodSettings(cfgCompaction.get(settings), "remote")),
+							) === "qaonly" &&
+							typeof model?.contextWindow === "number" &&
+							Number.isFinite(model.contextWindow) &&
+							model.contextWindow > 0,
+				accept: (checkpoint, signal) => {
+					if (!session) {
+						throw qaCheckpointError(
+							"QA_NOT_ACTIVE",
+							"QA rollover is unavailable before session startup.",
+							checkpoint.cycleId,
+						);
+					}
+					return session.acceptQaCheckpoint(checkpoint, signal);
+				},
+			},
 			getHindsightSessionState: () => session?.getHindsightSessionState(),
 			getMnemopiSessionState: () => session?.getMnemopiSessionState(),
 			getAgentId: () => resolvedAgentId,
@@ -2679,6 +2736,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			queueLaunchCompletion: notification =>
 				session?.queueLaunchCompletion(notification) ??
 				Promise.reject(new Error("Session unavailable for launch completion delivery")),
+			prepareServiceLaunch: options.prepareServiceLaunch,
 			registerDisposeCallback: callback => {
 				disposeCallbacks.add(callback);
 				return () => disposeCallbacks.delete(callback);
@@ -2809,6 +2867,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 
 		// Create built-in tools (already wrapped with meta notice formatting)
 		await logger.time("createAllTools", createTools, toolSession, options.toolNames);
+		let newContextExperimentalMode = cfgCompactionExperimentalContextManagement.get(settings);
 		const initialBrowserPreludeAvailable = shouldFilterBrowserMCPForPrelude({
 			restrictToolNames,
 			browserEnabled: cfgBrowserEnabled.get(settings),
@@ -3846,6 +3905,24 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		for (const [name, tool] of toolRegistry) {
 			nativeToolsByName.set(name, tool);
 		}
+		// Model discovery may finish after the initial built-in pass. Install the
+		// QA acknowledgement before building the first provider-facing prompt.
+		if (
+			!toolRegistry.has("new_context") &&
+			!cfgCompactionExperimentalContextManagement.get(settings) &&
+			(!restrictToolNames || normalizeToolNames(options.toolNames ?? []).includes("new_context"))
+		) {
+			const newContextTool = await BUILTIN_TOOLS.new_context(toolSession);
+			if (newContextTool) {
+				const wrapped = wrapToolWithMetaNotice(newContextTool);
+				toolRegistry.set(newContextTool.name, wrapped);
+				builtInToolNames.push(newContextTool.name);
+				builtInRegistryToolNames.add(newContextTool.name);
+				nativeToolsByName.set(newContextTool.name, wrapped);
+				activeToolNames.add(newContextTool.name);
+				newContextExperimentalMode = false;
+			}
+		}
 		if (!restrictToolNames && !toolRegistry.has("goal") && cfgGoalEnabled.get(settings)) {
 			const goalTool = await logger.time("createTools:goal:session", HIDDEN_TOOLS.goal, toolSession);
 			if (goalTool) {
@@ -4025,7 +4102,10 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			const removed: string[] = [];
 			for (const name of SETTINGS_GATED_BUILTIN_TOOL_NAMES) {
 				const registered = toolRegistry.has(name);
-				if (!plan.isAllowed(name)) {
+				const replaceNewContext =
+					name === "new_context" &&
+					newContextExperimentalMode !== cfgCompactionExperimentalContextManagement.get(settings);
+				if (!plan.isAllowed(name) || (name === "new_context" && !planned.has(name))) {
 					nativeToolsByName.delete(name);
 					if (!registered || !isBuiltIn(name)) continue;
 					toolRegistry.delete(name);
@@ -4033,22 +4113,32 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					removed.push(name);
 					continue;
 				}
-				if (!planned.has(name) || (registered && (isBuiltIn(name) || nativeToolsByName.has(name)))) continue;
+				if (
+					!planned.has(name) ||
+					(registered && (isBuiltIn(name) || nativeToolsByName.has(name)) && !replaceNewContext)
+				) {
+					continue;
+				}
 				const tool = await logger.time(`createTools:${name}:settings`, BUILTIN_TOOLS[name], toolSession);
 				if (!tool) continue;
 				const native = wrapToolWithMetaNotice(tool);
 				nativeToolsByName.set(name, native);
-				if (registered) continue;
+				if (name === "new_context") {
+					newContextExperimentalMode = cfgCompactionExperimentalContextManagement.get(settings);
+				}
+				if (registered && (!replaceNewContext || !isBuiltIn(name))) continue;
 				toolRegistry.set(name, new ExtensionToolWrapper(native, extensionRunner) as Tool);
 				builtInRegistryToolNames.add(name);
 				// As at construction: explicit lists activate requested names, session-managed
 				// force-includes and the checkpoint/rewind pair; other auto-includes stay inactive.
-				const activate = explicitToolNames
-					? explicitToolNames.has(name) ||
-						SESSION_MANAGED_BUILTIN_TOOL_NAMES.includes(name) ||
-						name === "checkpoint" ||
-						name === "rewind"
-					: native.hidden !== true;
+				const activate = registered
+					? toolSession.isToolActive?.(name) === true
+					: explicitToolNames
+						? explicitToolNames.has(name) ||
+							SESSION_MANAGED_BUILTIN_TOOL_NAMES.includes(name) ||
+							name === "checkpoint" ||
+							name === "rewind"
+						: native.hidden !== true;
 				added.push({ name, builtIn: true, activate });
 			}
 			const custom = await reconcileSettingsGatedCustomTools();
@@ -4188,13 +4278,15 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			// Held until AgentSession exists: before then the root cost gate does not, so a request
 			// sent from the startup prompt render could go out ungated (see `startCompression` below).
 			deferCompression: true,
-			compress: createSkillDescriptionCompressor(modelRegistry, settings, {
-				getCostGate: currentCostGate,
-				getTelemetry: () =>
-					agent
-						? resolveTelemetry(agent.telemetry, agent.sessionId)
-						: resolveTelemetry(options.telemetry, providerSessionId),
-			}),
+			compress: options.disableAuxiliaryInference
+				? undefined
+				: createSkillDescriptionCompressor(modelRegistry, settings, {
+						getCostGate: currentCostGate,
+						getTelemetry: () =>
+							agent
+								? resolveTelemetry(agent.telemetry, agent.sessionId)
+								: resolveTelemetry(options.telemetry, providerSessionId),
+					}),
 		});
 		// Instructions from MCP servers the host connects outside `mcpManager`
 		// (ACP client-declared servers); installed via
@@ -4794,7 +4886,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		// expire, so idle gaps do not force a full-prefix cache re-write.
 		// Spawned/one-shot sessions opt out via `cacheWarming: false`.
 		const cacheWarmer: CacheWarmer | undefined =
-			options.cacheWarming === false
+			options.disableAuxiliaryInference || options.cacheWarming === false
 				? undefined
 				: new CacheWarmer({
 						stream: (model, context, streamOptions) => primaryStreamFn(model, context, streamOptions),
@@ -4818,7 +4910,9 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		// through getters, so mid-session settings UI toggles take effect without
 		// a session recreate. The single shared host keeps its evidence across
 		// toggles; per-turn coordinator close never touches it.
-		const speculativeToolExecution = createSpeculativeToolExecutionConfig(settings, toolSession, extensionRunner);
+		const speculativeToolExecution = options.requireExactToolArguments
+			? undefined
+			: createSpeculativeToolExecutionConfig(settings, toolSession, extensionRunner);
 
 		agent = new Agent({
 			initialState: {
@@ -4905,7 +4999,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			},
 			cursorExecHandlers,
 			getCursorTools: () => (toolSession.xdev ? listXdevTools(toolSession.xdev) : []),
-			transformToolCallArguments,
+			transformToolCallArguments: options.requireExactToolArguments ? undefined : transformToolCallArguments,
 			// A stray sloppy payload in plain text becomes a real edit tool call so
 			// the normal pipeline (validation, approval, rendering) executes it.
 			transformAssistantMessage: async (message, signal) => {
@@ -5015,6 +5109,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		// (defaulting to read/grep/glob).
 		const advisorToolSession: ToolSession = {
 			...toolSession,
+			qaRollover: undefined,
 			// The primary may carry a dormant xd:// write transport. Advisors use
 			// their own configured tool slate, so a selected write is always full.
 			deviceOnlyWrite: undefined,
@@ -5157,8 +5252,16 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			createAdvisorTransformProviderContext: () => createTransformProviderContext(),
 			onPayload,
 			onResponse,
-			sideStreamFn: settingsAwareStreamFn,
-			advisorStreamFn: settingsAwareStreamFn,
+			sideStreamFn: options.disableAuxiliaryInference
+				? () => {
+						throw new Error("Auxiliary inference is disabled for this session");
+					}
+				: settingsAwareStreamFn,
+			advisorStreamFn: options.disableAuxiliaryInference
+				? () => {
+						throw new Error("Auxiliary inference is disabled for this session");
+					}
+				: settingsAwareStreamFn,
 			convertToLlm: convertToLlmFinal,
 			rebuildSystemPrompt,
 			getXdevToolEntries: () => (toolSession.xdev ? xdevEntries(toolSession.xdev) : []),
@@ -5215,7 +5318,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			// resource frame would otherwise report every server as empty.
 			advisorMcpResources: cursorMcpResources,
 			titleSystemPrompt: options.titleSystemPrompt,
-			autoTitle: options.autoTitle === true && !isSubagentSession,
+			autoTitle: options.disableAuxiliaryInference !== true && options.autoTitle === true && !isSubagentSession,
 		});
 		hasSession = true;
 		// The session now owns its cost gate; the interactive TUI starts compression after its first frame.
@@ -5284,6 +5387,11 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			// `find.enabled: auto` follows the judge role; a role change only touches
 			// the prompt when it actually adds or removes `find`.
 			cfgModelRoles.listen(session, () => reconcileGatedTools({ refreshPrompt: false }));
+			disposeCallbacks.add(
+				session.subscribe(event => {
+					if (event.type === "model_changed") void reconcileGatedTools({ refreshPrompt: false });
+				}),
+			);
 		}
 		// Backfill the resumed advisor spend without blocking startup: the scan
 		// runs after the session is live, so `--resume` no longer scales with the
@@ -5746,7 +5854,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					maxRetryDelayMs: agent.maxRetryDelayMs,
 					getToolContext: toolCall => toolContextStore.getContext(toolCall),
 					streamFn: primaryStreamFn,
-					transformToolCallArguments,
+					transformToolCallArguments: options.requireExactToolArguments ? undefined : transformToolCallArguments,
 					// No fallback resolver: only `learn`/`manage_skill` execute here (the rest are refused
 					// copies), and the primary's resolver could reach main-session MCP tools.
 					intentTracing: agent.intentTracing,
@@ -5931,6 +6039,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		startupCleanup.move();
 		return {
 			session,
+			prepareToolArguments: options.requireExactToolArguments ? transformToolCallArguments : undefined,
 			extensionsResult,
 			setToolUIContext,
 			mcpManager: ownedMcpManager ?? (mcpManager instanceof MCPManager ? mcpManager : undefined),

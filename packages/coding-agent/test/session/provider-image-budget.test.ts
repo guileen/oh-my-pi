@@ -24,6 +24,9 @@ import {
 	clampProviderContextImages,
 } from "@oh-my-pi/pi-coding-agent/session/provider-image-budget";
 import { isRecord } from "@oh-my-pi/pi-utils";
+import { withOfficialAnthropicEndpoint } from "../helpers/anthropic-endpoint";
+
+withOfficialAnthropicEndpoint();
 
 const UMANS_MODEL = buildModel({
 	id: "umans-glm-5.2",

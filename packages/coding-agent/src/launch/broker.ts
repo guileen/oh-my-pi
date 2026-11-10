@@ -1,3 +1,4 @@
+import { Database } from "bun:sqlite";
 import * as fs from "node:fs/promises";
 // node:net only serves the TCP readiness probe for user daemons (`connectPort`).
 import * as net from "node:net";
@@ -29,19 +30,36 @@ import {
 	DAEMON_PTY_COLUMNS,
 	DAEMON_PTY_ROWS,
 	DAEMON_RUNTIME_DIR_ENV,
+	DAEMON_LAUNCH_LEDGER_FILE,
+	DAEMON_LAUNCH_LEDGER_MARKER,
+	type DaemonLaunchMetadata,
+	type LaunchDisposition,
 	type DaemonCompletionNotification,
 	type DaemonOperation,
 	type DaemonRpcResult,
 	type DaemonSignal,
 	type DaemonWireRequest,
+	parseDaemonLaunchMetadata,
+	parseLaunchDisposition,
 	parseDaemonSnapshot,
 	parseDaemonSpec,
 	parseDaemonWireMessage,
 	parseDaemonWireRequest,
 } from "./protocol";
 import { resolveDaemonSpawnOptions } from "./spawn-options";
+import {
+	type OwnedSupervisorRef,
+	type OwnedSupervisorStatus,
+	prepareOwnedSupervisor,
+	launchOwnedSupervisor,
+	parseOwnedSupervisorRef,
+	queryOwnedSupervisor,
+	signalOwnedSupervisor,
+	sendOwnedSupervisorInput,
+} from "./owned-supervisor";
 import { renderTerminalOutput } from "./terminal-output";
 import { quotePosixArgv } from "../utils/shell-quote";
+import { writeFileAtomically } from "../utils/atomic-file";
 
 const DEFAULT_IDLE_GRACE_MS = 3_000;
 const MAX_REQUEST_BYTES = 1024 * 1024;
@@ -101,6 +119,8 @@ interface ManagedDaemon {
 	input?: Bun.FileSink;
 	pty?: PtySession;
 	generation: number;
+	/** Native startup may yield before a PID exists; absence is not exit evidence. */
+	nativeStarting?: boolean;
 	stopRequested: boolean;
 	logReady: boolean;
 	portReady: boolean;
@@ -113,10 +133,15 @@ interface ManagedDaemon {
 	pendingCompletions: DaemonCompletionNotification[];
 	completionSubscriptionId?: string;
 	persistQueue: Promise<void>;
+	/** Exit visibility must wait for durable completion publication, not only process exit. */
+	settling?: Promise<void>;
 	/** Serialized spec last written (or recovered); a write is skipped while unchanged. */
 	persistedSpec?: string;
 	/** Serialized metadata last written (or recovered); a write is skipped while unchanged. */
 	persistedMeta?: string;
+	launch?: DaemonLaunchMetadata;
+	supervisor?: OwnedSupervisorRef;
+	supervisorLaunched?: boolean;
 }
 
 interface BrokerLease {
@@ -129,6 +154,37 @@ interface DaemonLogRead {
 	text: string;
 	terminalOutput: string;
 	cursor: number;
+}
+
+interface StoredLaunch extends DaemonLaunchMetadata {
+	payload: string | null;
+	name?: string;
+	disposition: LaunchDisposition;
+	daemon?: DaemonSnapshot;
+	readyTimedOut?: boolean;
+	cancelled: boolean;
+	startError?: string;
+	recoveryUncertain?: boolean;
+}
+
+interface StoredLaunchOwner {
+	latest_epoch: string;
+	fenced_through_epoch?: string;
+}
+
+function launchPayload(operation: Extract<DaemonOperation, { op: "start" }>): string {
+	return JSON.stringify({
+		spec: {
+			...operation.spec,
+			env: Object.fromEntries(
+				Object.keys(operation.spec.env)
+					.sort()
+					.map(key => [key, operation.spec.env[key]]),
+			),
+		},
+		owner: operation.owner,
+		replace: operation.replace ?? false,
+	});
 }
 
 function terminalState(state: DaemonSnapshot["state"]): boolean {
@@ -162,20 +218,26 @@ function orderDaemonsForListing(snapshots: DaemonSnapshot[]): DaemonSnapshot[] {
 	return [...active, ...terminal.slice(0, MAX_TERMINAL_DAEMONS_LISTED)];
 }
 
-/**
- * Reap a recovered non-detached daemon snapshot in place. Already-terminal
- * records are left untouched so `list` keeps their real {@link DaemonSnapshot.exitedAt}
- * for recency ranking; records that were still alive when the previous broker
- * exited are marked `exited` at `now`, since their process died with that broker
- * (issue #6517). Returns whether the record was reaped.
- */
-function reapRecoveredSnapshot(snapshot: DaemonSnapshot, now: number): boolean {
-	if (terminalState(snapshot.state)) return false;
-	snapshot.pid = undefined;
-	snapshot.state = "exited";
-	snapshot.exitedAt = now;
-	snapshot.exitReason = "previous broker exited";
-	return true;
+/** A persisted PID is diagnostic only; it cannot establish recovered ownership. */
+function markUncontrolled(snapshot: DaemonSnapshot, reason: string): void {
+	snapshot.state = "unknown";
+	snapshot.exitReason = reason;
+	snapshot.readyPending = undefined;
+}
+
+async function readOwnedStatus(ref: OwnedSupervisorRef): Promise<OwnedSupervisorStatus> {
+	try {
+		return await queryOwnedSupervisor(ref);
+	} catch (error) {
+		return {
+			generation: ref.generation,
+			state: "unknown",
+			pid: null,
+			exitCode: null,
+			signal: null,
+			error: `Supervisor ownership cannot be verified: ${String(error)}`,
+		};
+	}
 }
 
 /** Mirror per-condition readiness progress into the snapshot so clients can see which condition is unmet. */
@@ -188,13 +250,6 @@ function syncReadyPending(record: ManagedDaemon): void {
 	if (!record.logReady) pending.push("log");
 	if (!record.portReady) pending.push("port");
 	record.snapshot.readyPending = pending.length > 0 ? pending : undefined;
-}
-
-/** Replace `filePath` via a pid-scoped temp file so readers never see a partial write. */
-async function writeFileAtomic(filePath: string, content: string): Promise<void> {
-	const tempPath = `${filePath}.${process.pid}.tmp`;
-	await Bun.write(tempPath, content);
-	await fs.rename(tempPath, filePath);
 }
 
 async function fileTextSlice(filePath: string, head: boolean): Promise<string> {
@@ -431,6 +486,12 @@ class DaemonBroker {
 	readonly #endpointCheckMs: number;
 	#endpointTimer: NodeJS.Timeout | undefined;
 	readonly #records = new Map<string, ManagedDaemon>();
+	#launchLedger: Database | undefined;
+	#launchLedgerError: string | undefined;
+	#launchLedgerOpening: Promise<void> | undefined;
+	readonly #launches = new Map<string, StoredLaunch>();
+	readonly #launchOwners = new Map<string, StoredLaunchOwner>();
+	readonly #launchTasks = new Map<string, Promise<DaemonRpcResult>>();
 	/**
 	 * Names reserved by an in-flight `start` before its record lands in
 	 * `#records`. Requests dispatch concurrently, and `#start` awaits (cwd stat,
@@ -471,6 +532,8 @@ class DaemonBroker {
 
 	async run(onListening?: () => void): Promise<void> {
 		await this.#recoverRecords();
+		await this.#openLaunchLedger();
+		await this.#recoverLaunches();
 		this.#server = await IpcServer.listen(
 			this.#endpoint,
 			{ framing: "lines", maxFrameBytes: MAX_REQUEST_BYTES },
@@ -485,6 +548,24 @@ class DaemonBroker {
 	async shutdown(): Promise<void> {
 		if (this.#shuttingDown) return this.#finished.promise;
 		this.#shuttingDown = true;
+		// Fence accepted starts before awaiting any process cleanup. A start may still
+		// be preparing its log or waiting for the native PTY startup callback.
+		for (const launch of this.#launches.values()) {
+			if (launch.disposition.final) continue;
+			launch.cancelled = true;
+			if (!this.#launchLedgerError) {
+				try {
+					this.#persistLaunch(launch);
+				} catch {
+					// Disk failure must not prevent best-effort termination of real processes.
+				}
+			}
+		}
+		for (const record of this.#records.values()) {
+			if (record.launch && record.snapshot.pid !== undefined && !terminalState(record.snapshot.state))
+				await this.#stopRecord(record, 2_000);
+		}
+		await Promise.allSettled(this.#launchTasks.values());
 		clearTimeout(this.#idleTimer);
 		this.#idleTimer = undefined;
 		clearInterval(this.#endpointTimer);
@@ -505,6 +586,8 @@ class DaemonBroker {
 		this.#sockets.clear();
 		this.#clients.clear();
 		await this.#server?.close();
+		this.#launchLedger?.close();
+		this.#launchLedger = undefined;
 		this.#finished.resolve();
 	}
 
@@ -632,6 +715,24 @@ class DaemonBroker {
 			} finally {
 				if (controller && this.#inFlight.get(id)?.controller === controller) this.#inFlight.delete(id);
 			}
+			// Freeze the observed generation before yielding: a live record may settle or
+			// restart while an unrelated response is waiting on persistence.
+			if ("daemon" in result) result = { ...result, daemon: { ...result.daemon } };
+			else if ("daemons" in result)
+				result = { ...result, daemons: result.daemons.map(snapshot => ({ ...snapshot })) };
+			const snapshots = "daemon" in result ? [result.daemon] : "daemons" in result ? result.daemons : [];
+			const settlements: Promise<void>[] = [];
+			for (const snapshot of snapshots) {
+				const record = this.#records.get(snapshot.name);
+				if (
+					terminalState(snapshot.state) &&
+					record?.snapshot.id === snapshot.id &&
+					record.snapshot.startedAt === snapshot.startedAt &&
+					record.settling
+				)
+					settlements.push(record.settling);
+			}
+			if (settlements.length) await Promise.all(settlements);
 			socket.send(JSON.stringify({ id, ok: true, result }));
 			if (request.operation.op === "shutdown") setTimeout(() => void this.shutdown(), 10);
 		} catch (error) {
@@ -645,7 +746,16 @@ class DaemonBroker {
 			case "ping":
 				return { op: "ping", projectDir: this.#projectDir };
 			case "start":
-				return this.#start(operation.spec, operation.owner, operation.replace, operation.awaitReady);
+				if (operation.launch) await this.#ensureLaunchLedger();
+				return operation.launch
+					? this.#startOwned(operation)
+					: this.#start(operation.spec, operation.owner, operation.replace, operation.awaitReady);
+			case "fence_owner":
+				await this.#ensureLaunchLedger();
+				return this.#fenceOwner(operation);
+			case "reconcile_launch":
+				await this.#ensureLaunchLedger();
+				return { op: "reconcile_launch", disposition: await this.#reconcileLaunch(operation) };
 			case "list": {
 				await Promise.all([...this.#records.values()].map(record => this.#refreshDetached(record)));
 				return {
@@ -668,10 +778,26 @@ class DaemonBroker {
 				return this.#send(operation);
 			case "stop": {
 				const record = this.#record(operation.name);
-				if (operation.id === undefined || operation.id === record.snapshot.id) {
+				if (
+					(operation.id === undefined || operation.id === record.snapshot.id) &&
+					(operation.generation === undefined || operation.generation === String(record.snapshot.startedAt))
+				) {
 					await this.#stopRecord(record, operation.timeoutMs);
 				}
 				return { op: "stop", daemon: record.snapshot };
+			}
+			case "stop_owned": {
+				const record = this.#record(operation.name);
+				if (
+					record.snapshot.id !== operation.id ||
+					String(record.snapshot.startedAt) !== operation.generation ||
+					!record.launch ||
+					record.launch.session_owner_id !== operation.session_owner_id ||
+					BigInt(record.launch.owner_epoch) > BigInt(operation.through_epoch)
+				)
+					throw new Error("Owned service generation cannot be confirmed");
+				await this.#stopRecord(record, operation.timeoutMs);
+				return { op: "stop_owned", daemon: record.snapshot };
 			}
 			case "restart":
 				return this.#restart(operation.name);
@@ -687,7 +813,410 @@ class DaemonBroker {
 		}
 	}
 
-	async #start(spec: DaemonSpec, owner?: string, replace = false, awaitReady = true): Promise<DaemonRpcResult> {
+	async #openLaunchLedger(create = false): Promise<void> {
+		const ledgerPath = path.join(this.#runtimeDir, DAEMON_LAUNCH_LEDGER_FILE);
+		const markerPath = path.join(this.#runtimeDir, DAEMON_LAUNCH_LEDGER_MARKER);
+		try {
+			const [exists, retained] = await Promise.all([Bun.file(ledgerPath).exists(), Bun.file(markerPath).exists()]);
+			if (!exists && !retained && !create) return;
+			if (retained && !exists) throw new Error("Retained launch ledger is missing");
+			if (exists && (await fs.stat(ledgerPath)).size < 100) throw new Error("Retained launch ledger is truncated");
+			const db = new Database(ledgerPath, { create: !exists });
+			this.#launchLedger = db;
+			if (exists) {
+				// Never repair a retained ledger into an empty healthy database.
+				const check = db.query("PRAGMA quick_check").get() as { quick_check: string } | null;
+				if (check?.quick_check !== "ok") throw new Error("Launch ledger integrity check failed");
+				const tables = db
+					.query("SELECT name FROM sqlite_master WHERE type='table' AND name IN ('launches', 'owners')")
+					.all();
+				if (tables.length !== 2) throw new Error("Retained launch ledger schema is incomplete");
+				db.query("SELECT id, data FROM launches LIMIT 0").all();
+				db.query("SELECT id, data FROM owners LIMIT 0").all();
+			}
+			db.exec("PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL;");
+			if (!exists)
+				db.exec(
+					"CREATE TABLE launches (id TEXT PRIMARY KEY, data TEXT NOT NULL); CREATE TABLE owners (id TEXT PRIMARY KEY, data TEXT NOT NULL)",
+				);
+			for (const row of db.query("SELECT data FROM launches").all() as { data: string }[]) {
+				const decoded: unknown = JSON.parse(row.data);
+				if (
+					!isRecord(decoded) ||
+					(decoded.payload !== null && typeof decoded.payload !== "string") ||
+					typeof decoded.cancelled !== "boolean"
+				)
+					throw new Error("Malformed retained launch");
+				const launch = {
+					...decoded,
+					...parseDaemonLaunchMetadata(decoded),
+					disposition: parseLaunchDisposition(decoded.disposition),
+					daemon: decoded.daemon === undefined ? undefined : parseDaemonSnapshot(decoded.daemon),
+				} as StoredLaunch;
+				if (launch.disposition.launch_intent_id !== launch.launch_intent_id)
+					throw new Error("Retained launch identity mismatch");
+				this.#launches.set(launch.launch_intent_id, launch);
+			}
+			for (const row of db.query("SELECT id, data FROM owners").all() as { id: string; data: string }[]) {
+				const owner: StoredLaunchOwner = JSON.parse(row.data);
+				if (
+					!/^(0|[1-9][0-9]*)$/.test(owner.latest_epoch) ||
+					(owner.fenced_through_epoch !== undefined && !/^(0|[1-9][0-9]*)$/.test(owner.fenced_through_epoch))
+				)
+					throw new Error("Malformed retained owner epoch");
+				this.#launchOwners.set(row.id, owner);
+			}
+			if (!retained) {
+				const marker = await fs.open(markerPath, "wx", 0o600);
+				try {
+					await marker.writeFile("1\n");
+					await marker.sync();
+				} finally {
+					await marker.close();
+				}
+				if (process.platform !== "win32") {
+					const dir = await fs.open(this.#runtimeDir, "r");
+					try {
+						await dir.sync();
+					} finally {
+						await dir.close();
+					}
+				}
+			}
+		} catch (error) {
+			this.#launchLedgerError = error instanceof Error ? error.message : String(error);
+			logger.warn("Daemon launch ledger unavailable", { error: this.#launchLedgerError });
+		}
+	}
+
+	async #ensureLaunchLedger(): Promise<void> {
+		if (this.#launchLedgerOpening) return this.#launchLedgerOpening;
+		if (this.#launchLedger || this.#launchLedgerError) return;
+		this.#launchLedgerOpening = this.#openLaunchLedger(true);
+		try {
+			await this.#launchLedgerOpening;
+		} finally {
+			this.#launchLedgerOpening = undefined;
+		}
+	}
+
+	#requireLaunchLedger(): Database {
+		if (!this.#launchLedger || this.#launchLedgerError)
+			throw new Error(`cleanup_failed: ${this.#launchLedgerError ?? "Launch ledger unavailable"}`);
+		return this.#launchLedger;
+	}
+
+	#persistLaunch(launch: StoredLaunch): void {
+		try {
+			this.#requireLaunchLedger()
+				.query("INSERT OR REPLACE INTO launches (id, data) VALUES (?, ?)")
+				.run(launch.launch_intent_id, JSON.stringify(launch));
+		} catch (error) {
+			this.#launchLedgerError = error instanceof Error ? error.message : String(error);
+			throw error;
+		}
+	}
+
+	#persistLaunchOwner(id: string, owner: StoredLaunchOwner): void {
+		try {
+			this.#requireLaunchLedger()
+				.query("INSERT OR REPLACE INTO owners (id, data) VALUES (?, ?)")
+				.run(id, JSON.stringify(owner));
+			this.#launchOwners.set(id, owner);
+		} catch (error) {
+			this.#launchLedgerError = error instanceof Error ? error.message : String(error);
+			throw error;
+		}
+	}
+
+	#unknownLaunch(id: string, message: string): LaunchDisposition {
+		return {
+			launch_intent_id: id,
+			state: "unknown",
+			service: null,
+			outcome: null,
+			final: false,
+			error: { code: "cleanup_failed", message, retryable: true },
+		};
+	}
+
+	#cancelledLaunch(id: string): LaunchDisposition {
+		return {
+			launch_intent_id: id,
+			state: "cancelled_before_launch",
+			service: null,
+			outcome: null,
+			final: true,
+			error: null,
+		};
+	}
+
+	#launchAllowed(metadata: DaemonLaunchMetadata): boolean {
+		const launch = this.#launches.get(metadata.launch_intent_id);
+		const owner = this.#launchOwners.get(metadata.session_owner_id);
+		return (
+			!this.#shuttingDown &&
+			!this.#launchLedgerError &&
+			!!launch &&
+			!launch.cancelled &&
+			!launch.disposition.final &&
+			(owner?.fenced_through_epoch === undefined ||
+				BigInt(metadata.owner_epoch) > BigInt(owner.fenced_through_epoch)) &&
+			(owner === undefined || BigInt(metadata.owner_epoch) >= BigInt(owner.latest_epoch))
+		);
+	}
+
+	#dispositionFor(record: ManagedDaemon): LaunchDisposition {
+		if (record.snapshot.state === "unknown")
+			return this.#unknownLaunch(
+				record.launch!.launch_intent_id,
+				record.snapshot.exitReason ?? "Process ownership is unknown",
+			);
+		const terminal = terminalState(record.snapshot.state);
+		return {
+			launch_intent_id: record.launch!.launch_intent_id,
+			state: terminal ? "terminal" : record.snapshot.pid === undefined ? "pending" : "running",
+			service: { id: record.snapshot.id, generation: String(record.snapshot.startedAt) },
+			outcome: terminal
+				? record.stopRequested
+					? "cancelled"
+					: record.snapshot.state === "failed"
+						? "error"
+						: "ok"
+				: null,
+			final: terminal,
+			error: null,
+		};
+	}
+
+	#updateLaunchFromRecord(record: ManagedDaemon): void {
+		if (!record.launch || this.#launchLedgerError) return;
+		const launch = this.#launches.get(record.launch.launch_intent_id);
+		if (!launch) return;
+		const updated: StoredLaunch = {
+			...launch,
+			daemon: { ...record.snapshot },
+			disposition: this.#dispositionFor(record),
+		};
+		try {
+			this.#persistLaunch(updated);
+			launch.daemon = updated.daemon;
+			launch.disposition = updated.disposition;
+		} catch {
+			// Keep native lifetime callbacks and exact-generation cleanup running.
+			// The latched ledger failure makes all later reconciliation uncertain.
+			logger.warn("Failed to retain daemon launch lifetime", { launch_intent_id: launch.launch_intent_id });
+		}
+	}
+
+	#matchingLaunchRecord(launch: StoredLaunch): ManagedDaemon | undefined {
+		const record = launch.name === undefined ? undefined : this.#records.get(launch.name);
+		return record &&
+			launch.daemon &&
+			record.snapshot.id === launch.daemon.id &&
+			record.snapshot.startedAt === launch.daemon.startedAt &&
+			record.snapshot.owner === launch.session_owner_id
+			? record
+			: undefined;
+	}
+
+	async #recoverLaunches(): Promise<void> {
+		if (this.#launchLedgerError) return;
+		for (const launch of this.#launches.values()) {
+			if (launch.disposition.final || launch.recoveryUncertain) continue;
+			if (!launch.daemon) {
+				// No native startup is possible before its identity is committed here.
+				launch.cancelled = true;
+				launch.disposition = this.#cancelledLaunch(launch.launch_intent_id);
+			} else {
+				const record = this.#matchingLaunchRecord(launch);
+				if (record && record.supervisor && record.snapshot.state !== "unknown") {
+					launch.disposition = this.#dispositionFor(record);
+					launch.daemon = { ...record.snapshot };
+				} else {
+					launch.disposition = this.#unknownLaunch(
+						launch.launch_intent_id,
+						"Broker restarted without recoverable process identity",
+					);
+					launch.recoveryUncertain = true;
+				}
+			}
+			this.#persistLaunch(launch);
+		}
+	}
+
+	#startOwned(operation: Extract<DaemonOperation, { op: "start" }>): Promise<DaemonRpcResult> {
+		this.#requireLaunchLedger();
+		const metadata = operation.launch!;
+		if (operation.owner !== metadata.session_owner_id)
+			throw new Error("Launch owner does not match session_owner_id");
+		const payload = launchPayload(operation);
+		let launch = this.#launches.get(metadata.launch_intent_id);
+		if (launch) {
+			if (
+				launch.session_owner_id !== metadata.session_owner_id ||
+				launch.owner_epoch !== metadata.owner_epoch ||
+				(launch.payload !== null && launch.payload !== payload)
+			)
+				throw new Error("idempotency_conflict: launch identity or payload differs");
+			if (launch.recoveryUncertain || launch.disposition.state === "unknown")
+				throw new Error("cleanup_failed: Launch lifetime is unknown; reconcile before further use");
+			if (launch.cancelled && !launch.disposition.final)
+				throw new Error("Launch cancellation is pending; reconcile before further use");
+			const task = this.#launchTasks.get(metadata.launch_intent_id);
+			if (task) return task;
+			if (launch.startError) throw new Error(launch.startError);
+			if (launch.daemon)
+				return Promise.resolve({
+					op: "start",
+					daemon: launch.daemon,
+					readyTimedOut: launch.readyTimedOut ?? false,
+				});
+			throw new Error("Launch was cancelled before process creation");
+		}
+		const owner = this.#launchOwners.get(metadata.session_owner_id);
+		if (
+			this.#shuttingDown ||
+			(owner?.fenced_through_epoch !== undefined &&
+				BigInt(metadata.owner_epoch) <= BigInt(owner.fenced_through_epoch)) ||
+			(owner && BigInt(metadata.owner_epoch) < BigInt(owner.latest_epoch))
+		)
+			throw new Error("Launch owner epoch is fenced");
+		// Both durable writes are synchronous, before scheduling any asynchronous preparation.
+		this.#persistLaunchOwner(metadata.session_owner_id, { ...owner, latest_epoch: metadata.owner_epoch });
+		launch = {
+			...metadata,
+			payload,
+			name: operation.spec.name,
+			cancelled: false,
+			disposition: {
+				launch_intent_id: metadata.launch_intent_id,
+				state: "pending",
+				service: null,
+				outcome: null,
+				final: false,
+				error: null,
+			},
+		};
+		this.#persistLaunch(launch);
+		this.#launches.set(metadata.launch_intent_id, launch);
+		const accepted = launch;
+		const task = Promise.resolve().then(async () => {
+			try {
+				const result = await this.#start(
+					operation.spec,
+					operation.owner,
+					operation.replace,
+					operation.awaitReady,
+					metadata,
+				);
+				if (result.op !== "start") throw new Error("Unexpected owned launch result");
+				const record = this.#matchingLaunchRecord(accepted);
+				if (record) this.#updateLaunchFromRecord(record);
+				accepted.readyTimedOut = result.readyTimedOut;
+				this.#persistLaunch(accepted);
+				return result;
+			} catch (error) {
+				accepted.startError = error instanceof Error ? error.message : String(error);
+				if (!accepted.daemon) {
+					accepted.cancelled = true;
+					accepted.disposition = this.#cancelledLaunch(metadata.launch_intent_id);
+				}
+				if (!this.#launchLedgerError) this.#persistLaunch(accepted);
+				throw error;
+			} finally {
+				this.#launchTasks.delete(metadata.launch_intent_id);
+			}
+		});
+		this.#launchTasks.set(metadata.launch_intent_id, task);
+		return task;
+	}
+
+	#fenceOwner(operation: Extract<DaemonOperation, { op: "fence_owner" }>): DaemonRpcResult {
+		this.#requireLaunchLedger();
+		const owner = this.#launchOwners.get(operation.session_owner_id);
+		const through =
+			owner?.fenced_through_epoch !== undefined &&
+			BigInt(owner.fenced_through_epoch) > BigInt(operation.through_epoch)
+				? owner.fenced_through_epoch
+				: operation.through_epoch;
+		this.#persistLaunchOwner(operation.session_owner_id, {
+			latest_epoch: owner?.latest_epoch ?? through,
+			fenced_through_epoch: through,
+		});
+		return { op: "fence_owner", fenced_through_epoch: through };
+	}
+
+	async #reconcileLaunch(operation: Extract<DaemonOperation, { op: "reconcile_launch" }>): Promise<LaunchDisposition> {
+		if (this.#launchLedgerError || !this.#launchLedger)
+			return this.#unknownLaunch(operation.launch_intent_id, this.#launchLedgerError ?? "Launch ledger unavailable");
+		let launch = this.#launches.get(operation.launch_intent_id);
+		if (
+			launch &&
+			(launch.session_owner_id !== operation.session_owner_id || launch.owner_epoch !== operation.owner_epoch)
+		)
+			throw new Error("idempotency_conflict: launch owner differs");
+		if (!launch) {
+			if (operation.mode === "inspect")
+				return this.#unknownLaunch(operation.launch_intent_id, "Launch intent is not recorded");
+			// Absence may mean the entire old runtime directory/ledger was lost.
+			// Block all delayed arrivals durably, but do not claim a past process
+			// never existed when no acceptance record survives to prove that.
+			launch = {
+				...operation,
+				payload: null,
+				cancelled: true,
+				recoveryUncertain: true,
+				disposition: this.#unknownLaunch(operation.launch_intent_id, "Launch acceptance history is unavailable"),
+			};
+			this.#persistLaunch(launch);
+			this.#launches.set(operation.launch_intent_id, launch);
+			return launch.disposition;
+		}
+		if (operation.mode === "cancel") {
+			launch.cancelled = true;
+			this.#persistLaunch(launch);
+			const preparing = this.#matchingLaunchRecord(launch);
+			if (preparing?.snapshot.pid !== undefined && !terminalState(preparing.snapshot.state))
+				await this.#stopRecord(preparing, 2_000);
+			// Includes preparation and native delayed startup, not merely visible records.
+			await this.#launchTasks.get(operation.launch_intent_id)?.catch(() => undefined);
+		}
+		if (this.#launchLedgerError) return this.#unknownLaunch(operation.launch_intent_id, this.#launchLedgerError);
+		if (launch.recoveryUncertain) return launch.disposition;
+		if (launch.disposition.final) return launch.disposition;
+		const record = this.#matchingLaunchRecord(launch);
+		if (!record) {
+			if (operation.mode === "cancel" && !launch.daemon)
+				launch.disposition = this.#cancelledLaunch(operation.launch_intent_id);
+			else if (!this.#launchTasks.has(operation.launch_intent_id))
+				launch.disposition = this.#unknownLaunch(
+					operation.launch_intent_id,
+					"Exact service generation is unavailable",
+				);
+		} else {
+			await this.#refreshDetached(record);
+			if (operation.mode === "cancel" && !terminalState(record.snapshot.state))
+				await this.#stopRecord(record, 2_000);
+			this.#updateLaunchFromRecord(record);
+			if (this.#launchLedgerError) return this.#unknownLaunch(operation.launch_intent_id, this.#launchLedgerError);
+			if (operation.mode === "cancel" && !terminalState(record.snapshot.state))
+				launch.disposition = this.#unknownLaunch(
+					operation.launch_intent_id,
+					"Exact service generation did not confirm termination",
+				);
+		}
+		this.#persistLaunch(launch);
+		return launch.disposition;
+	}
+
+	async #start(
+		spec: DaemonSpec,
+		owner?: string,
+		replace = false,
+		awaitReady = true,
+		launch?: DaemonLaunchMetadata,
+	): Promise<DaemonRpcResult> {
 		if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,47}$/.test(spec.name)) {
 			throw new Error("Daemon name must be 1-48 letters, numbers, dots, underscores, or hyphens");
 		}
@@ -709,9 +1238,10 @@ class DaemonBroker {
 		try {
 			const existing = this.#records.get(spec.name);
 			if (existing) await this.#refreshDetached(existing);
+			if (launch && !this.#launchAllowed(launch)) throw new Error("Launch cancelled before replacement");
 			if (existing && !terminalState(existing.snapshot.state)) {
 				if (!replace) throw new Error(`Daemon ${spec.name} is already ${existing.snapshot.state}`);
-				await this.#stopRecord(existing, 2_000);
+				await this.#stopRecord(existing, 2_000, launch);
 				if (!terminalState(existing.snapshot.state)) throw new Error(`Daemon ${spec.name} did not stop`);
 			}
 			if (existing && existing.pendingCompletions.length > 0 && !replace) {
@@ -730,6 +1260,7 @@ class DaemonBroker {
 			if (!stat.isDirectory()) throw new Error(`Daemon cwd is not a directory: ${spec.cwd}`);
 			const dir = path.join(this.#runtimeDir, "daemons", spec.name);
 			const now = Date.now();
+			if (launch && !this.#launchAllowed(launch)) throw new Error("Launch cancelled before process creation");
 			record = {
 				spec,
 				snapshot: {
@@ -737,7 +1268,7 @@ class DaemonBroker {
 					id: crypto.randomUUID(),
 					state: "starting",
 					createdAt: now,
-					startedAt: now,
+					startedAt: Math.max(now, existing?.snapshot.startedAt ?? 0),
 					restartCount: 0,
 					outputBytes: 0,
 					owner,
@@ -758,13 +1289,14 @@ class DaemonBroker {
 				completionCapable: owner !== undefined && this.#completionSubscriptions.has(owner),
 				completionSubscriptionId: owner === undefined ? undefined : this.#completionSubscriptions.get(owner),
 				pendingCompletions: replace ? (existing?.pendingCompletions ?? []) : [],
+				launch,
 			};
 			syncReadyPending(record);
 			this.#records.set(spec.name, record);
+			await this.#launch(record);
 		} finally {
 			this.#startingNames.delete(spec.name);
 		}
-		await this.#launch(record);
 		let readyTimedOut = false;
 		if (spec.ready && awaitReady && !terminalState(record.snapshot.state)) {
 			// Wake on the sticky readyAt marker or any terminal state, not the live
@@ -787,10 +1319,14 @@ class DaemonBroker {
 		record.generation++;
 		const generation = record.generation;
 		record.stopRequested = false;
+		record.supervisor = undefined;
+		record.supervisorLaunched = false;
 		record.snapshot.state = record.spec.ready ? "starting" : "running";
 		record.snapshot.persist = record.spec.persist;
 		record.snapshot.detached = record.spec.detached;
-		record.snapshot.startedAt = Date.now();
+		// startedAt is the externally retained generation; never reuse it during
+		// same-millisecond restart, even though the logical service id is stable.
+		record.snapshot.startedAt = Math.max(record.snapshot.startedAt + 1, Date.now());
 		record.snapshot.readyAt = undefined;
 		record.snapshot.exitedAt = undefined;
 		record.snapshot.exitCode = undefined;
@@ -803,16 +1339,48 @@ class DaemonBroker {
 		record.readinessBuffer = "";
 		record.outputOffset = 0;
 		this.#persist(record);
+		if (record.launch) {
+			const launch = this.#launches.get(record.launch.launch_intent_id);
+			if (!launch || !this.#launchAllowed(record.launch)) {
+				record.stopRequested = true;
+				record.snapshot.state = "exited";
+				record.snapshot.exitedAt = Date.now();
+				this.#persist(record);
+				await record.log?.close();
+				record.log = undefined;
+				return;
+			}
+			// Persist the exact identity before entering a native startup that can yield.
+			launch.daemon = { ...record.snapshot };
+			launch.disposition = this.#dispositionFor(record);
+			this.#persistLaunch(launch);
+		}
+		record.nativeStarting = true;
 		try {
-			if (record.spec.detached) await this.#launchDetached(record, generation);
+			if (record.launch && !this.#launchAllowed(record.launch)) throw new Error("Launch owner was fenced");
+			if (!record.spec.pty && process.platform !== "win32") await this.#launchOwned(record, generation);
+			else if (record.spec.detached) await this.#launchDetached(record, generation);
 			else if (record.spec.pty) await this.#launchPty(record, generation);
 			else this.#launchPipe(record, generation);
 			if (record.spec.ready?.port !== undefined) void this.#pollPort(record, generation, record.spec.ready);
+			if (record.launch && !this.#launchAllowed(record.launch)) await this.#stopRecord(record, 2_000);
 			this.#markReady(record);
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
+			if (record.supervisor && record.supervisorLaunched) {
+				markUncontrolled(record.snapshot, `Supervisor startup outcome unknown: ${message}`);
+				this.#updateLaunchFromRecord(record);
+				this.#persist(record);
+				return;
+			}
+			if (record.snapshot.pid !== undefined) {
+				await this.#stopRecord(record, 2_000);
+				if (!terminalState(record.snapshot.state)) throw error;
+			}
 			record.log?.append(`Daemon launch failed: ${message}\n`);
 			await this.#settle(record, generation, undefined, message);
+		} finally {
+			record.nativeStarting = false;
 		}
 	}
 
@@ -895,6 +1463,7 @@ class DaemonBroker {
 		const pid = await started.promise;
 		if (pid !== undefined && generation === record.generation) {
 			record.snapshot.pid = pid;
+			this.#updateLaunchFromRecord(record);
 			this.#persist(record);
 		}
 	}
@@ -911,6 +1480,7 @@ class DaemonBroker {
 		record.process = process;
 		record.input = process.stdin;
 		record.snapshot.pid = process.pid;
+		this.#updateLaunchFromRecord(record);
 		this.#persist(record);
 		const stdout = this.#drain(record, generation, process.stdout);
 		const stderr = this.#drain(record, generation, process.stderr);
@@ -924,6 +1494,16 @@ class DaemonBroker {
 	async #launchDetached(record: ManagedDaemon, generation: number): Promise<void> {
 		const logPath = path.join(record.dir, LOG_FILE);
 		const output = await fs.open(logPath, "a", 0o600);
+		if (
+			generation !== record.generation ||
+			record.stopRequested ||
+			terminalState(record.snapshot.state) ||
+			(record.launch && !this.#launchAllowed(record.launch))
+		) {
+			await output.close();
+			record.stopRequested = true;
+			throw new Error("Launch owner was fenced");
+		}
 		try {
 			const process = Bun.spawn([record.spec.application, ...record.spec.args], {
 				cwd: record.spec.cwd,
@@ -933,6 +1513,7 @@ class DaemonBroker {
 			});
 			record.process = process;
 			record.snapshot.pid = process.pid;
+			this.#updateLaunchFromRecord(record);
 			this.#persist(record);
 			process.unref();
 			void process.exited
@@ -942,6 +1523,91 @@ class DaemonBroker {
 				);
 		} finally {
 			await output.close();
+		}
+	}
+
+	async #launchOwned(record: ManagedDaemon, generation: number): Promise<void> {
+		// Automatic relaunch has no broker writer. Rotate before the new owner
+		// appends, so this generation cannot consume an earlier readiness marker.
+		if (!record.log) record.log = await DaemonLog.open(record.dir);
+		await record.log?.close();
+		record.log = undefined;
+		const identity = `${record.snapshot.id}:${record.snapshot.startedAt}`;
+		const dir = path.join(record.dir, `owned-${record.snapshot.id}-${record.snapshot.startedAt}`);
+		const ref = await prepareOwnedSupervisor(
+			dir,
+			{
+				application: record.spec.application,
+				args: record.spec.args,
+				cwd: record.spec.cwd,
+				env: workerEnvFromParent(record.spec.env),
+				outputPath: path.join(record.dir, LOG_FILE),
+				maxOutputBytes: MAX_LOG_BYTES,
+				previousOutputPath: path.join(record.dir, PREVIOUS_LOG_FILE),
+			},
+			{ generation: identity },
+		);
+		record.supervisor = ref;
+		await this.#persist(record, true);
+		if (
+			generation !== record.generation ||
+			record.stopRequested ||
+			(record.launch && !this.#launchAllowed(record.launch))
+		)
+			throw new Error("Launch owner was fenced");
+		record.supervisorLaunched = true;
+		launchOwnedSupervisor(ref);
+		const deadline = Date.now() + 10_000;
+		let status: OwnedSupervisorStatus;
+		do {
+			status = await readOwnedStatus(ref);
+			if (status.state === "running" || status.state === "exited") break;
+			await Bun.sleep(25);
+		} while (Date.now() < deadline);
+		await this.#applyOwnedStatus(record, generation, status);
+		void this.#monitorRecoveredDetached(record, generation).catch(error => {
+			logger.warn("Failed to monitor owned daemon", { name: record.snapshot.name, error: String(error) });
+		});
+	}
+
+	async #applyOwnedStatus(record: ManagedDaemon, generation: number, status: OwnedSupervisorStatus): Promise<void> {
+		if (
+			generation !== record.generation ||
+			this.#records.get(record.snapshot.name) !== record ||
+			status.generation !== record.supervisor?.generation ||
+			settledState(record.snapshot.state)
+		)
+			return;
+		const previousState = record.snapshot.state;
+		const previousPid = record.snapshot.pid;
+		const previousReason = record.snapshot.exitReason;
+		if (status.state === "exited") {
+			await this.#settle(
+				record,
+				generation,
+				status.exitCode ?? (status.signal === null ? undefined : 128 + status.signal),
+				status.error,
+			);
+		} else if (status.state === "running") {
+			record.snapshot.pid = status.pid ?? undefined;
+			if (record.snapshot.state === "unknown")
+				record.snapshot.state = record.stopRequested ? "stopping" : record.spec.ready ? "starting" : "running";
+			record.snapshot.exitReason = undefined;
+			this.#markReady(record);
+			if (
+				previousState !== record.snapshot.state ||
+				previousPid !== record.snapshot.pid ||
+				previousReason !== undefined
+			) {
+				this.#updateLaunchFromRecord(record);
+				this.#persist(record);
+			}
+		} else {
+			markUncontrolled(record.snapshot, status.error ?? "Supervisor has not confirmed application ownership");
+			if (previousState !== "unknown" || previousReason !== record.snapshot.exitReason) {
+				this.#updateLaunchFromRecord(record);
+				this.#persist(record);
+			}
 		}
 	}
 
@@ -971,7 +1637,7 @@ class DaemonBroker {
 	}
 
 	async #readDetachedOutput(record: ManagedDaemon, generation: number): Promise<void> {
-		if (!record.spec.detached || generation !== record.generation) return;
+		if ((!record.spec.detached && !record.supervisor) || generation !== record.generation) return;
 		const logPath = path.join(record.dir, LOG_FILE);
 		let size: number;
 		try {
@@ -1005,20 +1671,36 @@ class DaemonBroker {
 	}
 
 	async #refreshDetached(record: ManagedDaemon): Promise<void> {
-		if (!record.spec.detached || settledState(record.snapshot.state)) return;
+		if ((record.nativeStarting && !record.supervisorLaunched) || settledState(record.snapshot.state)) {
+			await record.settling;
+			return;
+		}
 		const generation = record.generation;
 		await this.#readDetachedOutput(record, generation);
-		if (generation !== record.generation || record.process) return;
-		const processRef = record.snapshot.pid === undefined ? null : Process.fromPid(record.snapshot.pid);
-		if (processRef?.status() === "running") return;
-		await this.#settle(record, generation);
+		if (generation !== record.generation || (record.nativeStarting && !record.supervisorLaunched)) return;
+		if (record.supervisor) {
+			await this.#applyOwnedStatus(record, generation, await readOwnedStatus(record.supervisor));
+		} else if (record.spec.detached && !record.process && record.snapshot.state !== "unknown") {
+			markUncontrolled(record.snapshot, "Process ownership is unavailable; retained PID will not be adopted");
+			this.#persist(record);
+		}
+		await record.settling;
 	}
 
 	async #monitorRecoveredDetached(record: ManagedDaemon, generation: number): Promise<void> {
 		while (!this.#shuttingDown && generation === record.generation && !settledState(record.snapshot.state)) {
 			await Bun.sleep(100);
 			if (this.#shuttingDown || generation !== record.generation) return;
-			await this.#refreshDetached(record);
+			if (record.snapshot.state === "starting") await this.#refreshDetached(record);
+			else if (record.supervisor)
+				await this.#applyOwnedStatus(record, generation, await readOwnedStatus(record.supervisor));
+			if (
+				record.supervisor &&
+				record.stopRequested &&
+				record.snapshot.state === "stopping" &&
+				!record.nativeStarting
+			)
+				await this.#stopRecord(record, 500);
 		}
 	}
 
@@ -1058,7 +1740,21 @@ class DaemonBroker {
 		registration.socket.send(JSON.stringify(completion));
 	}
 
-	async #settle(record: ManagedDaemon, generation: number, exitCode?: number, error?: string): Promise<void> {
+	#settle(record: ManagedDaemon, generation: number, exitCode?: number, error?: string): Promise<void> {
+		if (record.settling) return record.settling;
+		const pending = this.#finishSettlement(record, generation, exitCode, error);
+		record.settling = pending;
+		return pending.finally(() => {
+			if (record.settling === pending) record.settling = undefined;
+		});
+	}
+
+	async #finishSettlement(
+		record: ManagedDaemon,
+		generation: number,
+		exitCode?: number,
+		error?: string,
+	): Promise<void> {
 		// `restarting` is a settled state (child exited, relaunch timer armed). Any op that
 		// runs #refreshDetached on such a record must not re-settle it: re-entry double-counts
 		// restartCount and overwrites record.restartTimer, orphaning the armed timer so it fires
@@ -1104,6 +1800,7 @@ class DaemonBroker {
 			return;
 		}
 		record.snapshot.state = failed && !record.stopRequested ? "failed" : "exited";
+		this.#updateLaunchFromRecord(record);
 		const completion =
 			record.snapshot.owner !== undefined &&
 			!record.stopRequested &&
@@ -1201,9 +1898,10 @@ class DaemonBroker {
 		// Readiness was actually observed: the sticky readyAt survives a fast
 		// ready→exit, a live "ready" state, or a "running" daemon with no ready spec.
 		const readyObserved = (): boolean =>
-			record.snapshot.readyAt !== undefined ||
-			record.snapshot.state === "ready" ||
-			(record.snapshot.state === "running" && !record.spec.ready);
+			record.snapshot.state !== "unknown" &&
+			(record.snapshot.readyAt !== undefined ||
+				record.snapshot.state === "ready" ||
+				(record.snapshot.state === "running" && !record.spec.ready));
 		const generationEnded = (): boolean =>
 			record.generation !== boundGeneration || record.snapshot.state === "restarting";
 		const condition = (): boolean => {
@@ -1241,7 +1939,11 @@ class DaemonBroker {
 
 	async #send(operation: Extract<DaemonOperation, { op: "send" }>): Promise<DaemonRpcResult> {
 		const record = this.#record(operation.name);
+		const generation = record.generation;
 		await this.#refreshDetached(record);
+		if (generation !== record.generation) throw new Error("Daemon generation changed during send");
+		const supervisor = record.supervisor;
+		if (record.snapshot.state === "unknown") throw new Error("Daemon process ownership is unknown");
 		if (terminalState(record.snapshot.state) || record.snapshot.state === "stopping") {
 			throw new Error(`Daemon ${operation.name} is ${record.snapshot.state}`);
 		}
@@ -1249,15 +1951,24 @@ class DaemonBroker {
 			throw new Error("send requires data or signal");
 		}
 		if (operation.data !== undefined) {
-			if (record.pty) record.pty.write(operation.data);
+			if (supervisor)
+				await sendOwnedSupervisorInput(
+					supervisor,
+					operation.data.endsWith("\r") ? `${operation.data.slice(0, -1)}\n` : operation.data,
+				);
+			else if (record.pty) record.pty.write(operation.data);
 			else if (record.input) {
 				// PTYs interpret Enter as CR; pipe-backed shells require LF to end a line.
 				record.input.write(operation.data.endsWith("\r") ? `${operation.data.slice(0, -1)}\n` : operation.data);
 				await record.input.flush();
 			} else throw new Error(`Daemon ${operation.name} stdin is unavailable`);
 		}
+		if (generation !== record.generation) throw new Error("Daemon generation changed during send");
 		if (operation.signal) {
-			if (process.platform === "win32" && record.pty) {
+			if (supervisor) {
+				const result = await signalOwnedSupervisor(supervisor, SIGNAL_NUMBER[operation.signal], true);
+				await this.#applyOwnedStatus(record, generation, result.status);
+			} else if (process.platform === "win32" && record.pty) {
 				if (operation.signal === "SIGINT") record.pty.write("\u0003");
 				else record.pty.kill();
 			} else {
@@ -1266,58 +1977,101 @@ class DaemonBroker {
 				processRef.killTree(SIGNAL_NUMBER[operation.signal]);
 			}
 		}
+		if (generation !== record.generation) throw new Error("Daemon generation changed during send");
 		return { op: "send", daemon: record.snapshot };
 	}
 
-	async #stopRecord(record: ManagedDaemon, timeoutMs: number): Promise<void> {
+	async #stopRecord(record: ManagedDaemon, timeoutMs: number, replacingLaunch?: DaemonLaunchMetadata): Promise<void> {
+		const generation = record.generation;
 		await this.#refreshDetached(record);
+		if (generation !== record.generation || this.#records.get(record.snapshot.name) !== record) return;
+		const supervisor = record.supervisor;
+		const pty = record.pty;
+		const ended = (): boolean =>
+			generation !== record.generation ||
+			this.#records.get(record.snapshot.name) !== record ||
+			terminalState(record.snapshot.state);
+		// Refresh yields, so the replacement may have been fenced while it was in flight.
+		// Check immediately before changing the target or sending its termination signal.
+		if (replacingLaunch && !this.#launchAllowed(replacingLaunch))
+			throw new Error("Launch cancelled before replacement");
 		if (terminalState(record.snapshot.state)) return;
+		if (record.snapshot.state === "unknown" && !record.supervisor) return;
 		record.stopRequested = true;
 		if (record.restartTimer) {
 			clearTimeout(record.restartTimer);
 			record.restartTimer = undefined;
 			record.snapshot.state = "exited";
 			record.snapshot.exitedAt = Date.now();
+			this.#updateLaunchFromRecord(record);
 			this.#persist(record);
 			await record.log?.close();
 			record.log = undefined;
 			return;
 		}
 		record.snapshot.state = "stopping";
+		this.#updateLaunchFromRecord(record);
 		this.#persist(record);
-		const processRef = record.snapshot.pid === undefined ? null : Process.fromPid(record.snapshot.pid);
-		if (processRef) await processRef.terminate({ group: true, gracefulMs: timeoutMs, timeoutMs: timeoutMs + 1_000 });
-		else record.pty?.kill();
-		const settled = await this.#waitUntil(record, () => terminalState(record.snapshot.state), timeoutMs + 1_000);
-		if (!settled && record.pty) record.pty.kill();
+		if (supervisor) {
+			try {
+				await signalOwnedSupervisor(supervisor, SIGNAL_NUMBER.SIGTERM, true);
+				const stopped = await this.#waitUntil(record, ended, timeoutMs);
+				if (!stopped && !ended()) await signalOwnedSupervisor(supervisor, SIGNAL_NUMBER.SIGKILL, true);
+			} catch (error) {
+				if (generation !== record.generation || this.#records.get(record.snapshot.name) !== record) return;
+				markUncontrolled(record.snapshot, `Supervisor termination is unconfirmed: ${String(error)}`);
+				this.#updateLaunchFromRecord(record);
+				this.#persist(record);
+				return;
+			}
+		} else if (pty) pty.kill();
+		else {
+			const processRef = record.snapshot.pid === undefined ? null : Process.fromPid(record.snapshot.pid);
+			if (record.process && processRef)
+				await processRef.terminate({ group: true, gracefulMs: timeoutMs, timeoutMs: timeoutMs + 1_000 });
+		}
+		const settled = await this.#waitUntil(record, ended, timeoutMs + 1_000);
+		if (!settled && generation === record.generation) pty?.kill();
 	}
 
-	async #restart(name: string): Promise<DaemonRpcResult> {
-		const record = this.#record(name);
-		await this.#stopRecord(record, 2_000);
-		await record.log?.close();
-		record.log = await DaemonLog.open(record.dir);
-		record.stopRequested = false;
-		// Settled history does not need subscription writes, but a new generation
-		// must persist the owner's current capability for crash recovery.
-		const owner = record.snapshot.owner;
-		record.completionCapable = owner !== undefined && this.#completionSubscriptions.has(owner);
-		record.completionSubscriptionId = owner === undefined ? undefined : this.#completionSubscriptions.get(owner);
-		await this.#launch(record);
-		await record.persistQueue;
-		return { op: "restart", daemon: record.snapshot };
+	async #restart(name: string, spec?: DaemonSpec): Promise<DaemonRpcResult> {
+		if (this.#startingNames.has(name)) throw new Error(`Daemon ${name} is already starting`);
+		this.#startingNames.add(name);
+		try {
+			const record = this.#record(name);
+			if (record.launch) throw new Error("Owned service restart requires a new launch intent");
+			if (record.snapshot.state === "unknown")
+				throw new Error("Daemon process ownership is unknown; cannot restart");
+			await this.#stopRecord(record, 2_000);
+			if (!terminalState(record.snapshot.state))
+				throw new Error("Daemon process ownership did not confirm termination");
+			await record.log?.close();
+			record.log = await DaemonLog.open(record.dir);
+			if (spec) record.spec = spec;
+			record.stopRequested = false;
+			// A new generation must persist the owner's current completion capability.
+			const owner = record.snapshot.owner;
+			record.completionCapable = owner !== undefined && this.#completionSubscriptions.has(owner);
+			record.completionSubscriptionId = owner === undefined ? undefined : this.#completionSubscriptions.get(owner);
+			await this.#launch(record);
+			await record.persistQueue;
+			return { op: "restart", daemon: record.snapshot };
+		} finally {
+			this.#startingNames.delete(name);
+		}
 	}
 
 	async #mode(operation: Extract<DaemonOperation, { op: "mode" }>): Promise<DaemonRpcResult> {
 		const record = this.#record(operation.name);
 		await this.#refreshDetached(record);
+		if (record.snapshot.state === "unknown") throw new Error("Daemon process ownership is unknown");
 		if (terminalState(record.snapshot.state) || record.snapshot.state === "stopping") {
 			throw new Error(`Daemon ${operation.name} is ${record.snapshot.state}`);
 		}
 		if (operation.mode === "detached") {
 			if (!record.spec.detached) {
-				record.spec = { ...record.spec, detached: true, pty: false, persist: true };
-				await this.#restart(operation.name);
+				if (record.launch) throw new Error("Owned service detachment requires a new launch intent");
+				await this.#restart(operation.name, { ...record.spec, detached: true, pty: false, persist: true });
 			}
 		} else {
 			if (record.spec.detached && operation.mode === "session") {
@@ -1359,6 +2113,9 @@ class DaemonBroker {
 	#serializeMetadata(record: ManagedDaemon): string {
 		return JSON.stringify({
 			daemon: { ...record.snapshot },
+			launch: record.launch,
+			supervisor: record.supervisor,
+			stopRequested: record.stopRequested,
 			completionEvents: record.completionCapable,
 			completionSubscriptionId: record.completionSubscriptionId,
 			completionPending: record.pendingCompletions.length > 0,
@@ -1370,29 +2127,29 @@ class DaemonBroker {
 		});
 	}
 
-	#persist(record: ManagedDaemon): void {
+	#persist(record: ManagedDaemon, force = false): Promise<void> {
 		const spec = JSON.stringify(record.spec);
 		const metadata = this.#serializeMetadata(record);
-		const writeSpec = spec !== record.persistedSpec;
-		const writeMeta = metadata !== record.persistedMeta;
-		if (!writeSpec && !writeMeta) return;
+		const writeSpec = force || spec !== record.persistedSpec;
+		const writeMeta = force || metadata !== record.persistedMeta;
+		if (!writeSpec && !writeMeta) return record.persistQueue;
 		record.persistedSpec = spec;
 		record.persistedMeta = metadata;
-		record.persistQueue = record.persistQueue
-			.then(async () => {
-				// Spec first: recovery must never find metadata whose spec is not on disk.
-				if (writeSpec) await writeFileAtomic(path.join(record.dir, DAEMON_SPEC_FILE), spec);
-				if (writeMeta) await writeFileAtomic(path.join(record.dir, DAEMON_META_FILE), metadata);
-			})
-			.catch(error => {
-				// Unknown on-disk state: force the next persist to write both files.
-				record.persistedSpec = undefined;
-				record.persistedMeta = undefined;
-				logger.warn("Failed to persist daemon metadata", {
-					name: record.snapshot.name,
-					error: error instanceof Error ? error.message : String(error),
-				});
+		const write = record.persistQueue.then(async () => {
+			// Spec first: recovery must never find metadata whose spec is not on disk.
+			if (writeSpec) await writeFileAtomically(path.join(record.dir, DAEMON_SPEC_FILE), spec, 0o600, true);
+			if (writeMeta) await writeFileAtomically(path.join(record.dir, DAEMON_META_FILE), metadata, 0o600, true);
+		});
+		record.persistQueue = write.catch(error => {
+			// Unknown on-disk state: force the next persist to write both files.
+			record.persistedSpec = undefined;
+			record.persistedMeta = undefined;
+			logger.warn("Failed to persist daemon metadata", {
+				name: record.snapshot.name,
+				error: error instanceof Error ? error.message : String(error),
 			});
+		});
+		return write;
 	}
 
 	async #setRecordCompletionCapability(owner: string, capable: boolean): Promise<void> {
@@ -1435,20 +2192,40 @@ class DaemonBroker {
 				const { meta: decoded, spec: storedSpec, legacyLayout } = stored;
 				const snapshot = parseDaemonSnapshot(decoded.daemon);
 				const spec = parseDaemonSpec(storedSpec);
-				const processRef = snapshot.pid === undefined ? null : Process.fromPid(snapshot.pid);
-				const recoverableExit = !terminalState(snapshot.state) && snapshot.state !== "stopping";
-				const detached = spec.detached && recoverableExit && processRef?.status() === "running";
-				const recoveredDead = recoverableExit && !detached;
-				if (!detached) {
-					// Reap only records that were still alive when the previous broker
-					// exited; already-terminal records keep their real exit time so
-					// `list` ranks exited history by true recency (issue #6517).
-					if (!terminalState(snapshot.state) && processRef) {
-						await processRef.terminate({ group: true, gracefulMs: 500, timeoutMs: 2_000 });
+				let supervisor: OwnedSupervisorRef | undefined;
+				if ("supervisor" in decoded && decoded.supervisor !== undefined) {
+					try {
+						const ref = parseOwnedSupervisorRef(decoded.supervisor);
+						if (
+							ref.dir !== path.join(dir, `owned-${snapshot.id}-${snapshot.startedAt}`) ||
+							ref.generation !== `${snapshot.id}:${snapshot.startedAt}`
+						)
+							throw new Error("Supervisor identity does not match daemon generation");
+						supervisor = ref;
+					} catch {
+						// Keep unresolved work visible and reserved; malformed authority cannot permit replacement.
 					}
-					reapRecoveredSnapshot(snapshot, Date.now());
-				} else if (snapshot.state === "restarting") {
-					snapshot.state = spec.ready ? "starting" : "running";
+				}
+				const status = supervisor && !terminalState(snapshot.state) ? await readOwnedStatus(supervisor) : undefined;
+				const detached = status?.state === "running";
+				const recoveredDead = status?.state === "exited";
+				if (!terminalState(snapshot.state)) {
+					if (recoveredDead) {
+						snapshot.exitCode = status.exitCode ?? (status.signal === null ? undefined : 128 + status.signal);
+						snapshot.state =
+							("stopRequested" in decoded && decoded.stopRequested === true) ||
+							snapshot.state === "stopping" ||
+							snapshot.exitCode === 0
+								? "exited"
+								: "failed";
+						snapshot.exitedAt = Date.now();
+						snapshot.pid = undefined;
+						snapshot.exitReason = status.error;
+					} else if (detached) {
+						snapshot.pid = status.pid ?? undefined;
+						if (snapshot.state === "unknown" || snapshot.state === "restarting")
+							snapshot.state = spec.ready ? "starting" : "running";
+					} else markUncontrolled(snapshot, "Process ownership is unavailable; retained PID will not be adopted");
 				}
 				snapshot.persist = spec.persist;
 				snapshot.detached = spec.detached;
@@ -1456,8 +2233,14 @@ class DaemonBroker {
 					spec,
 					snapshot,
 					dir,
+					supervisor,
+					launch:
+						"launch" in decoded && decoded.launch !== undefined
+							? parseDaemonLaunchMetadata(decoded.launch)
+							: undefined,
 					generation: 0,
-					stopRequested: !detached || snapshot.state === "stopping",
+					stopRequested:
+						("stopRequested" in decoded && decoded.stopRequested === true) || snapshot.state === "stopping",
 					logReady: detached && (!spec.ready?.log || snapshot.state === "ready"),
 					portReady: detached && (spec.ready?.port === undefined || snapshot.state === "ready"),
 					readinessBuffer: "",
@@ -1518,7 +2301,7 @@ class DaemonBroker {
 				if (detached && spec.ready?.port !== undefined && snapshot.state !== "ready") {
 					void this.#pollPort(record, record.generation, spec.ready);
 				}
-				if (detached) {
+				if (supervisor && !terminalState(snapshot.state)) {
 					void this.#monitorRecoveredDetached(record, record.generation).catch(error => {
 						logger.warn("Failed to monitor recovered detached daemon", {
 							name: record.snapshot.name,

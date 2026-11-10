@@ -29,7 +29,15 @@ import {
 
 import { declareWorkerHostEntry, installWorkerInbox, isWorkerHostSelector } from "@oh-my-pi/pi-utils/worker-host";
 import { installSqliteLockShim } from "@oh-my-pi/pi-natives/sqlite-locks";
+import { BOT_WORKER_ARG } from "./bots/protocol";
+import type * as BotSmoke from "./bots/smoke";
+import type * as BotWorker from "./bots/worker";
 import { isNativeShell, runNativeShell } from "./cli/native-shell";
+import { GRAPH_WIRE_AUTHOR_ARG, GRAPH_WIRE_READ_ARG, GRAPH_WORKER_ARG } from "./graph/worker-protocol";
+import type * as GraphWorker from "./graph/worker";
+import type * as GraphSmoke from "./graph/smoke";
+import type * as GraphWireAuthorWorker from "./graph/author-worker";
+import type * as GraphWireObserver from "./graph/wire-observer";
 import { extractProfileFlags } from "./cli/profile-bootstrap";
 import {
 	AUTO_UPDATE_WORKER_ARG,
@@ -39,6 +47,7 @@ import {
 	IDA_HOST_WORKER_ARG,
 	LSP_MUX_WORKER_ARG,
 	MNEMOPI_EMBED_SERVER_WORKER_ARG,
+	OWNED_SUPERVISOR_WORKER_ARG,
 	PARENT_WATCHDOG_WORKER_ARG,
 	STATS_ACTIVITY_WORKER_ARG,
 	SUBAGENT_WORKER_ARG,
@@ -154,6 +163,7 @@ async function runSmokeTest(): Promise<void> {
 	const { smokeTestJsEvalWorker } = await import("./eval/js/context-manager");
 	// Other smoke dependencies stay lazy so normal CLI startup does not load their worker clients.
 	const { smokeTestDaemonBroker } = await import("./launch/client");
+	const { smokeTestOwnedSupervisor } = await import("./launch/owned-supervisor-smoke");
 	const { smokeTestLspMux } = await import("./lsp/mux/daemon");
 	const { smokeTestIdaHost } = await import("./ida/client");
 	const { smokeTestBlobBroker } = await import("./blob-broker/daemon");
@@ -183,12 +193,18 @@ async function runSmokeTest(): Promise<void> {
 	await smokeTestTtsWorker();
 	await smokeTestMnemopiEmbedWorker();
 	await smokeTestDaemonBroker();
+	await smokeTestOwnedSupervisor();
 	await smokeTestLspMux();
 	await smokeTestIdaHost();
 	await smokeTestBlobBroker();
 	await smokeTestTerminalOutputWorker();
 	await smokeTestTextPredictDaemon();
 	await smokeTestSubagentWorker();
+	const botSmoke: typeof BotSmoke = require("./bots/smoke");
+	await botSmoke.smokeTestBotWorker();
+	const graphSmoke: typeof GraphSmoke = require("./graph/smoke");
+	await graphSmoke.smokeTestGraphWorker();
+	await graphSmoke.smokeTestGraphWireRead();
 	process.stdout.write("smoke-test: ok\n");
 }
 
@@ -201,7 +217,7 @@ const STT_WORKER_ARG = "__omp_worker_stt";
 const TTS_WORKER_ARG = "__omp_worker_tts";
 const MNEMOPI_EMBED_WORKER_ARG = "__omp_worker_mnemopi_embed";
 
-async function runWorkerEntrypoint(arg: string | undefined): Promise<boolean> {
+async function runWorkerEntrypoint(arg: string | undefined, parameters: readonly string[] = []): Promise<boolean> {
 	if (arg === TINY_WORKER_ARG) {
 		await runTinyWorker();
 		return true;
@@ -318,6 +334,12 @@ async function runWorkerEntrypoint(arg: string | undefined): Promise<boolean> {
 		await startDaemonBrokerFromEnvironment();
 		return true;
 	}
+	if (arg === OWNED_SUPERVISOR_WORKER_ARG) {
+		// Keep the native child-owner runtime out of the ordinary CLI startup graph.
+		const { startOwnedSupervisorFromEnvironment } = await import("./launch/owned-supervisor-worker");
+		await startOwnedSupervisorFromEnvironment();
+		return true;
+	}
 	if (arg === LSP_MUX_WORKER_ARG) {
 		const { startLspMuxFromEnvironment } = await import("./lsp/mux/server");
 		await startLspMuxFromEnvironment();
@@ -344,6 +366,26 @@ async function runWorkerEntrypoint(arg: string | undefined): Promise<boolean> {
 		await installNetworkBootstrap();
 		const { runAutoUpdateWorker } = await import("./cli/auto-update");
 		await runAutoUpdateWorker();
+		return true;
+	}
+	if (arg === BOT_WORKER_ARG) {
+		const worker: typeof BotWorker = require("./bots/worker");
+		await worker.startBotWorkerFromEnvironment();
+		return true;
+	}
+	if (arg === GRAPH_WORKER_ARG) {
+		const worker: typeof GraphWorker = require("./graph/worker");
+		await worker.startGraphWorkerFromEnvironment();
+		return true;
+	}
+	if (arg === GRAPH_WIRE_READ_ARG) {
+		const observer: typeof GraphWireObserver = require("./graph/wire-observer");
+		await observer.startGraphWireObserver(parameters);
+		return true;
+	}
+	if (arg === GRAPH_WIRE_AUTHOR_ARG) {
+		const author: typeof GraphWireAuthorWorker = require("./graph/author-worker");
+		await author.startGraphWireAuthorWorker(parameters);
 		return true;
 	}
 	return false;
@@ -535,7 +577,10 @@ export async function runCli(argv: string[]): Promise<void> {
 	if (isWorkerHostSelector(resolvedArgv[0])) {
 		// Invoke dispatch first so its inbox is installed before asynchronous
 		// process-name setup yields; neither dependency belongs in prepaint.
-		const [dispatched] = await Promise.all([runWorkerEntrypoint(resolvedArgv[0]), setFullProcessName()]);
+		const [dispatched] = await Promise.all([
+			runWorkerEntrypoint(resolvedArgv[0], resolvedArgv.slice(1)),
+			setFullProcessName(),
+		]);
 		if (!dispatched) {
 			process.stderr.write(`Error: unknown worker selector: ${resolvedArgv[0]}\n`);
 			process.exitCode = 1;

@@ -27,7 +27,9 @@ import {
 	type SessionEntry,
 	type SessionMessageEntry,
 } from "./session-entries";
-import { QA_TOOL_TIP_TYPE } from "./compact-modes";
+import { QA_STATE_TYPE, QA_TOOL_TIP_TYPE } from "./compact-modes";
+import { renderQaCompactionCheckpoint, resolveQaCompactionCheckpoint } from "./qa-compaction";
+import { QA_CHECKPOINT_ENTRY_TYPE } from "./qa-rollover";
 
 // #4470 crash artifacts had legacy frames (no shape metadata) with 17 frames,
 // ~306k archive chars, and ~1.5M truncated chars. Current snapcompact frames
@@ -503,10 +505,18 @@ export function buildSessionContext(
 		for (let i = resetBoundaryIdx + 1; i < path.length; i++) {
 			appendMessage(path[i]);
 		}
-	} else if (compaction && isRecord(compaction.details) && compaction.details.kind === "qaonly" &&
-		Array.isArray(compaction.details.retainedEntryIds)) {
+	} else if (
+		compaction &&
+		isRecord(compaction.details) &&
+		compaction.details.kind === "qaonly" &&
+		Array.isArray(compaction.details.retainedEntryIds)
+	) {
 		const compactionIdx = path.findIndex(entry => entry.id === compaction.id);
 		const retained = new Set(compaction.details.retainedEntryIds);
+		const checkpoint =
+			!options?.transcript && "checkpointEntryId" in compaction.details
+				? resolveQaCompactionCheckpoint(path.slice(0, compactionIdx), compaction.details.checkpointEntryId)
+				: undefined;
 		for (let i = resetBoundaryIdx + 1; i < compactionIdx; i++) {
 			const entry = path[i];
 			if (!retained.has(entry.id)) continue;
@@ -517,8 +527,26 @@ export function buildSessionContext(
 				appendMessage(entry);
 			}
 		}
+		if (checkpoint) {
+			pushMessage(
+				createCustomMessage(
+					QA_CHECKPOINT_ENTRY_TYPE,
+					renderQaCompactionCheckpoint(checkpoint.data),
+					true,
+					undefined,
+					checkpoint.timestamp,
+				),
+			);
+		}
+		if (!options?.transcript && typeof compaction.details.state === "string" && compaction.details.state) {
+			pushMessage(
+				createCustomMessage(QA_STATE_TYPE, compaction.details.state, false, undefined, compaction.timestamp),
+			);
+		}
 		if (!options?.transcript && typeof compaction.details.toolTip === "string" && compaction.details.toolTip) {
-			pushMessage(createCustomMessage(QA_TOOL_TIP_TYPE, compaction.details.toolTip, false, undefined, compaction.timestamp));
+			pushMessage(
+				createCustomMessage(QA_TOOL_TIP_TYPE, compaction.details.toolTip, false, undefined, compaction.timestamp),
+			);
 		}
 		if (options?.transcript) {
 			handleEntryResetTracking(compaction);

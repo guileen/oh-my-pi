@@ -33,6 +33,7 @@ import {
 	type ModelManagerOptions,
 	type ModelRefreshStrategy,
 } from "@oh-my-pi/pi-catalog/model-manager";
+import { cloneModel } from "@oh-my-pi/pi-catalog/model-snapshot";
 import { getBundledModels, getBundledProviders } from "@oh-my-pi/pi-catalog/models";
 import {
 	googleAntigravityModelManagerOptions,
@@ -1414,12 +1415,7 @@ export class ModelRegistry {
 				// Clone mutable catalog data, retaining resolver functions as opaque
 				// capabilities. Hooks can then rename models without losing their
 				// request-time credentials or resolving them during catalog reads.
-				const snapshot: Model<Api>[] = structuredClone(
-					projected.map(({ resolveHeaders: _resolveHeaders, ...model }) => model),
-				);
-				for (let index = 0; index < snapshot.length; index++) {
-					if (projected[index].resolveHeaders) snapshot[index].resolveHeaders = projected[index].resolveHeaders;
-				}
+				const snapshot = projected.map(model => cloneModel(model));
 				// A hook owns its provider's rows and may synthesize them outright
 				// (a credential-scoped catalog replacing the registered bootstrap)
 				// or respell the ones it was handed. Extensions author `ModelSpec`s

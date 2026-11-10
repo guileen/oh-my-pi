@@ -53,6 +53,8 @@ export const Flag = {
 	CacheControlUnsupported: 0x0000_0800,
 	/** HTTP 413 byte/media rejection — token compaction cannot shrink bytes or media budgets (#9235). */
 	PayloadRejected: 0x8000_0000,
+	/** Host admission refused an inference dispatch; terminal and distinct from user cancellation. */
+	ProviderRequestDenied: 0x0000_0400,
 } as const;
 
 export type Flag = (typeof Flag)[keyof typeof Flag];
@@ -77,6 +79,7 @@ const KIND_MASK =
 	Flag.Grammar |
 	Flag.FastModeUnsupported |
 	Flag.CacheControlUnsupported |
+	Flag.ProviderRequestDenied |
 	Flag.OAuthExpiry;
 
 const RETRIABLE_KINDS =
@@ -479,6 +482,7 @@ const ERROR_KIND_LABELS: readonly [Flag, string][] = [
 	[Flag.SilentAbort, "silent-abort"],
 	[Flag.UserInterrupt, "user-interrupt"],
 	[Flag.Abort, "abort"],
+	[Flag.ProviderRequestDenied, "provider-request-denied"],
 ];
 
 const STATUS_MESSAGE_PATTERNS = [
@@ -500,6 +504,7 @@ export function is(id: number | undefined, flag: Flag): boolean {
 }
 
 export function retriable(id: number | undefined, opts?: { replayUnsafe?: boolean }): boolean {
+	if (is(id, Flag.ProviderRequestDenied)) return false;
 	if (is(id, Flag.ContentBlocked)) return false;
 	if (is(id, Flag.PayloadRejected)) return false;
 	if (opts?.replayUnsafe) return false;

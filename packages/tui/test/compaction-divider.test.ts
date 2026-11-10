@@ -83,6 +83,9 @@ describe("CompactionSummaryMessageComponent", () => {
 	it("degrades to a bare label when the viewport is too narrow for a framed rule", () => {
 		const lines = makeComponent().render(10);
 		expect(Bun.stripANSI(lines[1])).toContain("compacted");
+		expect(Bun.stringWidth(Bun.stripANSI(lines[1]))).toBeLessThanOrEqual(10);
+		expect(Bun.stripANSI(makeComponent().render(9)[1])).toBe("compacted");
+		expect(Bun.stringWidth(Bun.stripANSI(makeComponent().render(5)[1]))).toBeLessThanOrEqual(5);
 	});
 
 	it("honors the same-reference render cache and busts it on expansion toggle", () => {

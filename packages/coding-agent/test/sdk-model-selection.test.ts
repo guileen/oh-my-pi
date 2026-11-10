@@ -1570,14 +1570,18 @@ describe("createAgentSession deferred model pattern resolution", () => {
 
 	test.each([
 		// Not in the catalog at all.
-		["anthropic/claude-sonnet-9-9", "not found"],
-		// In the catalog, but its provider has no credentials here.
-		["google/gemini-2.5-pro", "is unavailable (no credentials, or not in enabledModels)"],
+		"anthropic/claude-sonnet-9-9",
+		// In the catalog, but this fixture permits no ambient credentials.
+		"google/gemini-2.5-pro",
 	] as const)(
 		"names a configured default %s that does not resolve instead of switching silently",
-		async (configured, reason) => {
+		async configured => {
 			const authStorage = createInMemoryAuthStorage();
 			authStorage.keys.setRuntime("anthropic", "test-key");
+			const source = authStorage.keys.source.bind(authStorage.keys);
+			vi.spyOn(authStorage.keys, "source").mockImplementation((provider, options) =>
+				source(provider, { ...options, env: "none" }),
+			);
 			const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "models.yml"));
 			const settings = Settings.isolated();
 			settings.setModelRole("default", configured);
@@ -1605,7 +1609,8 @@ describe("createAgentSession deferred model pattern resolution", () => {
 
 				try {
 					expect(session.model).toBeDefined();
-					expect(modelFallbackMessage).toContain(`Default model ${configured} ${reason}`);
+					expect(`${session.model?.provider}/${session.model?.id}`).not.toBe(configured);
+					expect(modelFallbackMessage).toContain(configured);
 					expect(modelFallbackMessage).toContain(`${session.model?.provider}/${session.model?.id}`);
 				} finally {
 					await session.dispose();

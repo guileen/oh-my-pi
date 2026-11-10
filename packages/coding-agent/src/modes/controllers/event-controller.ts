@@ -96,6 +96,16 @@ import { cfgSpeechEnabled, cfgSpeechMode } from "../../tts/settings";
 
 type AgentSessionEventKind = AgentSessionEvent["type"];
 
+const AUTO_COMPACTION_LABELS: Record<Extract<AgentSessionEvent, { type: "auto_compaction_start" }>["action"], string> =
+	{
+		"context-full": "Auto context-full maintenance",
+		remote: "Auto server compaction",
+		handoff: "Auto-handoff",
+		shake: "Auto-shake",
+		snapcompact: "Auto-snapcompact",
+		qaonly: "Auto Q&A compaction",
+	};
+
 const IRC_MESSAGE_VISIBLE_TTL_MS = 10_000;
 /**
  * Concurrent IRC cards allowed in the transcript's live region. Cards land
@@ -2669,16 +2679,7 @@ export class EventController {
 					: event.reason === "idle"
 						? "Idle "
 						: "";
-		const actionLabel =
-			event.action === "remote"
-				? "Auto server compaction"
-				: event.action === "handoff"
-					? "Auto-handoff"
-					: event.action === "shake"
-						? "Auto-shake"
-						: event.action === "snapcompact"
-							? "Auto-snapcompact"
-							: "Auto context-full maintenance";
+		const actionLabel = AUTO_COMPACTION_LABELS[event.action];
 		this.ctx.autoCompactionLoader = new Loader(
 			this.ctx.ui,
 			spinner => theme.fg("accent", spinner),
@@ -2714,34 +2715,26 @@ export class EventController {
 		}
 		this.#maintenanceActive = false;
 		this.#syncComposerActivity();
+		const actionLabel = AUTO_COMPACTION_LABELS[event.action];
+		const errorMessage = event.errorMessage
+			? previewLine(sanitizeText(event.errorMessage), TRUNCATE_LENGTHS.LINE * PREVIEW_LIMITS.COLLAPSED_LINES)
+			: undefined;
 		const isHandoffAction = event.action === "handoff";
-		const isRemoteAction = event.action === "remote";
 		const isShakeAction = event.action === "shake";
-		const isSnapcompactAction = event.action === "snapcompact";
 		if (event.aborted) {
-			this.ctx.showStatus(
-				isHandoffAction
-					? "Auto-handoff cancelled"
-					: isRemoteAction
-						? "Auto server compaction cancelled"
-						: isShakeAction
-							? "Auto-shake cancelled"
-							: isSnapcompactAction
-								? "Auto-snapcompact cancelled"
-								: "Auto context-full maintenance cancelled",
-			);
+			this.ctx.showStatus(`${actionLabel} cancelled`);
 		} else if (isShakeAction) {
 			// Shake produces no CompactionResult; rebuild on success, suppress benign skips.
 			// The fallback path (`errorMessage` set, `skipped` false) means shake reclaimed
 			// some tokens before deciding the threshold still wasn't cleared — rebuild so
 			// the chat reflects the dropped regions even though a context-full pass follows.
-			if (event.errorMessage) {
+			if (errorMessage) {
 				if (!event.skipped) {
 					this.ctx.rebuildChatFromMessages();
 					this.ctx.statusLine.invalidate();
 					this.ctx.ui.requestRender(true, { clearScrollback: true });
 				}
-				this.ctx.showWarning(event.errorMessage);
+				this.ctx.showWarning(errorMessage);
 			} else if (!event.skipped) {
 				this.ctx.lastAssistantUsage = undefined;
 				this.ctx.rebuildChatFromMessages();
@@ -2763,8 +2756,8 @@ export class EventController {
 			// replaces history instead of appending a second copy. The force
 			// matters too: post-clear the frame looks unchanged to the diff.
 			this.ctx.ui.requestRender(true, { clearScrollback: true });
-		} else if (event.errorMessage) {
-			this.ctx.showWarning(event.errorMessage);
+		} else if (errorMessage) {
+			this.ctx.showWarning(errorMessage);
 		} else if (isHandoffAction) {
 			this.ctx.clearTransientSessionUi();
 			this.ctx.lastAssistantUsage = undefined;
@@ -2776,12 +2769,12 @@ export class EventController {
 		} else if (event.skipped) {
 			// Benign skip: no model selected, no candidate models available, or nothing
 			// to compact yet. Not a failure — suppress the warning.
-		} else if (isSnapcompactAction) {
-			this.ctx.showWarning("Auto-snapcompact maintenance failed; continuing without maintenance");
-		} else if (isRemoteAction) {
-			this.ctx.showWarning("Auto server compaction failed; continuing without maintenance");
 		} else {
-			this.ctx.showWarning("Auto context-full maintenance failed; continuing without maintenance");
+			this.ctx.showWarning(
+				event.action === "qaonly"
+					? `${actionLabel} did not commit`
+					: `${actionLabel} failed; continuing without maintenance`,
+			);
 		}
 		await this.ctx.flushCompactionQueue({ willRetry: event.willRetry });
 		this.#ensureWorkingLoaderWhileStreaming();

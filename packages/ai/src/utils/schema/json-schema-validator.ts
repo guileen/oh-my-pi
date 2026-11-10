@@ -171,6 +171,7 @@ function resolveLocalRef(root: unknown, ref: string): unknown | undefined {
 	let current: unknown = root;
 	for (const token of pointer) {
 		if (!isRecord(current) && !Array.isArray(current)) return undefined;
+		if (!Object.hasOwn(current, token)) return undefined;
 		current = (current as Record<string, unknown>)[token];
 	}
 	return current;
@@ -270,7 +271,7 @@ function computeSchemaDefinesProperty(schema: unknown, key: string): boolean {
 		if (isRecord(patternProperties)) {
 			for (const [pattern, patternSchema] of Object.entries(patternProperties)) {
 				try {
-					if (new RegExp(pattern).test(key)) {
+					if (new RegExp(pattern, "u").test(key)) {
 						if (patternSchema !== false) return true;
 					}
 				} catch {
@@ -524,7 +525,7 @@ function validateObjectKeywords(
 	const properties = isRecord(schema.properties) ? schema.properties : {};
 	if (isRequiredSet(schema.required)) {
 		for (const key of schema.required) {
-			if (!(key in value)) {
+			if (!Object.hasOwn(value, key)) {
 				pushIssue(issues, [...path, key], "is required", { keyword: "required" });
 				valid = false;
 			}
@@ -532,7 +533,7 @@ function validateObjectKeywords(
 	}
 
 	for (const key in properties) {
-		if (!(key in value)) continue;
+		if (!Object.hasOwn(value, key)) continue;
 		valid = validateSchemaNode(properties[key], value[key], [...path, key], ctx, issues) && valid;
 	}
 
@@ -549,13 +550,13 @@ function validateObjectKeywords(
 			const patternSchema = patternProperties[pattern];
 			let re: RegExp;
 			try {
-				re = new RegExp(pattern);
+				re = new RegExp(pattern, "u");
 			} catch {
 				pushIssue(issues, path, `invalid patternProperties regex ${pattern}`, { keyword: "patternProperties" });
 				valid = false;
 				continue;
 			}
-			for (const key in value) {
+			for (const key of Object.keys(value)) {
 				if (!re.test(key)) continue;
 				known.add(key);
 				valid = validateSchemaNode(patternSchema, value[key], [...path, key], ctx, issues) && valid;
@@ -567,11 +568,11 @@ function validateObjectKeywords(
 		const dependentRequired = schema.dependentRequired;
 		for (const key in dependentRequired) {
 			const deps = dependentRequired[key];
-			if (!(key in value)) continue;
+			if (!Object.hasOwn(value, key)) continue;
 			if (!Array.isArray(deps)) continue;
 			for (const dep of deps) {
 				if (typeof dep !== "string") continue;
-				if (!(dep in value)) {
+				if (!Object.hasOwn(value, dep)) {
 					pushIssue(issues, [...path, dep], `is required when "${key}" is present`, {
 						keyword: "dependentRequired",
 					});
@@ -584,7 +585,7 @@ function validateObjectKeywords(
 	if (isRecord(schema.dependentSchemas)) {
 		const dependentSchemas = schema.dependentSchemas;
 		for (const key in dependentSchemas) {
-			if (!(key in value)) continue;
+			if (!Object.hasOwn(value, key)) continue;
 			valid = validateSchemaNode(dependentSchemas[key], value, path, ctx, issues) && valid;
 		}
 	}
@@ -599,7 +600,7 @@ function validateObjectKeywords(
 			valid = false;
 		}
 	} else if (additional !== undefined && additional !== true) {
-		for (const key in value) {
+		for (const key of Object.keys(value)) {
 			if (known.has(key)) continue;
 			valid = validateSchemaNode(additional, value[key], [...path, key], ctx, issues) && valid;
 		}
@@ -700,17 +701,21 @@ function validateStringKeywords(
 	issues: JsonSchemaValidationIssue[],
 ): boolean {
 	let valid = true;
-	if (typeof schema.minLength === "number" && value.length < schema.minLength) {
+	let length = 0;
+	if (typeof schema.minLength === "number" || typeof schema.maxLength === "number") {
+		for (const _character of value) length += 1;
+	}
+	if (typeof schema.minLength === "number" && length < schema.minLength) {
 		pushIssue(issues, path, `must be at least ${schema.minLength} characters`, { keyword: "minLength" });
 		valid = false;
 	}
-	if (typeof schema.maxLength === "number" && value.length > schema.maxLength) {
+	if (typeof schema.maxLength === "number" && length > schema.maxLength) {
 		pushIssue(issues, path, `must be at most ${schema.maxLength} characters`, { keyword: "maxLength" });
 		valid = false;
 	}
 	if (typeof schema.pattern === "string") {
 		try {
-			if (!new RegExp(schema.pattern).test(value)) {
+			if (!new RegExp(schema.pattern, "u").test(value)) {
 				pushIssue(issues, path, "must match pattern", { keyword: "pattern" });
 				valid = false;
 			}

@@ -16,14 +16,14 @@
  * whenever approval is not auto-allow or extension lifecycle handlers could
  * veto the call.
  */
-import {
-	canonicalJson,
-	type AgentToolCall,
-	type SpeculativeOperationSink,
-	type SpeculativeToolReference,
-	type ToolSpeculationAssessmentContext,
-	type ToolSpeculationStreamSession,
+import type {
+	AgentToolCall,
+	SpeculativeOperationSink,
+	SpeculativeToolReference,
+	ToolSpeculationAssessmentContext,
+	ToolSpeculationStreamSession,
 } from "@oh-my-pi/pi-agent-core";
+import { canonicalJson } from "@oh-my-pi/pi-wire/canonical-json";
 import type { TaskParams } from "@oh-my-pi/pi-tui/tools/task";
 import type { SpawnRun } from "./spawn-run";
 

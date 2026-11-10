@@ -1,3 +1,4 @@
+import { providerRequestFetch } from "../utils/provider-request";
 import {
 	anthropicApiVersionAcceptsSamplingParams,
 	isAnthropicSigningProxyUrl,
@@ -2223,7 +2224,8 @@ const streamAnthropicOnce = (
 						context.tools?.some(tool => ANTHROPIC_BUFFERED_INPUT_TOOLS.has(tool.name)) ?? false,
 					thinkingEnabled: options?.thinkingEnabled,
 					thinkingDisplay: options?.thinkingDisplay,
-					fetch: options?.fetch,
+					fetch: providerRequestFetch(model, options),
+					// Admission lives below client retries, compression, and Copilot fallback.
 					maxRetryDelayMs: options?.maxRetryDelayMs,
 					copilotCacheKey,
 					copilotCacheSnapshot: copilotCached ?? null,

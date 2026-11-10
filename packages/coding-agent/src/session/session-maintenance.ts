@@ -4,6 +4,7 @@ import { scheduler } from "node:timers/promises";
 import {
 	type Agent,
 	type AgentMessage,
+	type AgentPreModelCallResult,
 	type AgentTurnEndContext,
 	type MessageCountOptions,
 	resolveTelemetry,
@@ -66,6 +67,7 @@ import * as AIError from "@oh-my-pi/pi-ai/error";
 import { openAIResponsesReplaysNativeHistory } from "@oh-my-pi/pi-ai/providers/openai-responses-state";
 import { sendsImageInputOnWire } from "@oh-my-pi/pi-ai/providers/vision-guard";
 import { resolvePromptCacheLookback } from "@oh-my-pi/pi-catalog/compat/prompt-cache-lookback";
+import { supportsOutputTokenLimit } from "@oh-my-pi/pi-catalog/compat/output-limits";
 import { modelsAreEqual } from "@oh-my-pi/pi-catalog/models";
 import type { CatalogPolicyInputs } from "@oh-my-pi/pi-catalog/types";
 import { isRecord, logger, prompt, Snowflake, toError } from "@oh-my-pi/pi-utils";
@@ -80,7 +82,11 @@ import type { GoalModeState } from "../goals/state";
 import { resolveMemoryBackend } from "../memory-backend/resolve";
 import type { MemoryBackendOperationContext } from "../memory-backend/types";
 import { customMessageEntryMessage } from "@oh-my-pi/pi-tui/chat/transcript-entry";
-import { computeNonMessageTokens, type NonMessageTokenSource } from "@oh-my-pi/pi-tui/status-line/context-usage";
+import {
+	computeNonMessageTokens,
+	estimateContextToolSchemaTokens,
+	type NonMessageTokenSource,
+} from "@oh-my-pi/pi-tui/status-line/context-usage";
 import { createPlanReadMatcher } from "../plan-mode/plan-protection";
 import { isCompleteReadResult } from "../tools/read-supersede";
 import type { ConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
@@ -103,7 +109,16 @@ import {
 	stripImagesFromMessage,
 } from "./messages";
 import { isTerminalTextAssistantAnswer } from "./queued-messages";
-import { prepareQaCompaction } from "./qa-compaction";
+import { prepareQaCompaction, renderQaCompactionCheckpoint, type QaCompactionRuntimeState } from "./qa-compaction";
+import {
+	QA_CHECKPOINT_ENTRY_TYPE,
+	type QaCheckpointInput,
+	type QaCheckpointAcceptance,
+	qaCheckpointError,
+} from "./qa-rollover";
+import qaRolloverHintPrompt from "../prompts/system/qa-rollover-hint.md" with { type: "text" };
+import qaRolloverWarningPrompt from "../prompts/system/qa-rollover-warning.md" with { type: "text" };
+import qaRolloverHardReportPrompt from "../prompts/system/qa-rollover-hard-report.md" with { type: "text" };
 import {
 	resolveCompactionConfiguredTarget,
 	resolveContextPromotionConfiguredTarget,
@@ -428,6 +443,8 @@ export interface SessionMaintenanceHost {
 	hasExperimentalContextRolloverTools(): boolean;
 	takeExperimentalContextRolloverRequest(context: AgentTurnEndContext | undefined): boolean;
 	queueExperimentalContextNotesReminder(prompt: string): void;
+	hasQaRolloverTool?(): boolean;
+	pendingQaMessages?(): AgentMessage[];
 	memoryBackendSession(): MemoryBackendOperationContext["session"];
 	emitSessionEvent(event: AgentSessionEvent, options?: { detachExtensions?: boolean }): Promise<void>;
 	emitNotice(level: "info" | "warning" | "error", message: string, source?: string): void;
@@ -451,6 +468,7 @@ export interface SessionMaintenanceHost {
 		autoContinue: boolean;
 		terminalTextAnswer: boolean;
 		suppressContinuation: boolean;
+		checkpointDisposition?: QaCheckpointInput["disposition"];
 	}): boolean;
 	persistTurnMessagesForMidRunCompaction(context: AgentTurnEndContext | undefined): Promise<boolean>;
 	findLastAssistantMessage(): AssistantMessage | undefined;
@@ -458,6 +476,7 @@ export interface SessionMaintenanceHost {
 	reconnectToAgent(): void;
 	drainStrandedQueuedMessages(): void;
 	buildDisplaySessionContext(): SessionContext;
+	getQaCompactionRuntimeState(): Promise<QaCompactionRuntimeState>;
 	/** Preserve the eval runtime snapshot at the history rewrite boundary for replay. */
 	persistEvalStateContext(): void;
 	convertToLlmForSideRequest(messages: AgentMessage[]): Message[];
@@ -544,6 +563,25 @@ function mayHoldArchive(message: CompactionSummaryMessage): boolean {
 }
 
 /** Owns compaction, pruning, shake, promotion, and automatic context maintenance. */
+interface QaRolloverCycle {
+	cycleId: string;
+	generation: number;
+	key: string;
+	phase: "warning-pending" | "draining" | "hard-report" | "ready" | "compacting" | "blocked";
+	reportRequestsUsed: number;
+	reportPromptDelivered?: boolean;
+	/** Highest advisory stage delivered: 0 none, 1 hint, 2 warning, 3 final warning. */
+	advisoryStage: number;
+	hard: number;
+	hint: number;
+	warning: number;
+	finalWarning: number;
+	recovery: number;
+	reportInputLimit: number;
+	checkpoint?: QaCheckpointInput;
+	checkpointEntryId?: string;
+}
+
 export class SessionMaintenance {
 	#compactionAbortController: AbortController | undefined;
 	/** Resolves after an active manual compaction has reconnected the agent subscription. */
@@ -618,6 +656,11 @@ export class SessionMaintenance {
 		{ key: string; length: number; first: AgentMessage | undefined }
 	>();
 	readonly #host: SessionMaintenanceHost;
+	#qaCycle: QaRolloverCycle | undefined;
+	#qaParked = false;
+	#qaParkedModel: Model | undefined;
+	#qaParkedRevision = -1;
+	#qaOutcome: { generation: number; checkpoint?: QaCheckpointInput; result: CompactionCheckResult } | undefined;
 
 	get #model(): Model | undefined {
 		return this.#host.model();
@@ -646,6 +689,285 @@ export class SessionMaintenance {
 
 	constructor(host: SessionMaintenanceHost) {
 		this.#host = host;
+	}
+
+	#qaPolicy():
+		| {
+				key: string;
+				hard: number;
+				hint: number;
+				warning: number;
+				finalWarning: number;
+				recovery: number;
+				reportInputLimit: number;
+		  }
+		| undefined {
+		const settings = this.#compactionSettings;
+		const model = this.#model;
+		const window = model?.contextWindow ?? 0;
+		if (
+			!model ||
+			!Number.isFinite(window) ||
+			window <= 0 ||
+			!settings.enabled ||
+			settings.midTurnEnabled === false ||
+			settings.experimentalContextManagement === true
+		)
+			return;
+		const selected = resolveCompactionMethodOrder(settings.methodOrder).find(candidate =>
+			isCompactionMethodUsable(candidate, "threshold", model, settings),
+		);
+		if (selected !== "qaonly") return;
+		// Only the model safety boundary forces a stop; earlier stages are advisory.
+		const reportInputLimit = Math.min(promptBudgetTokens(window, settings), window - 8192);
+		const hard = reportInputLimit - 4096;
+		const hint = Math.min(100_000, Math.floor(hard * 0.5));
+		const warning = Math.floor(hard * 0.6);
+		const finalWarning = Math.floor(hard * 0.85);
+		const recovery = Math.floor(hint * COMPACTION_RECOVERY_BAND);
+		if (!(0 < recovery && recovery < hint && hint < warning && warning < finalWarning && finalWarning < hard)) return;
+		const branch = this.#host.sessionManager.getBranchView();
+		const boundary = branch.findLast(entry => entry.type === "compaction" || entry.type === "reset_boundary");
+		const key = JSON.stringify([
+			this.#host.sessionId(),
+			this.#host.promptGeneration(),
+			model.provider,
+			model.id,
+			this.#host.settings.revision,
+			boundary?.id,
+			hard,
+		]);
+		return { key, hard, hint, warning, finalWarning, recovery, reportInputLimit };
+	}
+
+	isQaRolloverEnabled(): boolean {
+		return this.#qaPolicy() !== undefined;
+	}
+
+	/** Fresh queued input owns the next run even when QA suppressed synthetic continuation. */
+	resumeQaForQueuedInput(): boolean {
+		if (!this.#qaParked || !this.#host.agent.hasQueuedMessages()) return false;
+		this.resetForNewPrompt();
+		return true;
+	}
+
+	#parkQa(): void {
+		this.#qaParked = true;
+		this.#qaParkedModel = this.#model;
+		this.#qaParkedRevision = this.#host.settings.revision;
+	}
+
+	#currentQaCycle(): QaRolloverCycle | undefined {
+		const cycle = this.#qaCycle;
+		if (cycle && cycle.key !== this.#qaPolicy()?.key) this.#qaCycle = undefined;
+		return this.#qaCycle;
+	}
+
+	/** Called after queued input is folded into the live context, before provider conversion. */
+	prepareQaModelCall(messages: AgentMessage[]): void {
+		if (
+			this.#qaParked &&
+			(this.#qaParkedModel !== this.#model || this.#qaParkedRevision !== this.#host.settings.revision)
+		) {
+			this.resetForNewPrompt();
+		}
+		if (this.#qaParked || this.isCompacting || this.#host.hasQaRolloverTool?.() === false) return;
+		const policy = this.#qaPolicy();
+		if (!policy) {
+			this.#qaCycle = undefined;
+			return;
+		}
+		let cycle = this.#currentQaCycle();
+		const tokens = this.#estimatePrePromptContextTokens([], this.#model?.contextWindow ?? 0);
+		if (!cycle && tokens >= policy.hint) {
+			this.cancelSpeculation();
+			cycle = this.#qaCycle = {
+				...policy,
+				cycleId: `qa:${Snowflake.next()}`,
+				generation: this.#host.promptGeneration(),
+				phase: "warning-pending",
+				reportRequestsUsed: 0,
+				advisoryStage: 0,
+			};
+		}
+		if (!cycle) return;
+		if (tokens >= policy.hard && cycle.phase !== "ready") cycle.phase = "hard-report";
+		const hardReport = cycle.phase === "hard-report";
+		const stage = tokens >= cycle.finalWarning ? 3 : tokens >= cycle.warning ? 2 : 1;
+		if (hardReport) {
+			if (cycle.reportPromptDelivered) return;
+		} else if ((cycle.phase !== "warning-pending" && cycle.phase !== "draining") || stage <= cycle.advisoryStage) {
+			return;
+		}
+		const vars = {
+			cycleId: cycle.cycleId,
+			currentTokens: tokens,
+			headroomTokens: Math.max(0, cycle.hard - tokens),
+			hardTokens: cycle.hard,
+			final: stage === 3,
+		};
+		messages.push({
+			role: "custom",
+			customType: hardReport ? "qa-rollover-hard-report" : stage === 1 ? "qa-rollover-hint" : "qa-rollover-warning",
+			display: false,
+			timestamp: Date.now(),
+			content: prompt.render(
+				hardReport ? qaRolloverHardReportPrompt : stage === 1 ? qaRolloverHintPrompt : qaRolloverWarningPrompt,
+				vars,
+			),
+		});
+		if (hardReport) {
+			cycle.reportPromptDelivered = true;
+		} else {
+			cycle.advisoryStage = stage;
+			cycle.phase = "draining";
+		}
+		this.#host.emitNotice(
+			"info",
+			hardReport
+				? "QA context limit reached: reporting saved work before context rollover."
+				: stage === 1
+					? "QA context hint: checkpoint available to denoise context."
+					: stage === 2
+						? "QA context warning: context is large; checkpoint when output is secured."
+						: "QA final context warning: secure output and checkpoint before the limit.",
+			"compaction",
+		);
+	}
+
+	/** Hard reporting takes precedence over unrelated queued tool-choice directives. */
+	qaReportToolChoice(): { type: "tool"; name: string } | undefined {
+		return this.#currentQaCycle()?.phase === "hard-report" ? { type: "tool", name: "new_context" } : undefined;
+	}
+
+	/** A completed report attempt must settle before generic retry/abort handling. */
+	hasPendingQaReport(): boolean {
+		const cycle = this.#currentQaCycle();
+		return cycle?.phase === "hard-report" && cycle.reportRequestsUsed > 0;
+	}
+
+	/** The report is the only permitted new action; already-running tools still settle normally. */
+	blockQaToolCall(message: AssistantMessage, toolName: string): string | undefined {
+		if (this.#currentQaCycle()?.phase !== "hard-report") return;
+		const calls = message.content.filter(block => block.type === "toolCall");
+		if (toolName !== "new_context" || calls.length !== 1) {
+			return "QA work limit reached: only a sole new_context checkpoint report is permitted.";
+		}
+	}
+
+	/** Admission is after conversion so pending input, tools and fixed instructions count. */
+	async beforeQaModelCall(context: Context, signal?: AbortSignal): Promise<AgentPreModelCallResult> {
+		if (signal?.aborted) return { stop: true, reason: "Cancelled" };
+		if (this.#qaParked) return { stop: true, reason: "QA rollover parked the old loop" };
+		const policy = this.#qaPolicy();
+		if (!policy) return;
+		const cycle = this.#currentQaCycle();
+		const tokens = Math.max(
+			this.#estimatePrePromptContextTokens([], this.#model?.contextWindow ?? 0),
+			this.#tokenizer.countMessages(context.messages, { excludeEncryptedReasoning: true }) +
+				this.#tokenizer.countTokens(context.systemPrompt ?? []) +
+				estimateContextToolSchemaTokens(context.tools ?? [], this.#tokenizer, this.#model, {
+					sourceRevision: this.#host.settings.revision,
+					pruneDescriptions: this.#host.agent.prunesToolDescriptions(this.#model),
+				}),
+		);
+		const reportOnly = cycle?.phase === "hard-report" || tokens >= policy.hard;
+		if (reportOnly && cycle && !cycle.checkpointEntryId && cycle.reportRequestsUsed === 0) {
+			cycle.phase = "hard-report";
+			const model = this.#model!;
+			const budgetThinking = model.thinking?.mode === "budget" || model.thinking?.mode === "anthropic-budget-effort";
+			const canCapReport =
+				supportsOutputTokenLimit(model) &&
+				!(budgetThinking && model.thinking?.requiresEffort && !model.thinking.suppressWhenOff);
+			if (tokens <= policy.reportInputLimit && this.#host.hasQaRolloverTool?.() !== false) {
+				context.tools = context.tools?.filter(tool => tool.name === "new_context");
+				if (context.tools?.length)
+					return {
+						// Some transports reject output caps; normal capacity reserves still apply.
+						maxTokens: canCapReport ? 8192 : undefined,
+						toolChoice: { type: "tool", name: "new_context" },
+					};
+			}
+		}
+		if (cycle?.checkpointEntryId || reportOnly) {
+			const result = await this.runAutoCompaction("threshold", false, {
+				autoContinue: false,
+				suppressContinuation: true,
+				triggerContextTokens: tokens,
+				phase: "mid_turn",
+				detachPostCommit: true,
+			});
+			this.#parkQa();
+			this.#qaOutcome = { generation: this.#host.promptGeneration(), checkpoint: cycle?.checkpoint, result };
+			return { stop: true, reason: "QA checkpoint boundary" };
+		}
+	}
+
+	/** Ordinary work has no request quota. Hard reporting permits one transport attempt, not retries. */
+	beforeQaProviderRequest(): void {
+		const cycle = this.#currentQaCycle();
+		if (this.#qaParked) throw new Error("QA rollover parked the old loop");
+		if (!cycle || cycle.phase === "warning-pending" || cycle.phase === "draining") return;
+		if (cycle.phase !== "hard-report" || cycle.reportRequestsUsed >= 1) {
+			throw new Error("QA checkpoint report attempt exhausted");
+		}
+		cycle.reportRequestsUsed++;
+	}
+
+	async acceptQaCheckpoint(input: QaCheckpointInput, signal?: AbortSignal): Promise<QaCheckpointAcceptance> {
+		const cycle = this.#currentQaCycle();
+		if (!cycle)
+			throw qaCheckpointError("QA_NOT_ACTIVE", "No automatic QA checkpoint cycle is active.", input.cycleId);
+		if (cycle.cycleId !== input.cycleId)
+			throw qaCheckpointError("QA_STALE_CYCLE", "Checkpoint belongs to another cycle.", input.cycleId);
+		if (cycle.checkpoint) {
+			if (
+				cycle.checkpoint.summary !== input.summary ||
+				cycle.checkpoint.disposition !== input.disposition ||
+				cycle.checkpoint.nextAction !== input.nextAction
+			) {
+				throw qaCheckpointError(
+					"QA_CHECKPOINT_CONFLICT",
+					"A different checkpoint is already recorded.",
+					input.cycleId,
+				);
+			}
+			return {
+				requested: true,
+				checkpoint: { cycleId: input.cycleId, entryId: cycle.checkpointEntryId!, status: "already-accepted" },
+			};
+		}
+		if (
+			(cycle.phase !== "draining" && cycle.phase !== "hard-report") ||
+			signal?.aborted ||
+			!this.#tokenizer.checkTokenBudget([input.summary, input.nextAction ?? ""], 4096).fits
+		) {
+			throw qaCheckpointError(
+				"QA_INVALID_CHECKPOINT",
+				"Checkpoint exceeds its size or active boundary.",
+				input.cycleId,
+			);
+		}
+		const current = () => !signal?.aborted && this.#currentQaCycle() === cycle && !this.#host.isDisposed();
+		let entryId: string;
+		try {
+			entryId = await this.#host.sessionManager.appendEntriesAtomically(
+				() => {
+					if (!current()) throw qaCheckpointError("QA_STALE_CYCLE", "Checkpoint was superseded.", input.cycleId);
+					return this.#host.sessionManager.appendCustomEntry(QA_CHECKPOINT_ENTRY_TYPE, { version: 1, ...input });
+				},
+				{ commitGuard: current },
+			);
+			await this.#host.sessionManager.flush();
+		} catch (error) {
+			if (!current()) throw qaCheckpointError("QA_STALE_CYCLE", "Checkpoint was superseded.", input.cycleId);
+			throw qaCheckpointError("QA_PERSIST_FAILED", toError(error).message, input.cycleId);
+		}
+		if (!current()) throw qaCheckpointError("QA_STALE_CYCLE", "Checkpoint was superseded.", input.cycleId);
+		cycle.checkpoint = input;
+		cycle.checkpointEntryId = entryId;
+		cycle.phase = "ready";
+		return { requested: true, checkpoint: { cycleId: input.cycleId, entryId, status: "accepted" } };
 	}
 
 	/** Experimental rollover is safe only when the current effective tool surface can recover its state. */
@@ -681,6 +1003,9 @@ export class SessionMaintenance {
 	/** Clears per-prompt recovery counters when a new user prompt starts. */
 	resetForNewPrompt(): void {
 		this.#incompleteRecoveryAttempts = 0;
+		this.#qaCycle = undefined;
+		this.#qaParked = false;
+		this.#qaOutcome = undefined;
 	}
 
 	/** Whether compaction or a manual handoff is active. */
@@ -1271,7 +1596,8 @@ export class SessionMaintenance {
 				);
 			}
 			if (compactMode?.name === "qaonly") {
-				const { details, summary } = prepareQaCompaction(this.#host.sessionManager.getBranch());
+				const runtimeState = await this.#host.getQaCompactionRuntimeState();
+				const { details, summary } = prepareQaCompaction(this.#host.sessionManager.getBranch(), runtimeState);
 				if (details.retainedEntryIds.length === 0) {
 					throw new ManualCompactionNoOpError("Nothing to compact (no user instructions)");
 				}
@@ -1307,7 +1633,8 @@ export class SessionMaintenance {
 					activeModel,
 					this.#tokenizer,
 				);
-				if (!preparation) throw new ManualCompactionNoOpError("Nothing to compact (session too small or already compacted)");
+				if (!preparation)
+					throw new ManualCompactionNoOpError("Nothing to compact (session too small or already compacted)");
 				let handoff: HandoffResult | undefined;
 				try {
 					handoff = await this.#host.generateHandoffDocument(customInstructions, {
@@ -1376,12 +1703,13 @@ export class SessionMaintenance {
 						return true;
 					case "handoff":
 					case "shake":
+					case "qaonly":
 						return false;
 				}
 			};
 			selectedMethodIndex = methods.findIndex((method, index) => index >= methodOffset && runsManually(method));
 			const selectedMethod = methods[selectedMethodIndex];
-			if (!selectedMethod) {
+			if (!selectedMethod || selectedMethod === "qaonly") {
 				throw new Error("No configured compaction method can run manually.");
 			}
 			// `/compact snapcompact` pins the order to snapcompact alone, so its
@@ -2146,6 +2474,9 @@ export class SessionMaintenance {
 	 * cleanup barrier. The barrier resolves only after its agent subscription reconnects.
 	 */
 	abortCompaction(reason?: unknown): Promise<void> | undefined {
+		this.#qaCycle = undefined;
+		this.#qaParked = false;
+		this.#qaOutcome = undefined;
 		const manualCompactionCleanup = this.#manualCompactionCleanup ?? this.#handoffCleanup;
 		this.#compactionAbortController?.abort(reason);
 		this.#autoCompactionAbortController?.abort(reason);
@@ -2566,7 +2897,8 @@ export class SessionMaintenance {
 		const settings = this.#compactionSettings;
 		if (
 			armed.result.preserveData &&
-			!remotePreserveReusable(armed.result.preserveData, model, resolveMethodSettings(settings, armed.method))
+			(armed.method === "qaonly" ||
+				!remotePreserveReusable(armed.result.preserveData, model, resolveMethodSettings(settings, armed.method)))
 		) {
 			return false;
 		}
@@ -2688,24 +3020,35 @@ export class SessionMaintenance {
 		providerReplayThroughEntryId?: string;
 		advisorResetReason: string;
 		detachExtensionEmit?: boolean;
+		durable?: boolean;
+		validateCommit?: () => boolean;
+		onCommitted?: () => void;
 	}): Promise<CompactionEntry | undefined> {
-		const entryId = this.#host.sessionManager.appendCompaction(
-			args.summary,
-			args.shortSummary,
-			args.firstKeptEntryId,
-			args.tokensBefore,
-			{
-				details: args.details,
-				fromExtension: args.fromExtension,
-				preserveData: args.preserveData,
-				method: args.method,
-				providerReplayThroughEntryId: args.providerReplayThroughEntryId,
-				tokensAfter:
-					isRecord(args.details) && args.details.kind === "experimental-context-rollover"
-						? this.#projectExperimentalContextRolloverTokens(args)
-						: this.#projectCompactedContextTokens(args),
-			},
-		);
+		const append = () => {
+			if (args.validateCommit && !args.validateCommit()) throw new CompactionCancelledError();
+			return this.#host.sessionManager.appendCompaction(
+				args.summary,
+				args.shortSummary,
+				args.firstKeptEntryId,
+				args.tokensBefore,
+				{
+					details: args.details,
+					fromExtension: args.fromExtension,
+					preserveData: args.preserveData,
+					method: args.method,
+					providerReplayThroughEntryId: args.providerReplayThroughEntryId,
+					tokensAfter:
+						isRecord(args.details) && args.details.kind === "experimental-context-rollover"
+							? this.#projectExperimentalContextRolloverTokens(args)
+							: this.#projectCompactedContextTokens(args),
+				},
+			);
+		};
+		const entryId = args.durable
+			? await this.#host.sessionManager.appendEntriesAtomically(append, { commitGuard: args.validateCommit })
+			: append();
+		args.onCommitted?.();
+		if (args.validateCommit && !args.validateCommit()) return;
 		this.#host.persistEvalStateContext();
 		// A committed compaction starts a new cycle; native compaction gets a fresh try.
 		this.#failedNativeSpeculation = undefined;
@@ -2850,6 +3193,8 @@ export class SessionMaintenance {
 		if (contextWindow <= 0) return;
 		const compactionSettings = this.#compactionSettings;
 		const contextTokens = this.#estimatePrePromptContextTokens(messages, contextWindow);
+		// QA admits a report at the next provider boundary, including prompts already over H.
+		if (this.#qaPolicy()) return;
 		const pendingMidTurnDeadEnd = this.#midTurnDeadEndPendingPrePrompt;
 		this.#midTurnDeadEndPendingPrePrompt = undefined;
 		if (!shouldCompact(contextTokens, contextWindow, compactionSettings)) {
@@ -2991,6 +3336,28 @@ export class SessionMaintenance {
 		const billedContextTokens = calculateContextTokens(lastAssistant.usage);
 		const storedContextTokens = this.#estimateStoredContextTokens();
 		const contextTokens = compactionContextTokens(billedContextTokens, storedContextTokens);
+		const qaPolicy = this.#qaPolicy();
+		const qaCycle = this.#currentQaCycle();
+		if (
+			qaPolicy &&
+			(qaCycle?.checkpointEntryId || (qaCycle?.phase === "hard-report" && qaCycle.reportRequestsUsed > 0))
+		) {
+			if (!(await this.#host.persistTurnMessagesForMidRunCompaction(context))) return;
+			if (signal?.aborted || this.#host.isDisposed()) return;
+			const result = await this.runAutoCompaction("threshold", false, {
+				autoContinue: false,
+				suppressContinuation: true,
+				triggerContextTokens: contextTokens,
+				phase: "mid_turn",
+				detachPostCommit: true,
+			});
+			if (signal?.aborted) return;
+			this.#parkQa();
+			this.#qaOutcome = { generation: this.#host.promptGeneration(), checkpoint: qaCycle?.checkpoint, result };
+			context.stop = true;
+			return;
+		}
+		if (qaPolicy) return;
 		const persistedDeadEnd = this.#midTurnCompactionDeadEnds.has(activeMessages);
 		if (persistedDeadEnd) {
 			if (!(await this.#host.persistTurnMessagesForMidRunCompaction(context))) return;
@@ -3101,6 +3468,44 @@ export class SessionMaintenance {
 		skipAbortedCheck = true,
 		autoContinue = true,
 	): Promise<CompactionCheckResult> {
+		const reportCycle = this.#currentQaCycle();
+		if (reportCycle?.phase === "hard-report" && reportCycle.reportRequestsUsed > 0) {
+			if (
+				assistantMessage.stopReason === "aborted" &&
+				!AIError.is(assistantMessage.errorId, AIError.Flag.ProviderRequestDenied)
+			)
+				return COMPACTION_CHECK_BLOCK_AUTOMATIC_CONTINUATION;
+			const result = await this.runAutoCompaction("threshold", false, {
+				autoContinue: false,
+				suppressContinuation: true,
+				phase: "mid_turn",
+				triggerContextTokens: this.#estimateStoredContextTokens(),
+			});
+			this.#parkQa();
+			return result.automaticContinuationBlocked || !result.historyRewritten
+				? COMPACTION_CHECK_BLOCK_AUTOMATIC_CONTINUATION
+				: result;
+		}
+		const qaOutcome = this.#qaOutcome;
+		if (qaOutcome && qaOutcome.generation === this.#host.promptGeneration()) {
+			this.#qaOutcome = undefined;
+			if (qaOutcome.result.automaticContinuationBlocked || !qaOutcome.result.historyRewritten) {
+				return COMPACTION_CHECK_BLOCK_AUTOMATIC_CONTINUATION;
+			}
+			const checkpoint = qaOutcome.checkpoint;
+			const scheduled = this.#host.scheduleCompactionContinuation({
+				generation: qaOutcome.generation,
+				autoContinue:
+					autoContinue &&
+					this.#compactionSettings.autoContinue !== false &&
+					checkpoint?.disposition === "continue",
+				terminalTextAnswer: false,
+				suppressContinuation: false,
+			});
+			return scheduled ? COMPACTION_CHECK_CONTINUATION : COMPACTION_CHECK_BLOCK_AUTOMATIC_CONTINUATION;
+		}
+		if (this.#qaParked) return COMPACTION_CHECK_BLOCK_AUTOMATIC_CONTINUATION;
+		if (isTerminalTextAssistantAnswer(assistantMessage)) this.#qaCycle = undefined;
 		// Skip if message was aborted (user cancelled) - unless skipAbortedCheck is false
 		if (skipAbortedCheck && assistantMessage.stopReason === "aborted") return COMPACTION_CHECK_NONE;
 		const contextWindow = this.#model?.contextWindow ?? 0;
@@ -3199,6 +3604,7 @@ export class SessionMaintenance {
 					if (!isCompactionMethodUsable(candidate, "overflow", payloadModel, payloadCompactionSettings, true))
 						return false;
 					if (candidate === "shake") return true;
+					if (candidate === "qaonly") return this.#currentQaCycle()?.checkpointEntryId !== undefined;
 					const preparation = prepareCompaction(
 						payloadBranch,
 						resolveMethodSettings(payloadCompactionSettings, candidate),
@@ -3595,8 +4001,11 @@ export class SessionMaintenance {
 			Math.max(0, assistantUsageContextTokens - maintenanceTokensFreed),
 			storedContextTokens,
 		);
-		const thresholdTokens = resolveThresholdTokens(contextWindow, compactionSettings);
-		const shouldThresholdCompact = shouldCompact(contextTokens, contextWindow, compactionSettings);
+		const qaPolicy = this.#qaPolicy();
+		const thresholdTokens = qaPolicy?.hard ?? resolveThresholdTokens(contextWindow, compactionSettings);
+		const shouldThresholdCompact = qaPolicy
+			? contextTokens >= qaPolicy.hard
+			: shouldCompact(contextTokens, contextWindow, compactionSettings);
 		logger.debug("Auto-compaction threshold decision", {
 			phase: "post-agent-end",
 			goalModeEnabled: this.#goalModeState?.enabled === true,
@@ -3918,6 +4327,11 @@ export class SessionMaintenance {
 				hookContext = hookContext ? [...hookContext, memoryBackendContext] : [memoryBackendContext];
 			}
 		}
+		const checkpoint = this.#currentQaCycle()?.checkpoint;
+		if (checkpoint) {
+			const context = renderQaCompactionCheckpoint({ version: 1, ...checkpoint });
+			hookContext = hookContext ? [...hookContext, context] : [context];
+		}
 
 		if (hookCompaction) {
 			preserveData ??= hookCompaction.preserveData;
@@ -4131,8 +4545,7 @@ export class SessionMaintenance {
 
 	/**
 	 * Whether a rendered archive (plus a pre-prompt pass's pending prompt)
-	 * would leave the compacted context above
-	 * `COMPACTION_RECOVERY_BAND × threshold`, the band
+	 * would leave the compacted context above the active recovery target
 	 * {@link #compactionCreatedHeadroom} requires after a threshold pass.
 	 * Committing such an archive there only re-enters the no-headroom rescue, so
 	 * the pass rejects it and lets the next configured method try; with no later
@@ -4144,7 +4557,10 @@ export class SessionMaintenance {
 	#snapcompactLeavesNoHeadroom(projectedTokens: number, settings: EngineCompactionSettings): boolean {
 		const ctxWindow = this.#model?.contextWindow ?? 0;
 		if (ctxWindow <= 0) return false;
-		return projectedTokens > Math.floor(resolveThresholdTokens(ctxWindow, settings) * COMPACTION_RECOVERY_BAND);
+		const recovery =
+			this.#qaPolicy()?.recovery ??
+			Math.floor(resolveThresholdTokens(ctxWindow, settings) * COMPACTION_RECOVERY_BAND);
+		return projectedTokens > recovery;
 	}
 
 	#deadEndRemedies(defaultRemedies: string, implicatedFrames: number): string {
@@ -4352,9 +4768,9 @@ export class SessionMaintenance {
 	#fixedContextExceedsRecoveryBand(): boolean {
 		const contextWindow = this.#model?.contextWindow ?? 0;
 		if (contextWindow <= 0) return false;
-		const recoveryBand = Math.floor(
-			resolveThresholdTokens(contextWindow, this.#compactionSettings) * COMPACTION_RECOVERY_BAND,
-		);
+		const recoveryBand =
+			this.#qaPolicy()?.recovery ??
+			Math.floor(resolveThresholdTokens(contextWindow, this.#compactionSettings) * COMPACTION_RECOVERY_BAND);
 		return (
 			computeNonMessageTokens(this.#host.nonMessageTokenSource(), this.#tokenizer, this.#host.settings.revision) >
 			recoveryBand
@@ -4401,7 +4817,7 @@ export class SessionMaintenance {
 			this.#estimateStoredContextTokens(),
 		);
 		const thresholdTokens = resolveThresholdTokens(contextWindow, compactionSettings);
-		const recoveryBand = Math.floor(thresholdTokens * COMPACTION_RECOVERY_BAND);
+		const recoveryBand = this.#qaPolicy()?.recovery ?? Math.floor(thresholdTokens * COMPACTION_RECOVERY_BAND);
 		// Residual at/below the band is authoritative headroom: the band sits
 		// strictly under the compaction threshold, so the next turn cannot
 		// re-trip threshold compaction regardless of how little this pass shaved.
@@ -4617,7 +5033,7 @@ export class SessionMaintenance {
 			);
 		}
 		const thresholdTokens = resolveThresholdTokens(ctxWindow, settings);
-		const recoveryBandTokens = Math.floor(thresholdTokens * COMPACTION_RECOVERY_BAND);
+		const recoveryBandTokens = this.#qaPolicy()?.recovery ?? Math.floor(thresholdTokens * COMPACTION_RECOVERY_BAND);
 		const baseTokens = computeNonMessageTokens(
 			this.#host.nonMessageTokenSource(),
 			this.#tokenizer,
@@ -5256,6 +5672,155 @@ export class SessionMaintenance {
 			return startIndex > 0 && reason === "threshold"
 				? COMPACTION_CHECK_BLOCK_AUTOMATIC_CONTINUATION
 				: COMPACTION_CHECK_NONE;
+		}
+		if (method === "qaonly") {
+			this.cancelSpeculation();
+			const cycle = this.#currentQaCycle();
+			const recovery =
+				cycle?.recovery ??
+				this.#qaPolicy()?.recovery ??
+				Math.floor(
+					promptBudgetTokens(this.#model?.contextWindow ?? 0, compactionSettings) * 0.6 * COMPACTION_RECOVERY_BAND,
+				);
+			const activeWork =
+				options.phase === "mid_turn" || reason === "overflow" || reason === "incomplete" || !terminalTextAnswer;
+			let blocker =
+				activeWork && !cycle?.checkpointEntryId
+					? "Active work has no accepted QA checkpoint; its working history was preserved."
+					: undefined;
+			let committed = false;
+			const controller = new AbortController();
+			this.#autoCompactionAbortController = controller;
+			const sessionId = this.#host.sessionId();
+			const sourceModel = this.#model;
+			const settingsRevision = this.#host.settings.revision;
+			const current = () =>
+				!controller.signal.aborted &&
+				!this.#host.isDisposed() &&
+				this.#host.sessionId() === sessionId &&
+				this.#host.promptGeneration() === generation &&
+				this.#model === sourceModel &&
+				this.#host.settings.revision === settingsRevision;
+			try {
+				if (!blocker) {
+					await this.#emitLifecycleEvent({ type: "auto_compaction_start", reason, action: "qaonly" }, false);
+					const runtime = await this.#host.getQaCompactionRuntimeState();
+					if (!current()) return COMPACTION_CHECK_BLOCK_AUTOMATIC_CONTINUATION;
+					const prepared = prepareQaCompaction(this.#host.sessionManager.getBranch(), runtime);
+					const result: CompactionResult = {
+						...prepared,
+						firstKeptEntryId: "",
+						tokensBefore: options.triggerContextTokens ?? this.#estimateStoredContextTokens(),
+					};
+					const after = this.#projectCompactedContextTokens({ ...result, method: "qaonly" });
+					const pending =
+						(options.pendingContextTokens ?? 0) +
+						this.#tokenizer.countMessages(this.#host.pendingQaMessages?.() ?? [], {
+							excludeEncryptedReasoning: true,
+						});
+					if (
+						!prepared.details.retainedEntryIds.length ||
+						after + pending > recovery ||
+						after >= this.#estimateStoredContextTokens()
+					) {
+						blocker = `QA cannot reclaim enough context (${after + pending} retained tokens; recovery target ${recovery}).`;
+					} else {
+						if (cycle) cycle.phase = "compacting";
+						await this.#commitCompactionEntry({
+							...result,
+							details: prepared.details,
+							shortSummary: undefined,
+							fromExtension: false,
+							preserveData: undefined,
+							method: "qaonly",
+							codexCompaction: undefined,
+							advisorResetReason: "qaonly",
+							durable: true,
+							validateCommit: () =>
+								committed
+									? !controller.signal.aborted &&
+										this.#host.sessionId() === sessionId &&
+										this.#host.promptGeneration() === generation
+									: current(),
+							onCommitted: () => {
+								committed = true;
+							},
+							detachExtensionEmit: true,
+						});
+						if (
+							!controller.signal.aborted &&
+							this.#host.sessionId() === sessionId &&
+							this.#host.promptGeneration() === generation
+						) {
+							this.#qaCycle = undefined;
+							await this.#emitLifecycleEvent(
+								{
+									type: "auto_compaction_end",
+									action: "qaonly",
+									result,
+									aborted: false,
+									willRetry,
+								},
+								true,
+							);
+							const scheduled = this.#host.scheduleCompactionContinuation({
+								generation,
+								autoContinue: shouldAutoContinue,
+								terminalTextAnswer,
+								suppressContinuation,
+								checkpointDisposition: cycle?.checkpoint?.disposition,
+							});
+							this.#host.emitNotice(
+								"info",
+								`QA compacted ${result.tokensBefore} → ${after} tokens; ${
+									options.phase === "mid_turn" && cycle?.checkpoint?.disposition === "continue"
+										? compactionSettings.autoContinue === false
+											? "paused"
+											: "continuation ready"
+										: scheduled
+											? "resuming"
+											: "paused"
+								}.`,
+								"compaction",
+							);
+							return { continuationScheduled: scheduled, historyRewritten: true };
+						}
+						return { ...COMPACTION_CHECK_BLOCK_AUTOMATIC_CONTINUATION, historyRewritten: committed };
+					}
+					await this.#emitLifecycleEvent(
+						{
+							type: "auto_compaction_end",
+							action: "qaonly",
+							result: undefined,
+							aborted: false,
+							willRetry: false,
+							skipped: true,
+							errorMessage: blocker,
+						},
+						true,
+					);
+				}
+			} catch (error) {
+				if (committed) {
+					logger.warn("QA post-commit notification failed", { error: toError(error).message });
+					return { ...COMPACTION_CHECK_NONE, historyRewritten: true };
+				}
+				blocker = `QA compaction failed: ${toError(error).message}`;
+			} finally {
+				if (this.#autoCompactionAbortController === controller) this.#autoCompactionAbortController = undefined;
+			}
+			if (!current()) return COMPACTION_CHECK_BLOCK_AUTOMATIC_CONTINUATION;
+			if (methodIndex + 1 < methods.length) {
+				return await this.runAutoCompaction(reason, willRetry, { ...options, methodIndex: methodIndex + 1 });
+			}
+			if (cycle) cycle.phase = "blocked";
+			this.#parkQa();
+			this.#host.emitNotice(
+				"warning",
+				`${blocker} Paused. Configure a later summary method, reduce fixed context, or start a new conversation.`,
+				"compaction",
+			);
+			return COMPACTION_CHECK_BLOCK_AUTOMATIC_CONTINUATION;
 		}
 
 		// A speculative pass may have already produced this compaction's summary
@@ -5926,6 +6491,14 @@ export class SessionMaintenance {
 									// retry too — the budgets would multiply and each outer
 									// wait would stack on top of an inner backoff.
 									oneshotRetry: false,
+									completeImpl: async (requestModel, requestContext, requestOptions) => {
+										const stream = await this.#host.sideStreamFn(
+											requestModel,
+											requestContext,
+											requestOptions,
+										);
+										return stream.result();
+									},
 								},
 							);
 							break;
@@ -6424,8 +6997,12 @@ export class SessionMaintenance {
 		if (deadEndWarning) {
 			this.#host.emitNotice("warning", deadEndWarning, "compaction");
 		}
-		if (continuationScheduled) return COMPACTION_CHECK_CONTINUATION;
-		return noProgressDeadEnd ? COMPACTION_CHECK_BLOCK_AUTOMATIC_CONTINUATION : COMPACTION_CHECK_NONE;
+		const outcome = continuationScheduled
+			? COMPACTION_CHECK_CONTINUATION
+			: noProgressDeadEnd
+				? COMPACTION_CHECK_BLOCK_AUTOMATIC_CONTINUATION
+				: COMPACTION_CHECK_NONE;
+		return { ...outcome, historyRewritten: true };
 	}
 
 	/**
@@ -6496,7 +7073,8 @@ export class SessionMaintenance {
 				if (typeof triggerContextTokens === "number" && Number.isFinite(triggerContextTokens)) {
 					const correctedTokens = Math.max(0, triggerContextTokens - result.tokensFreed);
 					const thresholdTokens = resolveThresholdTokens(contextWindow, compactionSettings);
-					const recoveryBand = Math.floor(thresholdTokens * COMPACTION_RECOVERY_BAND);
+					const recoveryBand =
+						this.#qaPolicy()?.recovery ?? Math.floor(thresholdTokens * COMPACTION_RECOVERY_BAND);
 					stillOverThreshold = correctedTokens > recoveryBand;
 				} else {
 					const postShakeTokens = this.#host.getContextUsage({ contextWindow })?.tokens ?? 0;

@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { isEnoent, logger, postmortem } from "@oh-my-pi/pi-utils";
 import { canonicalProjectDir, daemonRuntimeDir } from "./paths";
+import { DAEMON_LAUNCH_LEDGER_FILE, DAEMON_LAUNCH_LEDGER_MARKER } from "./protocol";
 
 const CLIENTS_DIR = "clients";
 const BROKER_PID_FILE = "broker.pid";
@@ -148,6 +149,9 @@ export async function pruneDeadDaemonRuntimeDirs(currentRuntimeDir: string): Pro
 		const dir = path.join(root, entry.name);
 		if (path.resolve(dir) === current) continue;
 		try {
+			// Bot launch tombstones and owner fences outlive process/runtime leases.
+			if (await Bun.file(path.join(dir, DAEMON_LAUNCH_LEDGER_MARKER)).exists()) continue;
+			if (await Bun.file(path.join(dir, DAEMON_LAUNCH_LEDGER_FILE)).exists()) continue;
 			const stat = await fs.stat(dir);
 			if (now - stat.mtimeMs < DAEMON_RUNTIME_STALE_GRACE_MS) continue;
 			if ((await readLiveDaemonBrokerPid(dir)) !== undefined) continue;

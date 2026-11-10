@@ -11,6 +11,7 @@ export * from "./meta-validator";
 export * from "./normalize";
 export * from "./spill";
 export * from "./strict-tool-validation";
+export * from "./strict-value-validation";
 export * from "./types";
 export * from "./typescript";
 export * from "./wire";

@@ -5,6 +5,7 @@ import { Markdown } from "../components/markdown";
 import { formatNumber } from "@oh-my-pi/pi-utils";
 import { getMarkdownTheme, getThemeEpoch, theme } from "../theme";
 import { expandKeyHint } from "../render/render-utils";
+import { truncateToWidth } from "../utils";
 import type { BranchSummaryMessage, CompactionSummaryMessage, CustomMessage } from "./messages";
 import type { TspSpan } from "@oh-my-pi/pi-wire";
 import { md, node, span, text } from "../native/describe";
@@ -19,6 +20,7 @@ const COMPACTION_METHOD_LABELS: Record<string, string> = {
 	handoff: "handed-off",
 	snapcompact: "snap-compacted",
 	shake: "shaken",
+	qaonly: "Q&A-compacted",
 };
 
 /** `256K→20K` amount badge, or undefined when the entry predates `tokensAfter`. */
@@ -29,6 +31,8 @@ function compactionAmount(message: CompactionSummaryMessage): string | undefined
 
 interface SummaryDividerOptions {
 	label: () => string;
+	/** Label without decorative or secondary content for narrow viewports. */
+	narrowLabel?: () => string;
 	/** Themed spans of the label for native terminals. */
 	nativeLabel: () => TspSpan[];
 	detailMarkdown: () => string;
@@ -44,10 +48,12 @@ interface SummaryDividerOptions {
  */
 class DividerSummary implements Component {
 	readonly #label: () => string;
+	readonly #narrowLabel: (() => string) | undefined;
 	#cache: { width: number; lines: readonly string[] } | undefined;
 
-	constructor(label: () => string) {
+	constructor(label: () => string, narrowLabel?: () => string) {
 		this.#label = label;
+		this.#narrowLabel = narrowLabel;
 	}
 
 	invalidate(): void {
@@ -75,8 +81,10 @@ class DividerSummary implements Component {
 		// ` label hint ` framed by rules on both sides.
 		const remaining = width - plainWidth - 2;
 		if (remaining < 4) {
-			// Too narrow for a framed rule — emit the bare label.
-			return theme.fg("muted", label);
+			// Keep the meaningful label when decoration or metadata would clip it.
+			const narrowLabel = this.#narrowLabel?.() ?? label;
+			const text = Bun.stringWidth(label, { countAnsiEscapeCodes: false }) <= width ? label : narrowLabel;
+			return truncateToWidth(theme.fg("muted", text), width);
 		}
 		const left = Math.floor(remaining / 2);
 		const right = remaining - left;
@@ -171,7 +179,7 @@ class SummaryMessageComponent implements Component {
 
 	#createDisclosure(expanded: boolean): Disclosure {
 		return new Disclosure({
-			summary: new DividerSummary(this.#options.label),
+			summary: new DividerSummary(this.#options.label, this.#options.narrowLabel),
 			body: () => this.#detailBox(),
 			expanded,
 		});
@@ -195,7 +203,7 @@ class SummaryMessageComponent implements Component {
  *   ──────── 📷 remote-compacted · 256K→20K · ctrl+o ────────
  *
  * The label names the maintenance method that fired (remote/soft/handoff/
- * snapcompact; "compacted" for legacy or extension-provided entries) and the
+ * snapcompact/qaonly; "compacted" for legacy or extension-provided entries) and the
  * before → after context amounts when the entry recorded them. The
  * conversation above the divider stays visible (display transcript keeps
  * full history); only the LLM context was reset. Expanding (ctrl+o) reveals
@@ -207,6 +215,7 @@ export class CompactionSummaryMessageComponent extends SummaryMessageComponent {
 			// A dead-end warning stamped by the progress guard badges the bar;
 			// the full text lives in the ctrl+o detail block below.
 			label: () => compactionLabel(message),
+			narrowLabel: () => (message.method && COMPACTION_METHOD_LABELS[message.method]) || "compacted",
 			nativeLabel: () => compactionNativeLabel(message),
 			nativeDetail: () => compactionNativeDetail(message),
 			detailMarkdown: () => compactionDetailMarkdown(message),

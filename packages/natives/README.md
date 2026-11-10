@@ -11,6 +11,7 @@ Native Rust functionality via N-API.
 - **WebRTC**: Native Opus media, SDP offer/answer negotiation, and data-channel events for live sessions
 - **File locking**: Process-owned cross-process locks with in-memory kernel names on Linux/Windows and `flock(2)` sidecars on other Unix platforms
 - **Local IPC**: `IpcServer`/`IpcConnection` over Unix sockets and Windows named pipes — owner-only access, single-instance binding with stale-endpoint takeover, newline or raw framing; `ipcEndpoint(dir, name)` names endpoints per platform
+- **Owned children**: `OwnedChild.spawn` retains native Unix child ownership, serializes poll/reap/signals and captures append-only or rotated logs; explicit environment and bounded stdin. PID is diagnostic, not recoverable authority. Windows spawn is unsupported; Unix sessions/groups are not descendant containment or a sandbox.
 - **PDF**: In-memory PDF-to-Markdown extraction with OCR-page classification via `pdf-inspector`
 - **Binary patches**: `applyBinaryPatch(oldPath, patchPath, outPath)` applies an HDiffPatch single-stream patch (HDIFFSF20, zstd or uncompressed), streaming from files; callers verify digests
 

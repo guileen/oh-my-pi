@@ -46,6 +46,13 @@
 
 - Fixed Factory Droid Fable requests offering Opus 5 as the refusal fallback when your organization's model policy excludes Opus 5; Claude requests now offer only fallback models your account can use, and a request served by another organization's login than the one your model list came from offers none ([#17772](https://github.com/can1357/oh-my-pi/pull/17772) by [@will-bogusz](https://github.com/will-bogusz))
 
+- Added `beforeProviderRequest` admission for inference attempts, including transport retries, with structured non-retryable denial.
+- Added fail-closed immutable JSON Schema value validation for a restricted 2020-12 subset, with depth, size and reference-expansion limits and no coercion or repair.
+- `/login mistral` signs in through the browser like the Mistral Vibe CLI and stores the minted API key, whose usage counts against the plan's Vibe Code quota instead of pay-as-you-go API credits; `MISTRAL_API_KEY` still works ([#13875](https://github.com/can1357/oh-my-pi/pull/13875) by [@Gauthier-Huguenin](https://github.com/Gauthier-Huguenin), continued in [#17672](https://github.com/can1357/oh-my-pi/pull/17672) by [@abilliontokens](https://github.com/abilliontokens))
+
+### Fixed
+
+- Fixed JSON Schema equality and object constraints treating inherited fields inconsistently, and string bounds/patterns treating Unicode characters as UTF-16 units.
 ## [18.15.0] - 2026-11-01
 
 ### Fixed

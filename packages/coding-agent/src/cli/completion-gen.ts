@@ -69,7 +69,7 @@ const MODEL_FLAGS: Record<string, true> = { model: true, smol: true, slow: true,
 /** Single-value flags resolved against on-disk sessions. */
 const SESSION_FLAGS: Record<string, true> = { resume: true, restore: true, fork: true, session: true };
 /** Flags whose value is a directory path. */
-const DIR_FLAGS: Record<string, true> = { "session-dir": true, "plugin-dir": true };
+const DIR_FLAGS: Record<string, true> = { "session-dir": true, "plugin-dir": true, "skills-dir": true, cwd: true };
 
 function flagValue(name: string, desc: FlagDescriptor): ValueSource {
 	if (desc.kind === "boolean") return { kind: "flag" };
@@ -79,6 +79,7 @@ function flagValue(name: string, desc: FlagDescriptor): ValueSource {
 	if (SESSION_FLAGS[name]) return { kind: "sessions" };
 	if (name === "tools") return { kind: "list", values: BUILTIN_TOOL_NAMES };
 	if (DIR_FLAGS[name]) return { kind: "dir" };
+	if (name === "expect-bot-id" || name === "job") return { kind: "value" };
 	if (desc.kind === "integer") return { kind: "value" };
 	return { kind: "file" };
 }

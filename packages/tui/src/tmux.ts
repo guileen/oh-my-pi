@@ -10,13 +10,10 @@ export function wrapTmuxPassthroughIfNeeded(payload: string, env: NodeJS.Process
 }
 
 const CLIENT_TERMTYPE_NAME = /^([A-Za-z][A-Za-z0-9._+-]*)(?=\s|\(|$)/u;
-// One `tmux display-message` round trip over the server socket, which answers in
-// single-digit milliseconds when healthy. 500ms kept losing the race on a loaded
-// machine (fork/exec of the tmux client alone can exceed it on a saturated box),
-// and a lost race is indistinguishable from "not tmux": the process then falls
-// back to the true-color profile for the whole session. 2s bounds the startup
-// stall only when tmux is genuinely wedged.
-const CLIENT_TERMINAL_TIMEOUT_MS = 2_000;
+// Bound tmux IPC queries without mistaking a slow fork/exec on a loaded host
+// for an unavailable server. The client can exceed 500ms before it even
+// reaches the server; 2s still bounds the startup stall for a wedged server.
+const TMUX_COMMAND_TIMEOUT_MS = 2_000;
 /** Client `TERM` values that name their emulator; tmux records this on every version. */
 const CLIENT_TERMNAME_PROGRAMS: ReadonlyArray<readonly [RegExp, string]> = [
 	[/^xterm-kitty$/u, "kitty"],
@@ -53,7 +50,7 @@ function queryTmuxClientTerminalNames(env: NodeJS.ProcessEnv): readonly string[]
 			env,
 			stdout: "pipe",
 			stderr: "ignore",
-			timeout: CLIENT_TERMINAL_TIMEOUT_MS,
+			timeout: TMUX_COMMAND_TIMEOUT_MS,
 			killSignal: "SIGKILL",
 		});
 		if (result.exitCode !== 0) return [];
@@ -62,8 +59,6 @@ function queryTmuxClientTerminalNames(env: NodeJS.ProcessEnv): readonly string[]
 		return [];
 	}
 }
-
-const TMUX_COMMAND_TIMEOUT_MS = 500;
 
 /** Run a tmux command against the current server; its stdout, or null on failure. */
 function runTmux(args: string[], env: NodeJS.ProcessEnv): string | null {

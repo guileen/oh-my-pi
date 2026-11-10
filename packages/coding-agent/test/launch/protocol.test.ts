@@ -1,5 +1,10 @@
 import { describe, expect, it } from "bun:test";
-import { type DaemonOperation, parseDaemonRpcResult, parseDaemonWireRequest } from "../../src/launch/protocol";
+import {
+	type DaemonOperation,
+	type LaunchDisposition,
+	parseDaemonRpcResult,
+	parseDaemonWireRequest,
+} from "../../src/launch/protocol";
 
 const operation: Extract<DaemonOperation, { op: "logs" }> = {
 	op: "logs",
@@ -132,5 +137,70 @@ describe("regex-derived protocol fields", () => {
 			matched: "",
 			timedOut: false,
 		});
+	});
+});
+
+describe("durable launch protocol", () => {
+	const metadata = { launch_intent_id: "intent", session_owner_id: "owner", owner_epoch: "9007199254740993" };
+
+	it("preserves decimal owner fences and exact stop generations", () => {
+		expect(
+			parseDaemonWireRequest({
+				id: "fence",
+				token: "token",
+				operation: { op: "fence_owner", session_owner_id: "owner", through_epoch: metadata.owner_epoch },
+			}).operation,
+		).toEqual({ op: "fence_owner", session_owner_id: "owner", through_epoch: metadata.owner_epoch });
+		expect(
+			parseDaemonWireRequest({
+				id: "stop",
+				token: "token",
+				operation: { op: "stop", name: "service", id: "generation-id", generation: "123", timeoutMs: 500 },
+			}).operation,
+		).toMatchObject({ id: "generation-id", generation: "123" });
+		for (const epoch of ["01", "-1", "1.0", "1e3"]) {
+			expect(() =>
+				parseDaemonWireRequest({
+					id: "invalid-epoch",
+					token: "token",
+					operation: { op: "reconcile_launch", ...metadata, owner_epoch: epoch, mode: "cancel" },
+				}),
+			).toThrow("canonical unsigned decimal");
+		}
+	});
+
+	it("does not accept a non-final terminal or final pending response", () => {
+		const operation = { op: "reconcile_launch" as const, ...metadata, mode: "inspect" as const };
+		const cancelled: LaunchDisposition = {
+			launch_intent_id: metadata.launch_intent_id,
+			state: "cancelled_before_launch",
+			service: null,
+			outcome: null,
+			final: true,
+			error: null,
+		};
+		expect(parseDaemonRpcResult(operation, { disposition: cancelled })).toEqual({
+			op: "reconcile_launch",
+			disposition: cancelled,
+		});
+		expect(() => parseDaemonRpcResult(operation, { disposition: { ...cancelled, state: "pending" } })).toThrow(
+			"finality",
+		);
+		expect(() =>
+			parseDaemonRpcResult(operation, {
+				disposition: {
+					...cancelled,
+					state: "terminal",
+					service: { id: "service", generation: "12" },
+					outcome: "cancelled",
+					final: false,
+				},
+			}),
+		).toThrow("finality");
+		expect(() =>
+			parseDaemonRpcResult(operation, {
+				disposition: { ...cancelled, state: "terminal", outcome: "cancelled" },
+			}),
+		).toThrow("exact generation");
 	});
 });

@@ -1,0 +1,1 @@
+Durable work state for the issued QA cycle, not a task-completion signal. You MUST choose disposition for the entire current user task, not just the finished milestone. Acceptance records this state; the session controls compaction and continuation.

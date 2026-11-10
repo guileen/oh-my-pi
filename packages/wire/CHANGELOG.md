@@ -7,6 +7,17 @@
 ### Added
 
 - Added the collab envelope helpers `packEnvelope`, `unpackEnvelope` and `rewriteEnvelopePeer`
+- Added the browser-safe `@oh-my-pi/pi-wire/graph` consumer and protocol entry, with shared Graph scalar types and record validators and no agent, coding-agent, Node or Bun runtime imports.
+- Added the `omp.graph/notification/v1` dispatch outbox record and page types, so a completion, failure, hold or cancellation can reach wherdr, a headless client or OMH through one versioned contract instead of an ad-hoc callback.
+- Added the `omp.graph/catalog/v1` and `omp.graph/run-index/v1` record types: a dispatcher can read a Graph's purpose and top-level input/output contract, then find the Runs that carry its titles and states.
+- Exposed the shared Graph record validator to browser gateways so negotiated execution records use the same validation boundary as producers and consumers.
+- Added shared validation for bounded protected Graph text responses, including unavailable-content and request-identity boundaries.
+- Added browser-safe validation for protected Graph definition reads, edits and authoring receipts, with UTF-8 and finite-JSON bounds.
+- Moved the sole deterministic `canonicalJson` serializer to `@oh-my-pi/pi-wire/canonical-json`.
+
+### Fixed
+
+- Graph source snapshots now replace previous-journal records at commit instead of retaining a prior epoch's higher revisions.
 
 ## [18.14.2] - 2026-10-31
 

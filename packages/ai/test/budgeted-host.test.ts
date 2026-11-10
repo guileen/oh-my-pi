@@ -4,6 +4,7 @@ import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { toModelSpec } from "@oh-my-pi/pi-catalog/provider-models/bundled-references";
 import { reachesBudgetedHost, reachesOfficialEndpoint } from "../src/providers/anthropic-state";
 import type { Model, ModelSpec } from "../src/types";
+import { withEnv } from "./helpers";
 
 function factoryModel(baseUrl: string): Model {
 	const spec: ModelSpec<"factory-droid-agent"> = {
@@ -35,14 +36,34 @@ describe("reachesBudgetedHost", () => {
 		expect(reachesBudgetedHost(factoryModel(baseUrl))).toBe(expected);
 	});
 
-	it("follows reachesOfficialEndpoint for every other provider", () => {
-		const opus = getBundledModel("anthropic", "claude-opus-5-5");
-		const proxied = buildModel({ ...toModelSpec(opus), baseUrl: "https://proxy.example/v1" });
-		const openrouter = getBundledModel("openrouter", "anthropic/claude-opus-5.5");
-		for (const model of [opus, proxied, openrouter]) {
-			expect(reachesBudgetedHost(model)).toBe(reachesOfficialEndpoint(model));
-		}
-		expect(reachesBudgetedHost(opus)).toBe(true);
-		expect(reachesBudgetedHost(proxied)).toBe(false);
+	it("follows reachesOfficialEndpoint for every other provider", async () => {
+		await withEnv({ ANTHROPIC_BASE_URL: undefined, CLAUDE_CODE_USE_FOUNDRY: undefined }, () => {
+			const opus = getBundledModel("anthropic", "claude-opus-5-5");
+			const proxied = buildModel({ ...toModelSpec(opus), baseUrl: "https://proxy.example/v1" });
+			const openrouter = getBundledModel("openrouter", "anthropic/claude-opus-5.5");
+			for (const model of [opus, proxied, openrouter]) {
+				expect(reachesBudgetedHost(model)).toBe(reachesOfficialEndpoint(model));
+			}
+			expect(reachesBudgetedHost(opus)).toBe(true);
+			expect(reachesBudgetedHost(proxied)).toBe(false);
+		});
+	});
+
+	it.each([
+		["Anthropic gateway", { ANTHROPIC_BASE_URL: "https://gateway.example", CLAUDE_CODE_USE_FOUNDRY: undefined }],
+		[
+			"Foundry",
+			{
+				ANTHROPIC_BASE_URL: undefined,
+				CLAUDE_CODE_USE_FOUNDRY: "true",
+				FOUNDRY_BASE_URL: "https://foundry.example",
+			},
+		],
+	])("does not apply official budgets when routed through %s", async (_label, env) => {
+		await withEnv(env, () => {
+			const opus = getBundledModel("anthropic", "claude-opus-5-5");
+			expect(reachesOfficialEndpoint(opus)).toBe(false);
+			expect(reachesBudgetedHost(opus)).toBe(false);
+		});
 	});
 });

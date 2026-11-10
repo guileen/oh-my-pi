@@ -68,6 +68,11 @@ export const commands: CommandEntry[] = [
 		help: commandHelp.benchHelp,
 	},
 	{
+		name: "bot",
+		load: () => import("./commands/bot").then(m => m.default),
+		help: commandHelp.botHelp,
+	},
+	{
 		name: "browser-relay",
 		load: () => import("./commands/browser-relay").then(m => m.default),
 		help: commandHelp.browserRelayHelp,
@@ -138,6 +143,11 @@ export const commands: CommandEntry[] = [
 		name: "git",
 		load: () => import("./commands/git").then(m => m.default),
 		help: commandHelp.gitHelp,
+	},
+	{
+		name: "graph",
+		load: () => import("./commands/graph").then(m => m.default),
+		help: commandHelp.graphHelp,
 	},
 	{
 		name: "grievances",

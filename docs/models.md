@@ -870,7 +870,9 @@ String entries apply everywhere. Scoped entries apply when the current working d
 Both surfaces keep provider-prefixed concrete models visible and selectable.
 
 - `/model` / `/models` opens the model hub with role assignments and provider catalogs; the session-only picker changes the active model without saving a role assignment.
-- `omp models` (default `ls` action) prints provider-grouped tables of available **chat** models; `--kind <kind>` selects another catalog kind and `--kind all` includes every kind.
+- `omp models` with no arguments prints a provider index — one line per provider with its model count — and a footer pointing at the drill-down; `--full` prints every model instead.
+- `omp models <provider>` (or `omp models ls <pattern>`) prints a provider-grouped table of available **chat** models; `--kind <kind>` selects another catalog kind and `--kind all` includes every kind.
+- `--compact` drops that table's borders and prints one line per model; it is the default whenever stdout is not a TTY, so scripts and agents read one row per line.
 - `omp models find <substring>` filters by provider, id, or name; `omp models refresh` forces an online catalog re-fetch ignoring the model cache TTL; a provider name doubles as an `ls` filter (e.g. `omp models openai-codex`).
 - Other flags: `--json`, `-e <path>` / `--extension <path>` (repeatable), `--no-extensions` (skip ambient discovery; explicit `-e` still loads), and `--config <overlay>` (repeatable).
 

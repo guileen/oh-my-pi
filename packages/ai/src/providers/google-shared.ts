@@ -1,3 +1,4 @@
+import { providerRequestFetch } from "../utils/provider-request";
 /**
  * Shared utilities for Google Generative AI and Google Cloud Code Assist providers.
  */
@@ -1069,7 +1070,7 @@ export function streamGoogleGenAI<T extends "google-generative-ai" | "google-ver
 			};
 
 			const bodyJson = JSON.stringify(paramsToWireBody(params));
-			const fetchImpl = plan.fetch ?? options?.fetch ?? (globalThis.fetch.bind(globalThis) as FetchImpl);
+			const fetchImpl = providerRequestFetch(model, options, plan.fetch ?? options?.fetch ?? globalThis.fetch);
 			// Bun's native fetch ceiling is disabled (`timeout: false`) so configurable
 			// watchdogs govern slow-prefill streams (issues #2422, #16991). Direct callers
 			// that bypass `register-builtins` (which installs the iterator-level

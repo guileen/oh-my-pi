@@ -562,6 +562,24 @@ class ProtocolParsingTests(unittest.TestCase):
         self.assertIsInstance(end, AutoCompactionEndEvent)
         self.assertEqual(end.action, "shake")
 
+    def test_parse_local_qa_compaction_without_inventing_usage(self) -> None:
+        start = parse_notification(
+            {"type": "auto_compaction_start", "reason": "threshold", "action": "qaonly"}
+        )
+        end = parse_notification(
+            {
+                "type": "auto_compaction_end",
+                "action": "qaonly",
+                "aborted": False,
+                "willRetry": False,
+            }
+        )
+        self.assertIsInstance(start, AutoCompactionStartEvent)
+        self.assertEqual(start.action, "qaonly")
+        self.assertIsInstance(end, AutoCompactionEndEvent)
+        self.assertEqual(end.action, "qaonly")
+        self.assertIsNone(end.result)
+
     def test_parse_extension_ui_request(self) -> None:
         notification = parse_notification(
             {

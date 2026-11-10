@@ -395,14 +395,16 @@ export class PsTopComponent implements Component {
 		const entry = this.#flat[this.#selected];
 		const left: NativeNode[] = [];
 		if (this.#view === "table") {
-			const running = this.#flat.filter(flat => !TERMINAL_STATES[flat.row.snapshot.state]).length;
-			const stopped = this.#flat.length - running;
+			const unknown = this.#flat.filter(flat => flat.row.snapshot.state === "unknown").length;
+			const stopped = this.#flat.filter(flat => TERMINAL_STATES[flat.row.snapshot.state]).length;
+			const running = this.#flat.length - stopped - unknown;
 			left.push(
 				text("Processes", { role: "omp.app.title" }),
 				text(
 					[
 						span(`${running} running`, running > 0 ? "success" : "muted"),
 						...(stopped > 0 ? [span(` · ${stopped} stopped`, "muted")] : []),
+						...(unknown > 0 ? [span(` · ${unknown} unknown`, "warning")] : []),
 						span(` · ${this.#reports.length} scope${this.#reports.length === 1 ? "" : "s"}`, "muted"),
 					],
 					{ truncate: "end" },
@@ -583,7 +585,7 @@ export class PsTopComponent implements Component {
 		const flags = [spec.pty && "pty", spec.persist && "persist", spec.detached && "detached"].filter(Boolean);
 		items.push({ k: "Flags", v: flags.length > 0 ? flags.join(" · ") : "—" });
 		const body: NativeNode[] = [];
-		if (!TERMINAL_STATES[daemon.state]) {
+		if (!TERMINAL_STATES[daemon.state] && daemon.state !== "unknown") {
 			body.push(
 				row([text([span("Up for", "muted")]), elapsed(Date.now() - daemon.startedAt)], {
 					gap: "xs",
@@ -719,7 +721,7 @@ export class PsTopComponent implements Component {
 				{ label: "command:", value: collapseCommand(formatCommand(info.spec)) },
 				{ label: "cwd:", value: info.spec.cwd },
 			];
-			if (!TERMINAL_STATES[daemon.state])
+			if (!TERMINAL_STATES[daemon.state] && daemon.state !== "unknown")
 				rows.push({ label: "uptime:", value: formatDuration(Date.now() - daemon.startedAt) });
 			if (daemon.exitReason) rows.push({ label: "exit:", value: daemon.exitReason });
 			rows.push({ label: "restarts:", value: `${daemon.restartCount} (policy: ${info.spec.restart})` });
@@ -809,7 +811,7 @@ function describeProcess(scope: PsScope, daemon: PsDaemonRow): NativeNode {
 	const state = stateLabel(snapshot);
 	const meta = [
 		snapshot.pid !== undefined && !terminal ? `pid ${snapshot.pid}` : undefined,
-		terminal ? undefined : formatDuration(Date.now() - snapshot.startedAt),
+		terminal || snapshot.state === "unknown" ? undefined : formatDuration(Date.now() - snapshot.startedAt),
 		`${snapshot.restartCount} restart${snapshot.restartCount === 1 ? "" : "s"}`,
 		flagsCell(daemon) || undefined,
 	].filter(part => part !== undefined);

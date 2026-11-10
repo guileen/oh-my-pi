@@ -452,6 +452,7 @@ import {
 	queueChipText,
 	toRestoredQueuedMessage,
 } from "./queued-messages";
+import { type QaCheckpointInput, type QaCheckpointAcceptance, qaCheckpointError } from "./qa-rollover";
 import { checkCodexBalance, readResetMarker, resetLockPath, withResetFence } from "./reset-fence";
 import type { ServingModel } from "./retry-fallback-chains";
 import {
@@ -2497,6 +2498,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				let turnError: unknown;
 				const inFlightEpoch = this.#beginInFlight();
 				try {
+					this.#maintenance.resetForNewPrompt();
 					await this.agent.prompt(messages.length === 1 ? first : messages);
 				} catch (error) {
 					turnError = error;
@@ -2899,6 +2901,12 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				if (this.#isDisposed) return;
 				this.#experimentalContextNotesReminder = { prompt, generation: this.#promptGeneration };
 			},
+			hasQaRolloverTool: () => this.#tools.getEnabledToolNames().includes("new_context"),
+			pendingQaMessages: () => [
+				...this.agent.peekSteeringQueue(),
+				...this.agent.peekFollowUpQueue(),
+				...this.#pendingNextTurnMessages,
+			],
 			memoryBackendSession: () => this,
 			emitSessionEvent: (event, options) => this.#emitSessionEvent(event, options),
 			emitNotice: (level, message, source) => this.emitNotice(level, message, source),
@@ -2910,6 +2918,22 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			reconnectToAgent: () => this.#reconnectToAgent(),
 			drainStrandedQueuedMessages: () => this.#drainStrandedQueuedMessages(),
 			buildDisplaySessionContext: () => this.buildDisplaySessionContext(),
+			getQaCompactionRuntimeState: async () => {
+				const planning = this.#planModeState?.enabled === true;
+				const approvedPlan = planning
+					? undefined
+					: await loadOverallPlanReference(this.#planReferencePath, this.#localProtocolOptions());
+				return {
+					plan:
+						planning && this.#planModeState
+							? { path: this.#planModeState.planFilePath, mode: "planning" }
+							: approvedPlan
+								? { path: approvedPlan.path, mode: "approved" }
+								: undefined,
+					goal: this.#goalModeState?.enabled ? this.#goalModeState.goal : undefined,
+					jobs: this.getAsyncJobSnapshot({ recentLimit: 0 }) ?? undefined,
+				};
+			},
 			persistEvalStateContext: () => {
 				// The rewritten history carries no snapshot yet, so always build one.
 				const message = this.#buildEvalStateContextMessage([]);
@@ -2982,13 +3006,23 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		};
 		this.#maintenance = new SessionMaintenance(maintenanceHost);
 		this.addDisposer(
+			this.agent.addBeforeModelCallHook((_signal, context) => {
+				this.#maintenance.prepareQaModelCall(context.messages);
+			}),
+		);
+		this.addDisposer(
+			this.agent.addBeforeModelCall((context, signal) => this.#maintenance.beforeQaModelCall(context, signal)),
+		);
+		this.agent.setBeforeProviderRequest(() => this.#maintenance.beforeQaProviderRequest());
+		this.addDisposer(() => this.agent.setBeforeProviderRequest(undefined));
+		this.addDisposer(
 			this.agent.addBeforeModelCallHook((_signal, context) =>
 				this.#maintenance.renderArchiveForModel(context.messages),
 			),
 		);
 		// A request past the cap mid-run stops the run before it is sent: no turn opens, nothing is billed.
-		// The gate is registered only while a cap is set: any before-model-call gate also turns a user abort
-		// before the next request into a clean stop, which leaves no interrupted turn for `/retry`.
+		// The gate is registered only while a cap is set, avoiding an unnecessary
+		// admission check on every provider request.
 		let removeCostCapGate: (() => void) | undefined;
 		const syncCostCapGate = () => {
 			if (this.#costGate.capped) {
@@ -3309,6 +3343,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 *   3. else undefined.
 	 */
 	nextToolChoiceDirective(): ToolChoiceDirective | undefined {
+		const reportChoice = this.#maintenance.qaReportToolChoice();
+		if (reportChoice) return reportChoice;
 		const hard = this.#nextHardToolChoice();
 		if (hard !== undefined) return hard;
 		const head = this.#toolChoiceQueue.peekPendingHead();
@@ -4316,18 +4352,13 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	}
 
 	/**
-	 * Session transitions (`/compact`, `/new`, session switch) disconnect before
-	 * `await abort()`, so the result the abort gives a running tool reaches no
-	 * persisting handler. Record it before the transition rewrites or leaves the
-	 * session; otherwise its call is left without a result and replay fills in a
-	 * synthetic one. Only results of calls the last assistant turn before the
-	 * disconnect made qualify: that turn was persisted at its `message_end`. A turn
-	 * the abort cut short mid-stream was never persisted, so its synthetic results
-	 * would be orphans. A successful `rewind` result is the exception too: the
-	 * aborted turn never applies it, so recording "rewind requested" would claim
-	 * a branch cut that never happened.
+	 * Preserve settled prompts and paired tool results consumed while transitions
+	 * disconnect event listeners. The core can start streaming before its buffered
+	 * user-message events reach the session; losing that prompt changes the intent
+	 * resumed after compaction. Interrupted assistant turns remain excluded, as do
+	 * their orphan results and successful rewinds the aborted turn never applied.
 	 */
-	#persistToolResultsEndedWhileDisconnected(): void {
+	#persistMessagesEndedWhileDisconnected(): void {
 		const start = this.#disconnectedMessageCount;
 		if (start === undefined) return;
 		// Once per disconnect: the transition may replace the agent's messages next (compaction, reset).
@@ -4337,10 +4368,17 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		for (let index = Math.min(start, messages.length) - 1; index >= 0 && !lastAssistant; index--) {
 			if (messages[index].role === "assistant") lastAssistant = messages[index];
 		}
-		if (lastAssistant?.role !== "assistant") return;
-		const knownCalls = new Set(lastAssistant.content.flatMap(block => (block.type === "toolCall" ? [block.id] : [])));
+		const knownCalls = new Set(
+			lastAssistant?.role === "assistant"
+				? lastAssistant.content.flatMap(block => (block.type === "toolCall" ? [block.id] : []))
+				: [],
+		);
 		for (let index = start; index < messages.length; index++) {
 			const message = messages[index];
+			if (isUserAuthoredMessage(message) || message.role === "developer" || message.role === "fileMention") {
+				this.#persistMessageEnd(message, this.#promptGeneration);
+				continue;
+			}
 			if (message.role !== "toolResult" || !knownCalls.has(message.toolCallId)) continue;
 			if (!message.isError && semanticToolResult(message.toolName, message)?.toolName === "rewind") continue;
 			this.#persistSessionMessageIfMissing(message);
@@ -5134,6 +5172,17 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 
 			let compactionResult = COMPACTION_CHECK_NONE;
 			let checkedCompaction = false;
+			if (this.#maintenance.hasPendingQaReport()) {
+				maintenanceRoute("qa-report-settlement");
+				const compactionTask = this.#maintenance.checkCompaction(msg);
+				this.#trackPostPromptTask(compactionTask);
+				const reportResult = await compactionTask;
+				this.#recovery.resolveRetry();
+				this.#resetSessionStopContinuationState();
+				await emitAgentEndNotification(reportResult.continuationScheduled ? { willContinue: true } : undefined);
+				return;
+			}
+
 			if (activeGoal) {
 				// Payload rejections get a pre-compaction chain consult; checkCompaction()'s overflow path commits a remedy before returning (#9235).
 				if (AIError.isPayloadRejection(msg) && this.#recovery.isHardErrorFallbackEligible(msg)) {
@@ -5445,8 +5494,9 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			}
 			for (;;) {
 				try {
+					const queuedInputFirst = !this.agent.state.isStreaming && this.#maintenance.resumeQaForQueuedInput();
 					if (!this.agent.state.isStreaming) onStart?.();
-					await this.agent.continue(signal);
+					await this.agent.continue(signal, { queuedInputFirst });
 					return { status: "completed" };
 				} catch (error) {
 					if (!(error instanceof AgentBusyError)) throw error;
@@ -5594,11 +5644,29 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		);
 	}
 
+	isQaRolloverEnabled(): boolean {
+		return this.#maintenance.isQaRolloverEnabled();
+	}
+
+	async acceptQaCheckpoint(input: QaCheckpointInput, signal?: AbortSignal): Promise<QaCheckpointAcceptance> {
+		const assistant = this.#findLastAssistantMessage();
+		const calls = assistant?.content.filter(block => block.type === "toolCall");
+		if (calls?.length !== 1 || calls[0].type !== "toolCall" || calls[0].name !== "new_context") {
+			throw qaCheckpointError(
+				"QA_INVALID_CHECKPOINT",
+				"new_context must be the sole tool call in its response.",
+				input.cycleId,
+			);
+		}
+		return this.#maintenance.acceptQaCheckpoint(input, signal);
+	}
+
 	#scheduleCompactionContinuation(options: {
 		generation: number;
 		autoContinue: boolean;
 		terminalTextAnswer: boolean;
 		suppressContinuation: boolean;
+		checkpointDisposition?: QaCheckpointInput["disposition"];
 	}): boolean {
 		if (options.suppressContinuation) return false;
 		if (this.agent.hasQueuedMessages()) {
@@ -5610,9 +5678,12 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			});
 			return true;
 		}
+		if (options.checkpointDisposition && options.checkpointDisposition !== "continue") return false;
 		if (!options.autoContinue) return false;
 		const activeGoal = this.#goalModeState?.enabled === true && this.#goalModeState.goal.status === "active";
 		if (options.terminalTextAnswer && !activeGoal) return false;
+		// A queued background completion will start the next turn itself.
+		if (this.agent.hasBackgroundCompletions?.()) return true;
 		return this.#scheduleAutoContinuePrompt(options.generation);
 	}
 
@@ -5740,6 +5811,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 * execution still emit there).
 	 */
 	async #beforeToolCall(ctx: BeforeToolCallContext, signal?: AbortSignal): Promise<BeforeToolCallResult | undefined> {
+		const qaBlock = this.#maintenance.blockQaToolCall(ctx.assistantMessage, ctx.tool.name);
+		if (qaBlock) return { block: true, reason: qaBlock };
 		const runner = this.#extensionRunner;
 		runner?.markLoopToolCall?.(ctx.toolCall.id, ctx.tool.name);
 		const ttsrResult = await this.#ttsr.beforeToolCall(ctx);
@@ -11641,6 +11714,10 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		const unwind = Promise.withResolvers<void>();
 		this.#abortUnwinds.add(unwind.promise);
 		try {
+			// Keep already-emitted user/tool state before compaction rewrites history.
+			// These commits do not await notification listeners; bumping the generation
+			// first would instead discard them as belonging to an abandoned prompt.
+			if (options?.preserveCompaction) await this.#messageEndPersistenceTail;
 			this.#titleGenerationAbortController.abort();
 			if (!this.#isDisposed) this.#titleGenerationAbortController = new AbortController();
 			this.#abortAutolearnCapture();
@@ -11674,7 +11751,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			this.agent.abort(options?.reason);
 			await Promise.all([postPromptDrain, computerControlRevocation]);
 			await this.agent.waitForIdle();
-			this.#persistToolResultsEndedWhileDisconnected();
+			this.#persistMessagesEndedWhileDisconnected();
 			// agent_end maintenance can enqueue a retry after the first cancellation.
 			// Keep the abort barrier up until those handlers settle, then cancel
 			// anything they scheduled before making the session revivable. Only

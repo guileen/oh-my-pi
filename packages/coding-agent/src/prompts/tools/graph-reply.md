@@ -1,0 +1,1 @@
+Reply to the latest message in an existing Graph consultation. Supply `conversation_id`, its latest `reply_to` message ID, `text`, and a stable `request_key`; include shareable `artifact_refs` when needed. The call waits for the next message or timeout; a reply does not finish the consultation.

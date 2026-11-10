@@ -35,6 +35,9 @@ import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { cfgSnapcompactShape } from "@oh-my-pi/pi-coding-agent/session/context-settings";
 import * as snapcompact from "@oh-my-pi/snapcompact";
+import { withOfficialAnthropicEndpoint } from "./helpers/anthropic-endpoint";
+
+withOfficialAnthropicEndpoint();
 
 describe("AgentSession snapcompact frame-budget sizing", () => {
 	let session: AgentSession;

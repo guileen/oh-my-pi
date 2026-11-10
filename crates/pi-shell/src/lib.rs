@@ -45,6 +45,7 @@ mod child_session;
 pub mod minimizer;
 pub mod output_decode;
 mod paths;
+pub mod owned_child;
 pub mod process;
 pub mod proctree;
 pub mod shell;

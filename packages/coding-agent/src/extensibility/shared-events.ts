@@ -243,13 +243,13 @@ export interface TurnEndEvent {
 export interface AutoCompactionStartEvent {
 	type: "auto_compaction_start";
 	reason: "threshold" | "overflow" | "idle" | "incomplete";
-	action: "context-full" | "remote" | "handoff" | "shake" | "snapcompact";
+	action: "context-full" | "remote" | "handoff" | "shake" | "snapcompact" | "qaonly";
 }
 
 /** Fired when auto-compaction ends */
 export interface AutoCompactionEndEvent {
 	type: "auto_compaction_end";
-	action: "context-full" | "remote" | "handoff" | "shake" | "snapcompact";
+	action: "context-full" | "remote" | "handoff" | "shake" | "snapcompact" | "qaonly";
 	result: CompactionResult | undefined;
 	aborted: boolean;
 	willRetry: boolean;

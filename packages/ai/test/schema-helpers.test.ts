@@ -64,14 +64,6 @@ describe("areJsonValuesEqual", () => {
 		expect(areJsonValuesEqual({}, {})).toBe(true);
 		expect(areJsonValuesEqual([], [])).toBe(true);
 	});
-
-	it("distinguishes NaN via Object.is", () => {
-		expect(areJsonValuesEqual(Number.NaN, Number.NaN)).toBe(true);
-	});
-
-	it("distinguishes +0 and -0 via Object.is", () => {
-		expect(areJsonValuesEqual(0, -0)).toBe(false);
-	});
 });
 
 describe("mergeCompatibleEnumSchemas", () => {

@@ -2,6 +2,8 @@
 
 Stateful agent with tool execution and event streaming. Built on `@oh-my-pi/pi-ai`.
 
+Deterministic JSON serialization is owned by the dependency-free `@oh-my-pi/pi-wire/canonical-json` entry. Import `canonicalJson` there rather than through the agent runtime.
+
 ## Installation
 
 ```bash

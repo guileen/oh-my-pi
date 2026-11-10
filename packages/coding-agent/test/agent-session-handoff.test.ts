@@ -184,10 +184,12 @@ describe("AgentSession handoff", () => {
 		const call = generateHandoffSpy.mock.calls[0];
 		if (!call) throw new Error("Expected relay handoff generation");
 		const trailing = call[0].messages.at(-1);
-		const text = typeof trailing?.content === "string"
-			? trailing.content
-			: (trailing?.content ?? []).map(block => (block.type === "text" ? block.text : "")).join("");
-		expect(text).toContain(`keep ${placeholder} && preserve <tag>`);
+		const text =
+			typeof trailing?.content === "string"
+				? trailing.content
+				: (trailing?.content ?? []).map(block => (block.type === "text" ? block.text : "")).join("");
+		expect(text).toContain("working memory");
+		expect(text).toContain(`keep ${placeholder}`);
 		expect(text).not.toContain(HANDOFF_SECRET);
 		expect(call[0].systemPrompt).toEqual(["Test"]);
 		expect(call[2].streamOptions.sessionId).toStartWith(`${previousSessionId}:side:`);
