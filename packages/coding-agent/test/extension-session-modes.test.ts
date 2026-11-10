@@ -114,6 +114,22 @@ describe("ctx.sessionModes in the interactive TUI", () => {
 		if (!modes) throw new Error("TUI context must expose sessionModes");
 		return { session, provider, mode, modes, events };
 	}
+	it("exposes a restartable loop command across prompt updates and pause", async () => {
+		const { mode, modes } = await tui();
+		await mode.handleLoopCommand("100 5m --until 'test -f done' first");
+		mode.setLoopPrompt("first");
+		expect(modes.getState().loop).toEqual({ status: "active", command: "/loop 100 5m --until 'test -f done' first" });
+		mode.setLoopPrompt("second\nline");
+		mode.pauseLoop();
+		expect(modes.getState().loop).toEqual({ status: "paused", command: "/loop 100 5m --until 'test -f done' second\nline" });
+		mode.disableLoopMode();
+		expect(modes.getState().loop).toEqual({ status: "inactive" });
+		await mode.handleLoopCommand("--duration 1h");
+		mode.setLoopPrompt("-- review failures");
+		expect(modes.getState().loop.command).toBe("/loop --duration 1h -- -- review failures");
+		mode.disableLoopMode();
+	});
+
 
 	it("a /mission command enters plan, sends its own prompt, and exits without approving or deleting the draft", async () => {
 		let planActiveDuringTurn: boolean | undefined;

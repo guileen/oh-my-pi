@@ -43,6 +43,11 @@ describe("loop limit parsing", () => {
 		expect(parseLoopArgs("   ")).toEqual({});
 	});
 
+	test("preserves flag-shaped and numeric prompts after the separator", () => {
+		expect(parseLoopArgs("--duration 1h -- -- review")).toEqual({ limit: { kind: "duration", durationMs: 3_600_000 }, prompt: "-- review" });
+		expect(parseLoopArgs("-- 100 tasks")).toEqual({ prompt: "100 tasks" });
+	});
+
 	test("parses a bare positive integer as an iteration limit", () => {
 		expect(parseLoopArgs("10")).toEqual({ limit: { kind: "iterations", iterations: 10 } });
 	});

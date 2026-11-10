@@ -1410,6 +1410,8 @@ export class InteractiveMode implements InteractiveModeContext {
 	loopDurationLimit: LoopLimitRuntime | undefined = undefined;
 	loopIntervalMs: number | undefined = undefined;
 	loopCondition: LoopConditionConfig | undefined = undefined;
+	#loopCommandPrefix: string | undefined;
+	#loopCommand: string | undefined;
 	/** Last state reported through `mode_changed`; starts inactive so a restored session's modes are reported too. */
 	#reportedModeState: SessionModeState = {
 		plan: { status: "inactive" },
@@ -3531,6 +3533,8 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.loopDurationLimit = undefined;
 		this.loopIntervalMs = undefined;
 		this.loopCondition = undefined;
+		this.#loopCommandPrefix = undefined;
+		this.#loopCommand = undefined;
 		this.#cancelLoopAutoSubmit();
 		this.#abortLoopCondition();
 		this.#syncLoopModeStatus();
@@ -3548,6 +3552,13 @@ export class InteractiveMode implements InteractiveModeContext {
 		// configured timeout in parallel with the turn it can no longer gate.
 		this.#abortLoopCondition();
 		this.loopPrompt = prompt;
+		if (this.#loopCommandPrefix !== undefined) {
+			const candidate = `${this.#loopCommandPrefix} ${prompt}`;
+			const parsed = parseLoopArgs(candidate.slice("/loop".length));
+			this.#loopCommand = typeof parsed !== "string" && parsed.prompt === prompt
+				? candidate
+				: `${this.#loopCommandPrefix} -- ${prompt}`;
+		}
 		this.loopModePaused = false;
 		this.#syncLoopModeStatus();
 	}
@@ -3585,6 +3596,10 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.showError(parsed);
 			return undefined;
 		}
+		const trimmed = args.trim();
+		const options = parsed.prompt ? trimmed.slice(0, -parsed.prompt.length).trimEnd() : trimmed;
+		this.#loopCommandPrefix = options ? `/loop ${options}` : "/loop";
+		this.#loopCommand = parsed.prompt ? `${this.#loopCommandPrefix} ${parsed.prompt}` : this.#loopCommandPrefix;
 		this.#enableLoopMode(parsed.limit, parsed.condition, Boolean(parsed.prompt), parsed.durationLimit, parsed.intervalMs);
 		// Hand any inline prompt back to the dispatcher so the normal submit flow
 		// runs the first iteration — it records the text as the loop prompt and
@@ -3644,7 +3659,10 @@ export class InteractiveMode implements InteractiveModeContext {
 							tokenBudget: goalState?.goal.tokenBudget,
 						}
 					: { status: "inactive" },
-			loop: { status: !this.loopModeEnabled ? "inactive" : this.loopModePaused ? "paused" : "active" },
+			loop: {
+				status: !this.loopModeEnabled ? "inactive" : this.loopModePaused ? "paused" : "active",
+				...(this.loopModeEnabled && this.#loopCommand !== undefined ? { command: this.#loopCommand } : {}),
+			},
 		};
 	}
 

@@ -1463,7 +1463,7 @@ export interface SessionModeState {
 	plan: { status: "inactive" | "active" | "paused"; planFilePath?: string };
 	vibe: { status: "inactive" | "active" };
 	goal: { status: "inactive" | "active" | "paused"; objective?: string; tokenBudget?: number };
-	loop: { status: "inactive" | "active" | "paused" };
+	loop: { status: "inactive" | "active" | "paused"; command?: string };
 }
 
 /**

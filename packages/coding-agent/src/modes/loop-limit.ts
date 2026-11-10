@@ -71,6 +71,10 @@ export function parseLoopArgs(args: string): ParsedLoopArgs | string {
 	let condition: LoopConditionConfig | undefined;
 
 	while (rest) {
+		if (rest === "--" || /^--\s/.test(rest)) {
+			rest = rest.slice(2).trimStart();
+			break;
+		}
 		if (!rest.startsWith("--")) {
 			if (positional) break;
 			const result = takeLoopLimit(rest);
