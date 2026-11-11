@@ -12,7 +12,7 @@
 
 Every completed tool result, including failures, returns an `observationId` (`o…`), except lifecycle tools `rewind`, `checkpoint`, and `todo`. Successful reads also return a `readId` (`r…`) for source selections. No separate checkpoint, work-package contract, report, or todo outcome is needed.
 
-Prefer a small cut for noisy searches or wrong reads; skip it for tiny/useful output. Optional `read: string[]` fuses retirement with ordinary read paths and inline selectors, preferably bounded source ranges. `note` is a one-line location/exclusion; `nextAction` names the work **after** these reads. This gives the next provider turn the note plus original source with paths, numbered lines and edit tags, not pointers alone or model-rewritten code. No intervening provider round is needed to request the reads. Tests, bash commands, browser and Computer Use observations—including failures—are also eligible.
+At the next settled boundary, retire resolved exploration containing disposable results, failed approaches, or long completed reasoning/tool chains. Judge the entire interval; skip only when it is already small and useful. Fuse a needed source read with `read: string[]`, using ordinary paths and bounded selectors. `note` records the decision or exclusion; `nextAction` names the work **after** those reads. The next provider turn receives original source with paths, numbered lines and edit tags, without an extra model round to request it. Tests, bash commands, browser and Computer Use observations—including failures—are also eligible.
 
 Examples below assume the indicated refs and evidence were delivered; copy actual returned refs. Search result `o1` located the handler and its caller:
 
@@ -25,20 +25,36 @@ Examples below assume the indicated refs and evidence were delivered; copy actua
 }
 ```
 
-Fused reads use the enabled canonical `read` tool with its normal permission checks and output format. A disabled reader rejects the request before reading or cutting. Successful reads and full read failures are preserved as ordinary observations with their normal IDs; one failed path does not discard successful reads. Inspect errors before continuing; do not claim unread source or repeat successful reads merely to execute `nextAction`. This is not a general tool-sequencing API.
+Fused reads use the enabled canonical `read` tool with normal permission checks and output format. A disabled reader rejects before reading or cutting. No net savings skips only the cut: valid fused reads still complete once. Successes and full read failures remain ordinary observations with normal IDs; one failed path does not discard successful reads. Inspect errors before continuing; do not claim unread source or repeat successful reads merely to execute `nextAction`. This is not a general tool-sequencing API.
 
 Optional evidence selections preserve already-delivered content without reading again:
 
 - `retain: [{"readId": "r1", "path": "src/entry.ts", "from": 82, "to": 95}]`, assuming `r1` delivered those rows, carries exact, fully displayed numbered rows, their path and edit tag. Raw reads, omitted/truncated rows, and selections outside the affected observations are rejected.
 - `keep: [{"observationId": "o3", "text": "Connection refused", "images": [0]}]`, assuming `o3` delivered that text and an image, carries exact evidence. `text` must be a nonempty substring of one delivered text part. Image indexes are zero-based among delivered image parts, not all content parts. Select text, images, or both; never model-created snapshots or paraphrases.
 
-Previously selected materials survive later hops. Use returned material references in `release` to remove obsolete code, or `demote` entries with the returned `ref` and a concise fact/exclusion `note` to retain only that fact and source location. Prior decision notes and action receipts also survive. Released code does not reappear on rebuild; original history remains in the journal.
+Selected source, text and images survive observation rewinds, work-package handoffs and automatic compaction. Fused numbered source reads are selected from their immutable delivered snapshots, retaining original paths, lines and tags. Use returned references in `release` to stop preserving obsolete material, or `demote` with a concise fact/exclusion `note`. Do not copy selected code into reports or reread it for preservation. Released material does not reappear on rebuild; original history remains in the journal.
 
 Rewind changes context, not execution. Read/grep/find/glob arguments and unselected outputs can be retired. For other or unknown tools, the runtime automatically retains a receipt containing the original tool name and arguments, `isError`, and complete structured details, including asynchronous handles. This records the attempted action, not business success: even `isError: false` is not proof of success. If outcome details were discarded, they are unknown. Do not automatically repeat an action because its output was retired; rewind neither undoes nor replays it. Keep exact output evidence when the next decision needs it.
 
 Call rewind alone after every tool call in the affected batches has a final result. The boundary includes the target call's batch and following completed observations. Mixed completed tools are allowed; incomplete batches, new user input, compaction/reset/branch-summary boundaries, and checkpoint/work-package changes reject the cut. Unrelated asynchronous notifications and current lifecycle state are preserved.
 
-Source selection is limited to 32 ranges, each at most 2000 lines; up to 128 active materials. The full replacement must shrink context, excluding the generated rewind call from the savings baseline. A small cut preserves current todos and does not close the enclosing package or mark work complete.
+Source selection is limited to 32 ranges, each at most 2000 lines; up to 128 active materials. A cut requires net savings, excluding the generated rewind call from the baseline. Without savings, the decision and any fused reads are recorded without replacing history. Small decisions preserve current todos and do not close the enclosing package or mark work complete.
+
+### Instruction point
+
+Every user instruction opens a point (`R0`, `R1`, …) advertised in a hidden notice after the user entry. `rewind({checkpointId, report, nextAction})` cuts from that point to the current tip: the instruction, report, selected materials, receipts and todo state stay; exploration leaves active context. It is not a work package—no `outcome`, stack entry or todo binding—and accepts no `note`, `keep`, `retain`, `read`, `release` or `demote`.
+
+The first point is preceded by a one-shot hidden skill notice: what a point folds, why (context is the budget), when to fold, where each call form applies, who decides, and how the report is budgeted. It ends with `The first rewind point follows.` Every point then carries a one-line reminder with its id and call form; the skill entry is not tied to point validity, so it survives the user instruction that invalidates earlier points. A compaction or reset that drops the explanation from the rebuilt context re-opens it immediately before the next point, and never repeats it otherwise.
+
+Points are reusable and chained. The notice entry is the cut boundary, so a used point survives and every completed fold opens the next point (`R1`, `R2`, …) at the retained position. Earlier points stay resolvable and may be reused, including the root point; a later user instruction, compaction or reset invalidates points before it. Fold summaries never invalidate a point: a summary that cut before the notice removes the notice from the branch instead. No net savings keeps the context unchanged and leaves the point available; the report still stays in the rewind result and still counts as the fold for the timing demands. The journal is append-only, so rewinding to an earlier point opens a sibling branch; the previous branch remains on disk.
+
+Two runtime timings apply while `checkpoint.enabled` is on and `rewind` is available:
+
+- **Mid-run (advisory).** A hidden hint fires every 12 settled tool results on the point (12, 24, 36, …), naming the point, the count and the call. It never repeats immediately; the next hint comes after another 12 settled results, so a completed observation fold does not silence the rest of a long turn.
+- **Pre-yield (mandatory).** At a text-only stop, if the point still has at least 12 settled results and no fold was completed for it, the runtime injects one mandatory reminder and continues the loop once. A completed observation fold satisfies it; a declined reminder yields to the user instead of looping. The demand carries the same 4,096-token report budget.
+- **Rollover precedence.** While the point has at least 12 settled results and no completed fold, a QA `new_context` rollover is refused with `QA_REWIND_FOLD_REQUIRED`: fold first, then checkpoint. The hard context report is the exception, because rewind is unavailable there. Rollover rewrites the branch, so evidence not folded first cannot be recovered afterwards.
+
+The advisory hint costs ~55 text tokens per fire; the pre-yield demand fires at most once per point. A fold recorded without a net-benefit cut still satisfies all three timings; the report stays in the rewind result.
 
 ### Work-package handoffs
 
@@ -66,13 +82,13 @@ For example, after completing a todo-bound package whose checkpoint returned the
 
 Reach the package's `finishWhen` before completing it. Commit the report and todo outcome together; do not separately mark the todo done first. Completing a task starts the next pending task; blocked tasks do not restart automatically. Completing a phase requires all children completed and evidence of the phase's own acceptance. Preserve unmet boundaries and blockers explicitly.
 
-Before closing a child, select what its parent and later siblings need: shared constraints, verified contracts and decisions, a compact file/symbol or artifact index, verification evidence, and unresolved risks. Include those in `report`, not private exploration or unrelated code. The retained report stays available to later siblings across their cuts. Selected observation materials inside the child are not automatically carried through a macro cut; preserve needed facts and locations in the report instead.
+Before closing a child, put shared constraints, verified decisions, a compact source/artifact index, verification evidence and unresolved risks in `report`; omit private exploration and unrelated code. Active selected observation materials are inherited separately, including fused-read snapshots, so the report need not repeat their code. Later siblings retain the report and selected evidence.
 
 When closing the parent, consolidate still-needed child findings and indexes into the parent's report. Parent cuts replace child reports rather than copying their accumulated history. An index locates evidence; it is not a current source snapshot or edit anchor.
 
 ## Outputs and application
 
-Small-decision results identify the observation boundary and retained materials for later release/demotion; they do not commit todo progress. Requested source reads are persisted after the cut in the same branch transaction, and the next provider turn receives their original output before continuing with `nextAction`. Recovery restores those observations without replaying reads. For macro handoffs, structured result details contain:
+Small-decision results identify the observation boundary and retained materials for later release/demotion; they do not commit todo progress. The continuation contains the concrete note and next action, without a repeated generic preamble. Requested source reads persist in the same atomic transaction whether or not a cut helps; the next provider turn receives their original output before continuing. Recovery restores them without replaying reads. For macro handoffs, structured result details contain:
 
 - `checkpointId`: the targeted active checkpoint.
 - `report`: the retained handoff body; `nextAction` is rendered separately.
@@ -91,7 +107,7 @@ Continue package B from `nextAction`. Rewinding A does not finish the overall ta
 The runtime validates the request before changing context:
 
 - For a macro handoff, the ID must match the active stack top; anchors and todo bindings must still resolve. Canonical source entry identity and fingerprint prevent concurrent replanning or delete-and-recreate from silently rebinding a package.
-- User input since the boundary prevents rewinding across that input. Incomplete batches and stale boundaries fail closed; macro mixed-batch restrictions remain unchanged. Small-cut boundary and savings validation precede read I/O. New input or stale generation during reads, or persistence failure, cannot commit a stale branch.
+- User input since the boundary prevents rewinding across that input. Incomplete batches and stale boundaries fail closed; macro mixed-batch restrictions remain unchanged. Boundary validation precedes read I/O; no net savings does not reject valid fused reads. New input or stale generation during reads, or persistence failure, cannot commit a stale branch.
 - The estimated replacement must shrink context for a cut; the strict savings baseline excludes the newly generated report, so a long report cannot manufacture savings. With an explicit outcome, no savings can still commit progress without a cut.
 - `report`, `nextAction`, and any blocker `reason` together must fit within 4096 estimated tokens.
 
@@ -106,6 +122,7 @@ The prefix through the checkpoint is eligible for provider prompt-cache reuse on
 ## Implementation
 
 - Tool schema and result: `packages/coding-agent/src/tools/checkpoint.ts`
+- Instruction point resolution: `packages/coding-agent/src/session/instruction-anchor.ts`
 - Validation, deferred application, and recovery: `packages/coding-agent/src/session/agent-session.ts`
 - Branch persistence: `packages/coding-agent/src/session/session-manager.ts`
 - Context rebuilding: `packages/coding-agent/src/session/session-context.ts`

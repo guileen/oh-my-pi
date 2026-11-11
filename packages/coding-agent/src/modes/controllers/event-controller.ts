@@ -104,6 +104,7 @@ const AUTO_COMPACTION_LABELS: Record<Extract<AgentSessionEvent, { type: "auto_co
 		shake: "Auto-shake",
 		snapcompact: "Auto-snapcompact",
 		qaonly: "Auto Q&A compaction",
+		rewind: "Auto interval rewind",
 	};
 
 const IRC_MESSAGE_VISIBLE_TTL_MS = 10_000;
@@ -2771,7 +2772,7 @@ export class EventController {
 			// to compact yet. Not a failure — suppress the warning.
 		} else {
 			this.ctx.showWarning(
-				event.action === "qaonly"
+				event.action === "qaonly" || event.action === "rewind"
 					? `${actionLabel} did not commit`
 					: `${actionLabel} failed; continuing without maintenance`,
 			);

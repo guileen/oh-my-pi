@@ -18,12 +18,14 @@ function createLoopContext(options: {
 				}
 			: undefined;
 	let loopPrompt: string | undefined = "original loop prompt";
+	let loopModePaused = false;
 	const setLoopPrompt = vi.fn((prompt: string) => {
 		loopPrompt = prompt;
+		loopModePaused = false;
 	});
 	const prompt = vi.fn(async () => true);
 	const pauseLoop = vi.fn(() => {
-		loopPrompt = undefined;
+		loopModePaused = true;
 	});
 	const editor = {
 		pendingImages: [],
@@ -52,6 +54,9 @@ function createLoopContext(options: {
 		},
 		sessionManager: { putBlob: vi.fn() },
 		loopModeEnabled: true,
+		get loopModePaused() {
+			return loopModePaused;
+		},
 		get loopPrompt() {
 			return loopPrompt;
 		},
@@ -104,16 +109,58 @@ describe("loop mode interjections", () => {
 		expect(getLoopPrompt()).toBe("original loop prompt");
 	});
 
-	it("adopts an idle submission as the new loop prompt", async () => {
+	it("preserves the loop prompt on an idle interjection", async () => {
 		const onInputCallback = vi.fn();
-		const { ctx, setLoopPrompt } = createLoopContext({ isStreaming: false, onInputCallback });
+		const { ctx, setLoopPrompt, getLoopPrompt } = createLoopContext({ isStreaming: false, onInputCallback });
 		const controller = new InputController(ctx);
 		controller.setupEditorSubmitHandler();
 
-		await ctx.editor.onSubmit?.("new loop body");
+		await ctx.editor.onSubmit?.("one-off correction");
 
-		expect(setLoopPrompt).toHaveBeenCalledWith("new loop body");
+		expect(setLoopPrompt).not.toHaveBeenCalled();
+		expect(getLoopPrompt()).toBe("original loop prompt");
 		expect(onInputCallback).toHaveBeenCalledTimes(1);
+	});
+
+	it("resumes the original body after a message during pause", async () => {
+		const onInputCallback = vi.fn();
+		const { ctx, getLoopPrompt, pauseLoop } = createLoopContext({ isStreaming: false, onInputCallback });
+		pauseLoop();
+		const controller = new InputController(ctx);
+		controller.setupEditorSubmitHandler();
+		await ctx.editor.onSubmit?.("one-off correction");
+		expect(onInputCallback).toHaveBeenCalledTimes(1);
+		expect(getLoopPrompt()).toBe("original loop prompt");
+		expect(ctx.loopModePaused).toBe(false);
+	});
+
+	it("preserves the existing body when an idle interjection fails", async () => {
+		const { ctx, prompt, pauseLoop, getLoopPrompt } = createLoopContext({ isStreaming: false });
+		prompt.mockRejectedValueOnce(new Error("dispatch failed"));
+		const controller = new InputController(ctx);
+		controller.setupEditorSubmitHandler();
+		await ctx.editor.onSubmit?.("original loop prompt");
+		expect(pauseLoop).not.toHaveBeenCalled();
+		expect(getLoopPrompt()).toBe("original loop prompt");
+	});
+
+	it("captures the next streamed prompt while waiting for a loop body", async () => {
+		const { ctx, getLoopPrompt } = createLoopContext({ isStreaming: true });
+		ctx.loopPrompt = undefined;
+		const controller = new InputController(ctx);
+		controller.setupEditorSubmitHandler();
+		await ctx.editor.onSubmit?.("first body");
+		expect(getLoopPrompt()).toBe("first body");
+	});
+
+	it("captures the next prompt queued during compaction while waiting", async () => {
+		const { ctx, getLoopPrompt, queueCompactionMessage } = createLoopContext({ isStreaming: false, isCompacting: true });
+		ctx.loopPrompt = undefined;
+		const controller = new InputController(ctx);
+		controller.setupEditorSubmitHandler();
+		await ctx.editor.onSubmit?.("first body");
+		expect(queueCompactionMessage).toHaveBeenCalledTimes(1);
+		expect(getLoopPrompt()).toBe("first body");
 	});
 
 	it("records an inline /loop prompt even while streaming", async () => {
@@ -204,6 +251,7 @@ describe("loop mode interjections", () => {
 
 	it("parks the loop when a direct submission is consumed locally", async () => {
 		const { ctx, setLoopPrompt, pauseLoop, prompt, getLoopPrompt } = createLoopContext({ isStreaming: false });
+		ctx.loopPrompt = undefined;
 		prompt.mockResolvedValueOnce(false);
 		const controller = new InputController(ctx);
 		controller.setupEditorSubmitHandler();
@@ -213,11 +261,13 @@ describe("loop mode interjections", () => {
 		expect(prompt).toHaveBeenCalledTimes(1);
 		expect(setLoopPrompt).toHaveBeenCalledWith("/void-cmd");
 		expect(pauseLoop).toHaveBeenCalledTimes(1);
-		expect(getLoopPrompt()).toBeUndefined();
+		expect(getLoopPrompt()).toBe("/void-cmd");
+		expect(ctx.loopModePaused).toBe(true);
 	});
 
 	it("arms a direct submission after dispatch succeeds", async () => {
 		const { ctx, setLoopPrompt, getLoopPrompt } = createLoopContext({ isStreaming: false });
+		ctx.loopPrompt = undefined;
 		const controller = new InputController(ctx);
 		controller.setupEditorSubmitHandler();
 
@@ -251,6 +301,7 @@ describe("loop mode interjections", () => {
 		const { ctx, setLoopPrompt, pauseLoop, prompt, getLoopPrompt, showError } = createLoopContext({
 			isStreaming: false,
 		});
+		ctx.loopPrompt = undefined;
 		prompt.mockRejectedValueOnce(new Error("attachment too large"));
 		const controller = new InputController(ctx);
 		controller.setupEditorSubmitHandler();
@@ -259,7 +310,8 @@ describe("loop mode interjections", () => {
 
 		expect(setLoopPrompt).toHaveBeenCalledWith("direct body");
 		expect(pauseLoop).toHaveBeenCalledTimes(1);
-		expect(getLoopPrompt()).toBeUndefined();
+		expect(getLoopPrompt()).toBe("direct body");
+		expect(ctx.loopModePaused).toBe(true);
 		expect(showError).toHaveBeenCalledWith("attachment too large");
 	});
 });

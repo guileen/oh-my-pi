@@ -15,6 +15,7 @@ import type { FileSink } from "bun";
 import type { BashResult } from "../../exec/bash-executor";
 import type { AgentSessionEvent, SessionStats } from "../../session/agent-session";
 import type { CacheWarmingMode } from "../../session/cache-warmer";
+import type { CompactMode } from "../../session/compact-modes";
 import type { SessionEntry, SessionTreeNode } from "../../session/session-entries";
 import type { SessionLeaseReport } from "../../session/session-storage";
 import { MAX_RPC_FRAME_BYTES, MAX_RPC_REASSEMBLED_BYTES, RpcFrameDecoder, type RpcProtocolVersion } from "./rpc-frame";
@@ -1092,8 +1093,8 @@ export class RpcClient {
 	/**
 	 * Compact session context.
 	 */
-	async compact(customInstructions?: string): Promise<CompactionResult> {
-		const response = await this.#send({ type: "compact", customInstructions });
+	async compact(customInstructions?: string, options?: { mode?: CompactMode }): Promise<CompactionResult> {
+		const response = await this.#send({ type: "compact", customInstructions, mode: options?.mode });
 		return this.#getData(response);
 	}
 

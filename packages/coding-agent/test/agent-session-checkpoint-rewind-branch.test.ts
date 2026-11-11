@@ -15,6 +15,12 @@ import { ExtensionRuntime, loadExtensionFromFactory } from "@oh-my-pi/pi-coding-
 import { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
+import { cfgCompactionKeepRecentTokens } from "@oh-my-pi/pi-coding-agent/session/context-settings";
+import {
+	INSTRUCTION_ANCHOR_MESSAGE_TYPE,
+	REWIND_SKILL_MESSAGE_TYPE,
+	resolveInstructionAnchors,
+} from "@oh-my-pi/pi-coding-agent/session/instruction-anchor";
 import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { CheckpointTool, RewindTool, type ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
@@ -27,6 +33,7 @@ import { TempDir } from "@oh-my-pi/pi-utils";
 // Legacy result fixtures deliberately omit work-package fields to cover persisted-session recovery.
 const checkpointSchema = type({ goal: type("string") });
 const rewindSchema = type({ report: type("string") });
+const probeSchema = type({});
 
 const xdevWriteSchema = type({ path: type("string"), content: type("string") });
 
@@ -88,6 +95,16 @@ const rewindTool: AgentTool<typeof rewindSchema, { report: string; rewound: bool
 	},
 };
 
+const probeTool: AgentTool<typeof probeSchema, unknown> = {
+	name: "probe",
+	label: "Probe",
+	description: "Return one settled observation",
+	parameters: probeSchema,
+	async execute() {
+		return { content: [{ type: "text" as const, text: "ok" }] };
+	},
+};
+
 type Harness = {
 	session: AgentSession;
 	authStorage: AuthStorage;
@@ -120,10 +137,12 @@ async function createHarness(
 		onAgentEnd?: (willContinue: boolean | undefined) => void;
 		resolveFallbackTool?: (name: string) => AgentTool | undefined;
 		realTools?: boolean;
+		checkpoints?: boolean;
 		realSearchTools?: boolean;
 		todoBinding?: boolean;
 		persist?: boolean;
 		initialMessages?: AgentMessage[];
+		shortCircuitCompaction?: boolean;
 	},
 ): Promise<Harness & { mock: MockModel }> {
 	const tempDir = TempDir.createSync("@pi-checkpoint-rewind-branch-");
@@ -134,7 +153,7 @@ async function createHarness(
 	const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir.path(), "models.yml"));
 	const settings = Settings.isolated({
 		"compaction.enabled": false,
-		"checkpoint.enabled": options?.realTools ?? false,
+		"checkpoint.enabled": options?.realTools || options?.checkpoints || false,
 		"retry.enabled": false,
 		"todo.enabled": false,
 		"todo.eager": "default",
@@ -146,7 +165,10 @@ async function createHarness(
 			cwd: tempDir.path(),
 			settings,
 			getCheckpointState: () => session.getCheckpointState(),
+			getInstructionAnchor: (id?: string) => session.getInstructionAnchor(id),
 			getLastCompletedRewind: () => session.getLastCompletedRewind(),
+			validateInstructionRewind: (checkpointId, report, nextAction) =>
+				session.validateInstructionRewind(checkpointId, report, nextAction),
 			validateRewind: (checkpointId, report, nextAction, outcome, reason) =>
 				session.validateRewind(checkpointId, report, nextAction, outcome, reason),
 			bindCheckpointTodo: options.todoBinding ? target => session.bindCheckpointTodo(target) : undefined,
@@ -180,11 +202,21 @@ async function createHarness(
 		}
 	}
 	let extensionRunner: ExtensionRunner | undefined;
-	if (options?.onAgentEnd) {
+	if (options?.onAgentEnd || options?.shortCircuitCompaction) {
 		const runtime = new ExtensionRuntime();
 		const extension = await loadExtensionFromFactory(
 			pi => {
-				pi.on("agent_end", event => options.onAgentEnd?.(event.willContinue));
+				if (options?.onAgentEnd) pi.on("agent_end", event => options.onAgentEnd?.(event.willContinue));
+				if (options?.shortCircuitCompaction)
+					pi.on("session_before_compact", event => ({
+						compaction: {
+							summary: "compacted summary",
+							shortSummary: undefined,
+							firstKeptEntryId: event.preparation.firstKeptEntryId,
+							tokensBefore: event.preparation.tokensBefore,
+							details: {},
+						},
+					}));
 			},
 			tempDir.path(),
 			new EventBus(),
@@ -205,6 +237,64 @@ async function createHarness(
 	const harness = { session, authStorage, tempDir, extraSessions: [] };
 	activeHarnesses.push(harness);
 	return { ...harness, mock };
+}
+
+/** Branch with enough tokens for a manual compaction at `keepRecentTokens = 1`. */
+function compactableSeed(): AgentMessage[] {
+	return [
+		{ role: "user", content: "Fix the flaky smoke test", timestamp: Date.now() },
+		{
+			role: "assistant",
+			content: [{ type: "text", text: "Read the failing suite and its fixtures." }],
+			api: "anthropic-messages",
+			provider: "anthropic",
+			model: "claude-sonnet-4-5",
+			stopReason: "stop",
+			usage: {
+				input: 1_000,
+				output: 100,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 1_100,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			timestamp: Date.now(),
+		},
+	];
+}
+
+async function reopenHarness(harness: Harness) {
+	const file = harness.session.sessionManager.getSessionFile();
+	if (!file) throw new Error("Missing durable session");
+	await harness.session.dispose();
+	const manager = await SessionManager.open(file);
+	const mock = createMockModel({
+		responses: [{ content: ["Continue from preserved evidence."], stopReason: "stop" }],
+	});
+	const session = new AgentSession({
+		agent: new Agent({
+			getApiKey: () => "test-key",
+			initialState: {
+				model: mock,
+				tools: [],
+				messages: manager.buildSessionContext().messages,
+				systemPrompt: ["Test"],
+			},
+			convertToLlm,
+			streamFn: mock.stream,
+		}),
+		sessionManager: manager,
+		settings: Settings.isolated({
+			"compaction.enabled": false,
+			"retry.enabled": false,
+			"todo.enabled": false,
+			"todo.reminders": false,
+		}),
+		modelRegistry: new ModelRegistry(harness.authStorage, path.join(harness.tempDir.path(), "reopened-models.yml")),
+		toolRegistry: new Map(),
+	});
+	harness.extraSessions.push(session);
+	return { session, mock };
 }
 
 function messageText(message: Message): string {
@@ -234,7 +324,10 @@ function rewindToolForSession(session: AgentSession): RewindTool {
 	return new RewindTool(
 		createToolSession({
 			getCheckpointState: () => session.getCheckpointState(),
+			getInstructionAnchor: (id?: string) => session.getInstructionAnchor(id),
 			getLastCompletedRewind: () => session.getLastCompletedRewind(),
+			validateInstructionRewind: (checkpointId, report, nextAction) =>
+				session.validateInstructionRewind(checkpointId, report, nextAction),
 		}),
 	);
 }
@@ -322,6 +415,190 @@ async function expectNoActiveCheckpointError(session: AgentSession): Promise<voi
 }
 
 describe("AgentSession checkpoint rewind branch context", () => {
+	it("opens the instruction rewind point and folds the turn into the retained report", async () => {
+		const report = "Located the defect at src/fix.ts:3; the guard is inverted.";
+		const nextAction = "Apply the corrected guard.";
+		const responses = (async function* () {
+			yield {
+				content: [
+					{
+						type: "toolCall",
+						id: "explore",
+						name: "grep",
+						arguments: { pattern: "INSTRUCTION_NEEDLE", path: "." },
+					},
+				],
+				stopReason: "toolUse" as const,
+			};
+			yield {
+				content: [
+					{
+						type: "toolCall",
+						id: "fold",
+						name: "rewind",
+						arguments: { checkpointId: "R0", report, nextAction },
+					},
+				],
+				stopReason: "toolUse" as const,
+			};
+			yield { content: ["Fixed."], stopReason: "stop" as const };
+		})() as MockResponseSource;
+		const { session, mock, tempDir } = await createHarness(responses, [], {
+			realTools: true,
+			realSearchTools: true,
+		});
+		await Bun.write(
+			path.join(tempDir.path(), "fix.ts"),
+			Array.from({ length: 200 }, (_, i) => `export const item${i} = "INSTRUCTION_NEEDLE_${i}";`).join("\n"),
+		);
+		await session.prompt("Fix the inverted guard.");
+		const firstRequest = mock.calls[0]!.context.messages.map(messageText).join("\n");
+		expect(firstRequest).toContain("Instruction rewind point `R0`");
+		const afterFold = mock.calls[2]!.context.messages.map(messageText).join("\n");
+		expect(afterFold).toContain("Fix the inverted guard.");
+		expect(afterFold).toContain(report);
+		expect(afterFold).toContain(nextAction);
+		expect(afterFold).not.toContain("INSTRUCTION_NEEDLE");
+		expect(afterFold).toContain("Instruction rewind point `R1`");
+		expect(session.getInstructionAnchor()?.id).toBe("R1");
+		expect(session.getInstructionAnchor("R0")?.id).toBe("R0");
+		expect(() => session.validateInstructionRewind("R0", report, nextAction)).not.toThrow();
+		const summary = session.sessionManager
+			.getEntries()
+			.find(entry => entry.type === "branch_summary" && entry.details);
+		expect(summary?.type).toBe("branch_summary");
+		expect((summary as { details?: { kind?: string } } | undefined)?.details?.kind).toBe("instruction-rewind");
+	});
+
+	it("keeps earlier instruction points reusable after a later fold", async () => {
+		const firstReport = "First pass located the inverted guard at src/fix.ts:3.";
+		const secondReport = "Second pass confirmed the corrected guard.";
+		const responses = (async function* () {
+			yield {
+				content: [
+					{
+						type: "toolCall",
+						id: "explore_again",
+						name: "grep",
+						arguments: { pattern: "INSTRUCTION_NEEDLE", path: "." },
+					},
+				],
+				stopReason: "toolUse" as const,
+			};
+			yield {
+				content: [
+					{
+						type: "toolCall",
+						id: "fold_first",
+						name: "rewind",
+						arguments: { checkpointId: "R0", report: firstReport, nextAction: "Continue" },
+					},
+				],
+				stopReason: "toolUse" as const,
+			};
+			yield {
+				content: [
+					{
+						type: "toolCall",
+						id: "explore_second",
+						name: "grep",
+						arguments: { pattern: "INSTRUCTION_NEEDLE", path: "." },
+					},
+				],
+				stopReason: "toolUse" as const,
+			};
+			yield {
+				content: [
+					{
+						type: "toolCall",
+						id: "fold_second",
+						name: "rewind",
+						arguments: { checkpointId: "R1", report: secondReport, nextAction: "Answer" },
+					},
+				],
+				stopReason: "toolUse" as const,
+			};
+			yield {
+				content: [
+					{
+						type: "toolCall",
+						id: "explore_third",
+						name: "grep",
+						arguments: { pattern: "INSTRUCTION_NEEDLE", path: "." },
+					},
+				],
+				stopReason: "toolUse" as const,
+			};
+			yield {
+				content: [
+					{
+						type: "toolCall",
+						id: "fold_first_reuse",
+						name: "rewind",
+						arguments: { checkpointId: "R1", report: "Reused R1 after R2.", nextAction: "Answer" },
+					},
+				],
+				stopReason: "toolUse" as const,
+			};
+			yield {
+				content: [
+					{
+						type: "toolCall",
+						id: "explore_fourth",
+						name: "grep",
+						arguments: { pattern: "INSTRUCTION_NEEDLE", path: "." },
+					},
+				],
+				stopReason: "toolUse" as const,
+			};
+			yield {
+				content: [
+					{
+						type: "toolCall",
+						id: "fold_root",
+						name: "rewind",
+						arguments: { checkpointId: "R0", report: "Root pass.", nextAction: "Answer" },
+					},
+				],
+				stopReason: "toolUse" as const,
+			};
+			yield { content: ["Done."], stopReason: "stop" as const };
+		})() as MockResponseSource;
+		const { session, mock, tempDir } = await createHarness(responses, [], {
+			realTools: true,
+			realSearchTools: true,
+		});
+		await Bun.write(
+			path.join(tempDir.path(), "fix.ts"),
+			Array.from({ length: 200 }, (_, i) => `export const item${i} = "INSTRUCTION_NEEDLE_${i}";`).join("\n"),
+		);
+		await session.prompt("Fix the inverted guard.");
+		expect(session.getInstructionAnchor()?.id).toBe("R4");
+		expect(session.getInstructionAnchor("R0")?.id).toBe("R0");
+		expect(session.getInstructionAnchor("R1")).toBeUndefined();
+		expect(() => session.validateInstructionRewind("R0", firstReport, "Answer")).not.toThrow();
+		expect(() => session.validateInstructionRewind("R1", secondReport, "Answer")).toThrow(
+			/Instruction rewind point is stale or unavailable/,
+		);
+		const afterSecondFold = mock.calls[4]!.context.messages.map(messageText).join("\n");
+		expect(afterSecondFold).toContain("Instruction rewind point `R2`");
+		expect(afterSecondFold).toContain("Instruction rewind point `R1`");
+		expect(afterSecondFold).toContain("Instruction rewind point `R0`");
+		expect(afterSecondFold).not.toContain("INSTRUCTION_NEEDLE");
+		const afterR1Reuse = mock.calls[6]!.context.messages.map(messageText).join("\n");
+		expect(afterR1Reuse).toContain("Instruction rewind point `R3`");
+		expect(afterR1Reuse).toContain("Instruction rewind point `R1`");
+		expect(afterR1Reuse).not.toContain("Instruction rewind point `R2`");
+		expect(afterR1Reuse).not.toContain("INSTRUCTION_NEEDLE");
+		const afterRootFold = mock.calls[8]!.context.messages.map(messageText).join("\n");
+		expect(afterRootFold).toContain("Instruction rewind point `R4`");
+		expect(afterRootFold).toContain("Instruction rewind point `R0`");
+		expect(afterRootFold).not.toContain("Instruction rewind point `R1`");
+		expect(afterRootFold).not.toContain("Instruction rewind point `R2`");
+		expect(afterRootFold).not.toContain("Instruction rewind point `R3`");
+		expect(afterRootFold).not.toContain("INSTRUCTION_NEEDLE");
+	});
+
 	it("rejects a todo binding already owned by a non-immediate ancestor", async () => {
 		const { session } = await createHarness(
 			[
@@ -1207,6 +1484,314 @@ describe("AgentSession checkpoint rewind branch context", () => {
 		}
 	});
 
+	for (const fused of [false, true]) {
+		it(`retains a valid nonshrinking observation and completes ${fused ? "fused reading" : "without reading"} in the ordinary tool round`, async () => {
+			const note = "Keep the current exploration because replacing it has no benefit. ".repeat(150);
+			const harness = await createHarness(
+				[
+					{
+						content: [
+							{
+								type: "toolCall",
+								id: "small_search",
+								name: "grep",
+								arguments: { pattern: "SMALL_OBSERVATION", path: "small.ts" },
+							},
+						],
+						stopReason: "toolUse",
+					},
+					{
+						content: [
+							{
+								type: "toolCall",
+								id: "small_cut",
+								name: "rewind",
+								arguments: {
+									observationId: searchReference("o", "small_search"),
+									note,
+									nextAction: "Continue using the preserved implementation.",
+									...(fused ? { read: ["small.ts:1-2"] } : {}),
+								},
+							},
+						],
+						stopReason: "toolUse",
+					},
+					{ content: ["Use the evidence directly."], stopReason: "stop" },
+				],
+				[],
+				{ realTools: true, realSearchTools: true, persist: true },
+			);
+			const { session, mock, tempDir } = harness;
+			await Bun.write(
+				path.join(tempDir.path(), "small.ts"),
+				'export const value = "SMALL_OBSERVATION";\nexport const exact = "NO_SAVINGS_SOURCE";\n',
+			);
+			const reader = session.agent.state.tools.find(tool => tool.name === "read");
+			if (!reader) throw new Error("Missing canonical reader");
+			const reads = spyOn(reader, "execute");
+			try {
+				await session.prompt("Inspect the small observation and continue without another model read round.");
+				expect(mock.calls).toHaveLength(3);
+				if (fused) {
+					const ordinary = await createHarness(
+						[
+							{
+								content: [
+									{
+										type: "toolCall",
+										id: "ordinary_search",
+										name: "grep",
+										arguments: { pattern: "SMALL_OBSERVATION", path: "small.ts" },
+									},
+								],
+								stopReason: "toolUse",
+							},
+							{
+								content: [
+									{ type: "toolCall", id: "ordinary_read", name: "read", arguments: { path: "small.ts:1-2" } },
+								],
+								stopReason: "toolUse",
+							},
+							{ content: ["Use the displayed implementation."], stopReason: "stop" },
+						],
+						[],
+						{ realTools: true, realSearchTools: true },
+					);
+					await Bun.write(
+						path.join(ordinary.tempDir.path(), "small.ts"),
+						'export const value = "SMALL_OBSERVATION";\nexport const exact = "NO_SAVINGS_SOURCE";\n',
+					);
+					await ordinary.session.prompt("Inspect the small observation and read the implementation normally.");
+					expect(mock.calls).toHaveLength(ordinary.mock.calls.length);
+				}
+				expect(reads).toHaveBeenCalledTimes(fused ? 1 : 0);
+				const request = mock.calls[2]!.context.messages;
+				const text = request.map(messageText).join("\n");
+				expect(
+					request.some(message => message.role === "toolResult" && message.toolCallId === "small_search"),
+				).toBe(true);
+				const result = request.find(message => message.role === "toolResult" && message.toolCallId === "small_cut");
+				if (result?.role !== "toolResult") throw new Error("Missing no-cut result");
+				expect(result.isError).toBe(false);
+				expect(result.details).toMatchObject({ rewound: false, estimate: { willCompact: false } });
+				expect(text).toContain(note.trim());
+				expect(session.sessionManager.getBranch().some(entry => entry.type === "branch_summary")).toBe(false);
+				if (fused) {
+					expect(text).toMatch(/\[small\.ts#[0-9a-f]{4}\]/i);
+					const readResult = request.find(message => message.role === "toolResult" && message.toolName === "read");
+					if (!readResult) throw new Error("Missing fused read result");
+					expect(messageText(readResult)).toContain('2:export const exact = "NO_SAVINGS_SOURCE";');
+					expect(
+						request.filter(message => message.role === "toolResult" && message.toolName === "read"),
+					).toHaveLength(1);
+					expect(result.details).not.toHaveProperty("sourceReads");
+				}
+				expect(session.messages).toEqual(session.sessionManager.buildSessionContext().messages);
+				await Bun.write(path.join(tempDir.path(), "small.ts"), "CHANGED_AFTER_NO_CUT\n");
+				const reopened = await reopenHarness(harness);
+				await reopened.session.prompt("Continue using the saved observation.");
+				const resumed = reopened.mock.calls[0]!.context.messages.map(messageText).join("\n");
+				expect(resumed).toContain("SMALL_OBSERVATION");
+				expect(resumed).toContain(note.trim());
+				expect(resumed).not.toContain("CHANGED_AFTER_NO_CUT");
+				if (fused) {
+					expect(resumed).toMatch(/\[small\.ts#[0-9a-f]{4}\]/i);
+					const resumedReads = reopened.mock.calls[0]!.context.messages.filter(
+						message => message.role === "toolResult" && message.toolName === "read",
+					);
+					expect(resumedReads).toHaveLength(1);
+					expect(messageText(resumedReads[0]!)).toContain('2:export const exact = "NO_SAVINGS_SOURCE";');
+				}
+				expect(reads).toHaveBeenCalledTimes(fused ? 1 : 0);
+			} finally {
+				reads.mockRestore();
+			}
+		});
+	}
+
+	for (const policy of ["keep", "release", "demote"] as const) {
+		it(`carries canonical explicit and fused evidence once through a macro cut and reopen (${policy})`, async () => {
+			let explicitRef = "";
+			const fusedRef = searchReference("r", "source_cut:read:0");
+			async function* responses() {
+				yield {
+					content: [{ type: "toolCall", id: "material_package", name: "checkpoint", arguments: workPackage }],
+					stopReason: "toolUse" as const,
+				};
+				yield {
+					content: [
+						{
+							type: "toolCall",
+							id: "material_search",
+							name: "grep",
+							arguments: { pattern: "MATERIAL_NOISE|OBSERVER_FACT", path: "*.ts" },
+						},
+					],
+					stopReason: "toolUse" as const,
+				};
+				yield {
+					content: [
+						{ type: "toolCall", id: "explicit_read", name: "read", arguments: { path: "explicit.ts:1-2" } },
+					],
+					stopReason: "toolUse" as const,
+				};
+				yield {
+					content: [
+						{
+							type: "toolCall",
+							id: "source_cut",
+							name: "rewind",
+							arguments: {
+								observationId: searchReference("o", "material_search"),
+								retain: [
+									{ readId: searchReference("r", "explicit_read"), path: "explicit.ts", from: 1, to: 2 },
+								],
+								keep: [{ observationId: searchReference("o", "material_search"), text: "OBSERVER_FACT" }],
+								read: ["fused.ts:1-2"],
+								nextAction: "Inspect the remaining dependency using both source snapshots.",
+							},
+						},
+					],
+					stopReason: "toolUse" as const,
+				};
+				const material = session.messages.find(
+					message => message.role === "custom" && message.customType === SEARCH_MATERIAL,
+				);
+				if (
+					material?.role !== "custom" ||
+					!material.details ||
+					typeof material.details !== "object" ||
+					!("ref" in material.details)
+				)
+					throw new Error("Missing explicit source reference");
+				explicitRef = String(material.details.ref);
+				yield {
+					content: [
+						signedThinking("DISCARD_LONG_REASONING ".repeat(1200), "retired-material-reasoning"),
+						{
+							type: "toolCall",
+							id: "later_search",
+							name: "grep",
+							arguments: { pattern: "MATERIAL_NOISE", path: "noise.ts" },
+						},
+					],
+					stopReason: "toolUse" as const,
+				};
+				if (policy !== "keep") {
+					yield {
+						content: [
+							{
+								type: "toolCall",
+								id: "material_policy",
+								name: "rewind",
+								arguments: {
+									observationId: searchReference("o", "later_search"),
+									...(policy === "release"
+										? { release: [explicitRef, fusedRef] }
+										: {
+												demote: [
+													{
+														ref: explicitRef,
+														note: "The explicit entry delegates to the fused implementation.",
+													},
+													{ ref: fusedRef, note: "The fused implementation owns the behavior." },
+												],
+											}),
+									nextAction: "Finish the package using only active evidence.",
+								},
+							},
+						],
+						stopReason: "toolUse" as const,
+					};
+					yield {
+						content: [
+							{
+								type: "toolCall",
+								id: "macro_noise",
+								name: "grep",
+								arguments: { pattern: "MATERIAL_NOISE", path: "noise.ts" },
+							},
+						],
+						stopReason: "toolUse" as const,
+					};
+				}
+				await Bun.write(path.join(tempDir.path(), "explicit.ts"), "EXPLICIT_CHANGED_DURING_PACKAGE\n");
+				await Bun.write(path.join(tempDir.path(), "fused.ts"), "FUSED_CHANGED_DURING_PACKAGE\n");
+				yield {
+					content: [
+						{
+							type: "toolCall",
+							id: "material_macro",
+							name: "rewind",
+							arguments: {
+								checkpointId: "material_package",
+								report: "The source ownership is established.",
+								nextAction: "Continue to the next package without rereading.",
+							},
+						},
+					],
+					stopReason: "toolUse" as const,
+				};
+				yield { content: ["Continue from the retained evidence."], stopReason: "stop" as const };
+			}
+			const harness = await createHarness(responses() as MockResponseSource, [], {
+				realTools: true,
+				realSearchTools: true,
+				persist: true,
+			});
+			const { session, mock, tempDir } = harness;
+			await Bun.write(
+				path.join(tempDir.path(), "explicit.ts"),
+				'export const entry = "EXPLICIT_MACRO_SOURCE";\nexport const ready = true;\n',
+			);
+			await Bun.write(
+				path.join(tempDir.path(), "fused.ts"),
+				'export const worker = "FUSED_MACRO_SOURCE";\nexport const ready = true;\n',
+			);
+			await Bun.write(path.join(tempDir.path(), "fact.ts"), 'export const fact = "OBSERVER_FACT";\n');
+			await Bun.write(
+				path.join(tempDir.path(), "noise.ts"),
+				Array.from({ length: 190 }, (_, i) => `export const noise${i} = "MATERIAL_NOISE_${i}";`).join("\n"),
+			);
+			await session.prompt("Locate both implementations, preserve selected evidence, then finish the package.");
+			expect(mock.calls).toHaveLength(policy === "keep" ? 7 : 9);
+			expect(session.getLastCompletedRewind()).toMatchObject({
+				checkpointId: "material_package",
+				contextChanged: true,
+			});
+			const request = mock.calls.at(-1)!.context.messages;
+			const assertEvidence = (messages: Message[]) => {
+				const text = messages.map(messageText).join("\n");
+				expect(text).not.toContain("MATERIAL_NOISE_");
+				expect(text.match(/OBSERVER_FACT/g)).toHaveLength(1);
+				expect(text).not.toContain("CHANGED_DURING_PACKAGE");
+				expect(text).not.toContain("CHANGED_AFTER_MACRO");
+				expect(JSON.stringify(messages)).not.toContain("DISCARD_LONG_REASONING");
+				expect(messages.some(message => message.role === "toolResult" && message.toolName === "read")).toBe(false);
+				if (policy === "keep") {
+					expect(text.match(/1:export const entry = "EXPLICIT_MACRO_SOURCE";/g)).toHaveLength(1);
+					expect(text.match(/1:export const worker = "FUSED_MACRO_SOURCE";/g)).toHaveLength(1);
+					expect(text).toMatch(/\[explicit\.ts#[0-9a-f]{4}\]/i);
+					expect(text).toMatch(/\[fused\.ts#[0-9a-f]{4}\]/i);
+				} else {
+					expect(text).not.toContain("EXPLICIT_MACRO_SOURCE");
+					expect(text).not.toContain("FUSED_MACRO_SOURCE");
+					if (policy === "demote") {
+						expect(text).toContain("The explicit entry delegates to the fused implementation.");
+						expect(text).toContain("The fused implementation owns the behavior.");
+					}
+				}
+			};
+			assertEvidence(request);
+			await Bun.write(path.join(tempDir.path(), "explicit.ts"), "EXPLICIT_CHANGED_AFTER_MACRO\n");
+			await Bun.write(path.join(tempDir.path(), "fused.ts"), "FUSED_CHANGED_AFTER_MACRO\n");
+			const reopened = await reopenHarness(harness);
+			await reopened.session.prompt("Continue without rereading the source.");
+			assertEvidence(reopened.mock.calls[0]!.context.messages);
+			expect(reopened.mock.calls).toHaveLength(1);
+		});
+	}
+
 	it("keeps successful fused ranges and a canonical read failure together without another model round", async () => {
 		const paths = ["entry.ts:2-3", "missing.ts:1-2", "worker.ts:2-4", "entry.ts:9-10"];
 		const { session, mock, tempDir } = await createHarness(
@@ -1391,7 +1976,7 @@ describe("AgentSession checkpoint rewind branch context", () => {
 						type: "toolCall",
 						id: "identity_search",
 						name: "grep",
-						arguments: { pattern: "IDENTITY_NOISE", path: "." },
+						arguments: { pattern: "IDENTITY_NOISE", path: "noise.ts" },
 					},
 				],
 				stopReason: "toolUse" as const,
@@ -1444,7 +2029,7 @@ describe("AgentSession checkpoint rewind branch context", () => {
 						type: "toolCall",
 						id: "dependency_search",
 						name: "grep",
-						arguments: { pattern: "IDENTITY_NOISE", path: "." },
+						arguments: { pattern: "IDENTITY_NOISE", path: "noise.ts" },
 					},
 				],
 				stopReason: "toolUse" as const,
@@ -1493,6 +2078,10 @@ describe("AgentSession checkpoint rewind branch context", () => {
 				"Locate the implementation, excluding generated candidates and retaining the correct source.",
 			);
 			expect(mock.calls).toHaveLength(6);
+			const rejected = mock.calls[3]!.context.messages.find(
+				message => message.role === "toolResult" && message.isError,
+			);
+			if (rejected) throw new Error(messageText(rejected));
 			expect(reads).toHaveBeenCalledTimes(2);
 			expect(wrongCallId).toBe("identity_cut:read:0");
 			expect(correctCallId).toBe("wrong_fused_cut:read:0");
@@ -3191,5 +3780,118 @@ describe("AgentSession checkpoint rewind branch context", () => {
 				report: "post-resume findings",
 			}),
 		).resolves.toMatchObject({ details: { report: "post-resume findings", rewound: true } });
+	});
+
+	it("injects the rewind skill once, immediately before the first point", async () => {
+		const responses: MockResponseSource = [
+			{ content: ["First answer."], stopReason: "stop" },
+			{ content: ["Second answer."], stopReason: "stop" },
+		];
+		const { session, mock } = await createHarness(responses, [], { realTools: true });
+
+		await session.prompt("First instruction.");
+		await session.prompt("Second instruction.");
+
+		const first = mock.calls[0]!.context.messages.map(messageText).join("\n");
+		const second = mock.calls[1]!.context.messages.map(messageText).join("\n");
+		expect(first).toContain("Rewind skill (one-time");
+		expect(first).toContain("The first rewind point follows.");
+		expect(first.indexOf("Rewind skill (one-time")).toBeLessThan(first.indexOf("Instruction rewind point `R0`"));
+		// One-shot: later instructions advertise their point without re-explaining it.
+		expect(second.split("Rewind skill (one-time").length - 1).toBe(1);
+		expect(second).toContain("Instruction rewind point `R1`");
+		expect(second).toContain('rewind({"checkpointId":"R1"');
+		// The journal, not the live array, decides which points remain valid.
+		expect(resolveInstructionAnchors(session.sessionManager.getBranch()).map(anchor => anchor.id)).toEqual(["R1"]);
+		const branch = session.sessionManager.getBranch();
+		const skillEntries = branch.filter(
+			entry => entry.type === "custom_message" && entry.customType === REWIND_SKILL_MESSAGE_TYPE,
+		);
+		expect(skillEntries).toHaveLength(1);
+		expect(branch.indexOf(skillEntries[0]!)).toBeLessThan(
+			branch.findIndex(
+				entry => entry.type === "custom_message" && entry.customType === INSTRUCTION_ANCHOR_MESSAGE_TYPE,
+			),
+		);
+	});
+
+	it("demands one fold before yielding when the point still carries exploration", async () => {
+		const rounds = 12;
+		const responses: MockResponseSource = [
+			...Array.from({ length: rounds }, (_, index) => ({
+				content: [{ type: "toolCall" as const, id: `probe_${index}`, name: "probe", arguments: {} }],
+				stopReason: "toolUse" as const,
+			})),
+			{ content: ["First answer."], stopReason: "stop" as const },
+			{ content: ["Second answer."], stopReason: "stop" as const },
+		];
+		const { session, mock } = await createHarness(responses, [probeTool as AgentTool, rewindTool as AgentTool], {
+			checkpoints: true,
+		});
+
+		await session.prompt("Investigate.");
+
+		const reminders: string[] = [];
+		for (const entry of session.sessionManager.getBranch()) {
+			if (entry.type !== "message") continue;
+			const message = entry.message as Message;
+			const text = messageText(message);
+			if (message.role === "developer" && text.includes("about to answer")) reminders.push(text);
+		}
+		expect(reminders).toHaveLength(1);
+		const reminder = reminders[0]!;
+		expect(reminder).toContain("`R0`");
+		expect(reminder).toContain("rewind({");
+		// The reminder continued the loop once; the declined second stop yields.
+		expect(mock.calls.length).toBe(rounds + 2);
+	});
+
+	it("opens a fresh instruction rewind point after a compaction lands", async () => {
+		const { session } = await createHarness([], undefined, {
+			realTools: true,
+			shortCircuitCompaction: true,
+			initialMessages: compactableSeed(),
+		});
+		cfgCompactionKeepRecentTokens.set(session.settings, 1);
+		session.agent.replaceMessages(session.buildDisplaySessionContext().messages);
+
+		await session.compact();
+
+		const branch = session.sessionManager.getBranch();
+		expect(branch.some(entry => entry.type === "compaction")).toBe(true);
+		const anchors = branch.filter(
+			entry => entry.type === "custom_message" && entry.customType === INSTRUCTION_ANCHOR_MESSAGE_TYPE,
+		);
+		expect(anchors).toHaveLength(1);
+		expect(branch.at(-1)).toBe(anchors[0]);
+		// The rewritten context has no explanation above the new point: re-inject it once.
+		const skills = branch.filter(
+			entry => entry.type === "custom_message" && entry.customType === REWIND_SKILL_MESSAGE_TYPE,
+		);
+		expect(skills).toHaveLength(1);
+		expect(branch.at(-2)).toBe(skills[0]);
+		const resolved = resolveInstructionAnchors(branch);
+		expect(resolved).toHaveLength(1);
+		expect(session.getInstructionAnchor()?.id).toBe(resolved[0]?.id);
+	});
+
+	it("adds no instruction point after a compaction when checkpoints are disabled", async () => {
+		const { session } = await createHarness([], undefined, {
+			shortCircuitCompaction: true,
+			initialMessages: compactableSeed(),
+		});
+		cfgCompactionKeepRecentTokens.set(session.settings, 1);
+		session.agent.replaceMessages(session.buildDisplaySessionContext().messages);
+
+		await session.compact();
+
+		const branch = session.sessionManager.getBranch();
+		expect(branch.some(entry => entry.type === "compaction")).toBe(true);
+		expect(
+			branch.filter(
+				entry => entry.type === "custom_message" && entry.customType === INSTRUCTION_ANCHOR_MESSAGE_TYPE,
+			),
+		).toHaveLength(0);
+		expect(resolveInstructionAnchors(branch)).toHaveLength(0);
 	});
 });

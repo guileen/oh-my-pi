@@ -146,8 +146,8 @@ _AUTO_COMPACTION_REASON_VALUES: Final[frozenset[str]] = frozenset({"threshold", 
 _decode_auto_compaction_reason = cast("Decoder[AutoCompactionReason]", literal(_AUTO_COMPACTION_REASON_VALUES))
 
 
-AutoCompactionAction: TypeAlias = Literal["context-full", "remote", "handoff", "shake", "snapcompact", "qaonly"]
-_AUTO_COMPACTION_ACTION_VALUES: Final[frozenset[str]] = frozenset({"context-full", "remote", "handoff", "shake", "snapcompact", "qaonly"})
+AutoCompactionAction: TypeAlias = Literal["context-full", "remote", "handoff", "shake", "snapcompact", "qaonly", "rewind"]
+_AUTO_COMPACTION_ACTION_VALUES: Final[frozenset[str]] = frozenset({"context-full", "remote", "handoff", "shake", "snapcompact", "qaonly", "rewind"})
 _decode_auto_compaction_action = cast("Decoder[AutoCompactionAction]", literal(_AUTO_COMPACTION_ACTION_VALUES))
 
 
@@ -3563,11 +3563,13 @@ class WireClient:
         params["mode"] = mode
         self._command("set_interrupt_mode", params)
 
-    def compact(self, custom_instructions: str | None = None) -> CompactionResult:
+    def compact(self, *, custom_instructions: str | None = None, mode: Literal["soft", "remote", "snapcompact", "relay", "qaonly", "rewind"] | None = None) -> CompactionResult:
         """Compact the conversation."""
         params: dict[str, object] = {}
         if custom_instructions is not None:
             params["customInstructions"] = custom_instructions
+        if mode is not None:
+            params["mode"] = mode
         return parse_compaction_result(self._command("compact", params), "compact")
 
     def set_auto_compaction(self, enabled: bool) -> None:

@@ -113,6 +113,7 @@ export interface RewindToolDetails {
 	nextAction?: string;
 	estimate?: RewindContextEstimate;
 	search?: SearchRewindInput;
+	instructionAnchor?: boolean;
 	sourceReads?: RewindSourceRead[];
 	outcome?: WorkPackageOutcome;
 	reason?: string;
@@ -207,6 +208,11 @@ export class RewindTool implements AgentTool<typeof rewindSchema, RewindToolDeta
 		_onUpdate?: AgentToolUpdateCallback<RewindToolDetails>,
 		context?: AgentToolContext,
 	): Promise<AgentToolResult<RewindToolDetails>> {
+		// Callers may serialize unused optionals as `null`; treat them as absent so
+		// every presence check below behaves as if the field were omitted.
+		for (const [key, value] of Object.entries(params)) {
+			if (value === null) delete (params as Record<string, unknown>)[key];
+		}
 		if (params.observationId !== undefined) {
 			if (
 				params.checkpointId !== undefined ||
@@ -265,18 +271,57 @@ export class RewindTool implements AgentTool<typeof rewindSchema, RewindToolDeta
 				}
 				estimate = this.session.validateSearchRewind(search);
 			}
-			const summary = `Observation rewind requested: ${estimate.beforeTokens} → ${estimate.afterTokens} estimated tokens.`;
-			const result = toolResult<RewindToolDetails>({
+			const compact = estimate.willCompact !== false;
+			const summary = compact
+				? `Observation rewind requested: ${estimate.beforeTokens} → ${estimate.afterTokens} estimated tokens.`
+				: "Observation decision recorded; context will be retained because a cut has no net benefit.";
+			return toolResult<RewindToolDetails>({
 				report: "",
-				rewound: true,
+				rewound: compact,
 				search,
 				estimate,
 				sourceReads,
-			}).text(summary);
-			if (sourceReads) {
-				result.content([{ type: "text", text: summary }, ...sourceReads.flatMap(read => read.result.content)]);
-			}
-			return result.done();
+			})
+				.text(summary)
+				.done();
+		}
+		const instructionAnchor = this.session.getInstructionAnchor?.(params.checkpointId);
+		if (
+			params.checkpointId &&
+			instructionAnchor?.id === params.checkpointId &&
+			this.session.getCheckpointState?.()?.checkpointId !== params.checkpointId
+		) {
+			if (
+				params.note !== undefined ||
+				params.keep ||
+				params.read ||
+				params.retain ||
+				params.release ||
+				params.demote ||
+				params.outcome !== undefined ||
+				params.reason !== undefined
+			)
+				throw new ToolError("Instruction rewind accepts only report and nextAction.");
+			const report = params.report?.trim() ?? "";
+			const nextAction = params.nextAction.trim();
+			if (!report || !nextAction) throw new ToolError("report and nextAction must be nonempty.");
+			if (!this.session.validateInstructionRewind)
+				throw new ToolError("Instruction rewind requires a live session.");
+			const estimate = this.session.validateInstructionRewind(params.checkpointId, report, nextAction);
+			return toolResult<RewindToolDetails>({
+				report,
+				rewound: estimate.willCompact !== false,
+				checkpointId: params.checkpointId,
+				nextAction,
+				estimate,
+				instructionAnchor: true,
+			})
+				.text(
+					estimate.willCompact === false
+						? `Instruction decision recorded; context retained because a cut has no net benefit (${estimate.beforeTokens} tokens).`
+						: `Instruction rewind requested: estimated context ${estimate.beforeTokens} → ${estimate.afterTokens} tokens; the used point stays as its own boundary and a fresh one opens after it.`,
+				)
+				.done();
 		}
 		if (
 			!params.checkpointId ||
@@ -292,12 +337,26 @@ export class RewindTool implements AgentTool<typeof rewindSchema, RewindToolDeta
 		}
 		const state = this.session.getCheckpointState?.();
 		if (!state) {
+			if (params.checkpointId && /^R\d+$/.test(params.checkpointId)) {
+				if (!this.session.getInstructionAnchor)
+					throw new ToolError(
+						"Instruction rewind requires a host session bridge this runtime did not provide; the advertised point cannot be resolved.",
+					);
+				throw new ToolError(
+					`Instruction rewind point ${params.checkpointId} is stale or unavailable. Rewind to a point advertised in the current request.`,
+				);
+			}
 			if (this.session.getLastCompletedRewind?.()) {
 				throw new ToolError(
 					"Checkpoint already completed; continue from the retained rewind report instead of calling rewind again.",
 				);
 			}
-			throw new ToolError("No active checkpoint. Create a checkpoint before calling rewind.");
+			const anchor = this.session.getInstructionAnchor?.();
+			throw new ToolError(
+				anchor
+					? `No active checkpoint. Use the instruction rewind point ${anchor.id} advertised for this request.`
+					: "No active checkpoint. Create a checkpoint before calling rewind.",
+			);
 		}
 		if (params.checkpointId !== state.checkpointId) {
 			throw new ToolError("Checkpoint ID does not match the active work package. Use its returned checkpointId.");

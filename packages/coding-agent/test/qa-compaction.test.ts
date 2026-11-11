@@ -12,10 +12,11 @@ import type { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage
 import { parseCompactArgs, QA_STATE_TYPE } from "@oh-my-pi/pi-coding-agent/session/compact-modes";
 import { CONTEXT_NOTES_ENTRY_TYPE } from "@oh-my-pi/pi-coding-agent/session/context-notes";
 import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
-import { prepareQaCompaction } from "@oh-my-pi/pi-coding-agent/session/qa-compaction";
+import { prepareLocalRewindCompaction, prepareQaCompaction } from "@oh-my-pi/pi-coding-agent/session/qa-compaction";
 import { QA_CHECKPOINT_ENTRY_TYPE, type QaCheckpointData } from "@oh-my-pi/pi-coding-agent/session/qa-rollover";
 import { buildSessionContext } from "@oh-my-pi/pi-coding-agent/session/session-context";
 import type { CompactionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
+import { preserveSearchMaterials, SEARCH_REWIND_STATE, searchReference } from "@oh-my-pi/pi-coding-agent/session/search-rewind";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { USER_TODO_EDIT_CUSTOM_TYPE } from "@oh-my-pi/pi-coding-agent/tools/todo";
 import type { TodoPhase } from "@oh-my-pi/pi-tui/tools/todo";
@@ -838,4 +839,107 @@ it("rejects missing, misplaced and unsupported checkpoint references instead of 
 			{ ...futureSource, parentId: candidate.id },
 		]),
 	).toThrow();
+});
+
+it("sends an unchanged original prefix and complete ordered post-interval suffix after local fold and reload", async () => {
+	const manager = SessionManager.create(temp.path(), temp.join("sessions"));
+	const summarizer = forbidSummarizer();
+	const assistant = (content: AssistantMessage["content"], stopReason: "stop" | "toolUse"): AssistantMessage => ({
+		...createAssistantMessage(""),
+		content,
+		stopReason,
+	});
+	const prefix: AgentMessage[] = [
+		{ role: "user", content: "Original request: preserve parser compatibility; never deploy.", timestamp: Date.now() - 50 },
+		assistant([{ type: "thinking", thinking: "PREFIX_THOUGHT", thinkingSignature: "PREFIX_SIGNATURE" },
+			{ type: "text", text: "Compatibility recorded." }], "stop"),
+		{ role: "user", content: "Continue that exact request.", timestamp: Date.now() - 40 },
+	];
+	for (const message of prefix) manager.appendMessage(message);
+	manager.appendMessage(assistant([
+		{ type: "thinking", thinking: "REMOVED_REASONING_CHAIN", thinkingSignature: "removed-signature" },
+		{ type: "toolCall", id: "fold-read", name: "read", arguments: { path: "missing-source.ts:71-72" } },
+	], "toolUse"));
+	manager.appendMessage({
+		role: "toolResult", toolCallId: "fold-read", toolName: "read", isError: false, timestamp: Date.now(),
+		content: [{ type: "text", text: "[missing-source.ts#CAFE]\n71:const immutable = 17;\n72:export { immutable };\nUNSELECTED_RAW_PAYLOAD" }],
+	});
+	manager.appendCustomMessageEntry(SEARCH_REWIND_STATE, "", false, { activeRefs: [searchReference("r", "fold-read")] });
+	const checkpoint: QaCheckpointData = {
+		version: 1, cycleId: "local-fold", summary: "Saved parser implementation.", disposition: "continue",
+		nextAction: "Review integration without deploying.",
+	};
+	manager.appendMessage(assistant([{ type: "toolCall", id: "report-local", name: "new_context",
+		arguments: { checkpoint } }], "toolUse"));
+	manager.appendCustomEntry(QA_CHECKPOINT_ENTRY_TYPE, checkpoint);
+	manager.appendMessage({
+		role: "toolResult", toolCallId: "report-local", toolName: "new_context", isError: false,
+		timestamp: Date.now(), content: [{ type: "text", text: "accepted" }],
+	});
+	const suffix: AgentMessage[] = [
+		assistant([
+			{ type: "thinking", thinking: "SUFFIX_THOUGHT", thinkingSignature: "UNSAFE_SUFFIX_SIGNATURE" },
+			{ type: "text", text: "Ordered suffix before both results." },
+			{ type: "toolCall", id: "suffix-one", name: "read", arguments: { path: "a.ts" } },
+			{ type: "toolCall", id: "suffix-two", name: "read", arguments: { path: "b.ts" } },
+		], "toolUse"),
+		{ role: "toolResult", toolCallId: "suffix-two", toolName: "read", isError: false, timestamp: Date.now(),
+			content: [{ type: "text", text: "SECOND_CALL_RESULT_DELIVERED_FIRST" }] },
+		{ role: "toolResult", toolCallId: "suffix-one", toolName: "read", isError: false, timestamp: Date.now(),
+			content: [{ type: "text", text: "FIRST_CALL_RESULT_DELIVERED_LAST" }] },
+	];
+	for (const message of suffix) manager.appendMessage(message);
+	const originalContext = manager.buildSessionContext().messages;
+	const prepared = prepareLocalRewindCompaction(manager.getBranch(), originalContext);
+	manager.appendCompaction(prepared.summary, undefined, "", 0, {
+		method: "rewind", details: preserveSearchMaterials(manager.getBranch(), prepared.details),
+	});
+	for (let cycle = 0; cycle < 8; cycle++) {
+		manager.appendMessage({ role: "user", content: `Continue phase ${cycle}; preserve every original constraint.`,
+			timestamp: Date.now() });
+		manager.appendMessage(assistant([
+			{ type: "thinking", thinking: `REMOVED_REPEAT_CHAIN_${cycle}` },
+			{ type: "toolCall", id: `repeat-work-${cycle}`, name: "read", arguments: { path: "unselected.log" } },
+		], "toolUse"));
+		manager.appendMessage({ role: "toolResult", toolCallId: `repeat-work-${cycle}`, toolName: "read",
+			isError: false, timestamp: Date.now(), content: [{ type: "text", text: "REMOVED_REPEAT_PAYLOAD" }] });
+		const next = { ...checkpoint, cycleId: `repeat-local-${cycle}`, summary: `Saved phase ${cycle}.` };
+		manager.appendMessage(assistant([{ type: "toolCall", id: `repeat-report-${cycle}`, name: "new_context",
+			arguments: { checkpoint: next } }], "toolUse"));
+		manager.appendCustomEntry(QA_CHECKPOINT_ENTRY_TYPE, next);
+		manager.appendMessage({ role: "toolResult", toolCallId: `repeat-report-${cycle}`, toolName: "new_context",
+			isError: false, timestamp: Date.now(), content: [{ type: "text", text: "accepted" }] });
+		const nextFold = prepareLocalRewindCompaction(manager.getBranch(), manager.buildSessionContext().messages);
+		manager.appendCompaction(nextFold.summary, undefined, "", 0, {
+			method: "rewind", details: preserveSearchMaterials(manager.getBranch(), nextFold.details),
+		});
+	}
+	await manager.flush();
+	const reopened = await SessionManager.open(manager.getSessionFile()!, temp.join("sessions"));
+	const recorder = recordRequests();
+	const session = createSession(reopened, recorder.streamFn);
+	expect(session.messages.slice(0, prefix.length)).toEqual(prefix);
+	await session.prompt("Continue after the fold.");
+	await session.waitForIdle();
+	expect(recorder.requests).toHaveLength(1);
+	const request = recorder.requests[0]!;
+	expect(request.slice(0, convertToLlm(prefix).length)).toEqual(convertToLlm(prefix));
+	const payload = JSON.stringify(request);
+	expect(payload).toContain("PREFIX_SIGNATURE");
+	expect(payload).not.toContain("UNSAFE_SUFFIX_SIGNATURE");
+	expect(payload).not.toContain("REMOVED_REASONING_CHAIN");
+	expect(payload).not.toContain("REMOVED_REPEAT_CHAIN");
+	expect(payload).not.toContain("REMOVED_REPEAT_PAYLOAD");
+	for (let cycle = 0; cycle < 8; cycle++) expect(payload).toContain(`Continue phase ${cycle}`);
+	expect(payload).not.toContain("UNSELECTED_RAW_PAYLOAD");
+	expect(payload.match(/71:const immutable = 17;/g)).toHaveLength(1);
+	expect(payload).toContain("[missing-source.ts#CAFE]");
+	const one = request.findIndex(message => message.role === "assistant" &&
+		message.content.some(block => block.type === "toolCall" && block.id === "suffix-one"));
+	expect(one).toBeGreaterThanOrEqual(0);
+	expect(request.slice(one, one + 3).map(message =>
+		message.role === "toolResult" ? message.toolCallId : message.role)).toEqual([
+		"assistant", "suffix-two", "suffix-one",
+	]);
+	expect(summarizer).not.toHaveBeenCalled();
 });

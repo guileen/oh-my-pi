@@ -204,6 +204,7 @@ import type { AuthStorage } from "./session/auth-storage";
 import { CostCapError, type CostGateApi, guardStreamFn } from "./session/cost-gate";
 import {
 	canUseRemoteCompaction,
+	isLocalCheckpointCompactionMethod,
 	resolveCompactionMethodOrder,
 	resolveMethodSettings,
 } from "./session/compaction-methods";
@@ -2677,11 +2678,13 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 						: cfgCompactionEnabled.get(settings) &&
 							!cfgCompactionExperimentalContextManagement.get(settings) &&
 							(isSubagentSession || cfgCompactionMidTurnEnabled.get(settings)) &&
-							resolveCompactionMethodOrder(cfgCompactionMethodOrder.get(settings)).find(
-								method =>
-									method !== "remote" ||
-									canUseRemoteCompaction(model, resolveMethodSettings(cfgCompaction.get(settings), "remote")),
-							) === "qaonly" &&
+							isLocalCheckpointCompactionMethod(
+								resolveCompactionMethodOrder(cfgCompactionMethodOrder.get(settings)).find(
+									method =>
+										method !== "remote" ||
+										canUseRemoteCompaction(model, resolveMethodSettings(cfgCompaction.get(settings), "remote")),
+								),
+							) &&
 							typeof model?.contextWindow === "number" &&
 							Number.isFinite(model.contextWindow) &&
 							model.contextWindow > 0,
@@ -2764,6 +2767,9 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			getCheckpointState: () => session.getCheckpointState(),
 			setCheckpointState: state => session.setCheckpointState(state ?? undefined),
 			getLastCompletedRewind: () => session.getLastCompletedRewind(),
+			getInstructionAnchor: id => session.getInstructionAnchor(id),
+			validateInstructionRewind: (checkpointId, report, nextAction) =>
+				session.validateInstructionRewind(checkpointId, report, nextAction),
 			validateRewind: (checkpointId, report, nextAction, outcome, reason) =>
 				session.validateRewind(checkpointId, report, nextAction, outcome, reason),
 			bindCheckpointTodo: target => session.bindCheckpointTodo(target),

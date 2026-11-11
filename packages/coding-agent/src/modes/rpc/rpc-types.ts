@@ -22,6 +22,7 @@ import type { AgentSessionEvent, SessionStats } from "../../session/agent-sessio
 import type { SessionLeaseReport } from "../../session/session-storage";
 import type { RestoredQueuedMessage } from "../../session/agent-session-types";
 import type { CacheWarmingMode } from "../../session/cache-warmer";
+import type { CompactMode } from "../../session/compact-modes";
 import type { FileEntry, SessionEntry, SessionTreeNode } from "../../session/session-entries";
 import type { UsageLimitState } from "../../session/usage-limit";
 import type { AvailableSlashCommandSource } from "../../slash-commands/available-commands";
@@ -111,7 +112,7 @@ export type RpcCommand =
 	| { id?: string; type: "set_interrupt_mode"; mode: "immediate" | "wait" }
 
 	// Compaction
-	| { id?: string; type: "compact"; customInstructions?: string }
+	| { id?: string; type: "compact"; customInstructions?: string; mode?: CompactMode }
 	| { id?: string; type: "set_auto_compaction"; enabled: boolean }
 
 	// Cache warming

@@ -316,6 +316,39 @@ describe("InteractiveMode loop auto-submit", () => {
 		expect(showStatus).toHaveBeenCalledWith("Exit vibe mode before using reset loops. Loop mode disabled.");
 	});
 
+	it("resumes the retained loop body after a paused interjection", async () => {
+		vi.useFakeTimers();
+		await mode.handleLoopCommand("repeat this");
+		mode.setLoopPrompt("repeat this");
+		mode.pauseLoop();
+		const controller = new InputController(mode);
+		controller.setupEditorSubmitHandler();
+		pendingInput = mode.getUserInput();
+		await mode.editor.onSubmit?.("one-off correction");
+		expect((await pendingInput).text).toBe("one-off correction");
+		expect(mode.loopPrompt).toBe("repeat this");
+		expect(mode.loopModePaused).toBe(false);
+		pendingInput = mode.getUserInput();
+		vi.advanceTimersByTime(800);
+		await flushMicrotasks();
+		expect((await pendingInput).text).toBe("repeat this");
+	});
+
+	it("does not resubmit a paused loop and retains its body", async () => {
+		vi.useFakeTimers();
+		await mode.handleLoopCommand("repeat this");
+		mode.setLoopPrompt("repeat this");
+		mode.pauseLoop();
+		const resolved: SubmittedUserInput[] = [];
+		pendingInput = mode.getUserInput();
+		void pendingInput.then(input => resolved.push(input));
+		vi.advanceTimersByTime(1600);
+		await flushMicrotasks();
+		expect(resolved).toEqual([]);
+		expect(mode.loopPrompt).toBe("repeat this");
+		expect(mode.loopModePaused).toBe(true);
+	});
+
 	it("reports waiting, running, paused, resumed, and disabled loop states", async () => {
 		const setLoopModeStatus = vi.spyOn(mode.statusLine, "setLoopModeStatus");
 

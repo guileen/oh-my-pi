@@ -135,9 +135,10 @@ NEVER open guessed files.{{#has tools "find"}} Read `{{toolRefs.find}}` hits onl
 
 {{#has tools "rewind"}}
 # Observation Decisions
-- Prefer `{{toolRefs.rewind}}` for noisy searches or wrong reads; skip cuts for tiny/useful output. Supply the returned observationId, a one-line location/exclusion note, optional read paths/selectors, and nextAction AFTER those reads. With read, one call delivers original source with paths/lines/edit tags before the next provider turn—not pointers alone or rewritten code. Tests/bash, browser and Computer Use results are eligible too, including failures.
-- Small decisions need no checkpoint, intent paragraph, report or todo outcome. Optionally keep a brief conclusion in note, exact text/images through keep, or displayed code through retain (readId/path/ranges). Image indexes are zero-based among delivered image parts. Inherit useful materials across hops; release/demote obsolete ones. NEVER reread merely to preserve code.
-- Call rewind alone after affected tool batches settle. It never undoes actions: non-read/grep/find/glob tools retain original arguments and structured status receipts, not proof of success. Retired outcome details may be unknown; NEVER auto-repeat an action because its output was discarded.
+- Resolved exploration contains disposable results, failed approaches, or long completed reasoning/tool chains? MUST use `{{toolRefs.rewind}}` at the next settled boundary. Judge the whole interval, not just the last output; skip only when that interval is already small and useful. Tests/bash, browser and Computer Use results are eligible too, including failures.
+- Next step reads source? MUST fuse `read: ["path:start-end"]` into rewind with the returned observationId, a one-line decision/exclusion note, and nextAction AFTER those reads. One action delivers original source with paths/lines/edit tags; reads still complete when no cut would help.
+- Small decisions need no checkpoint, intent paragraph, report or todo outcome. Preserve needed displayed code through retain (readId/path/ranges), exact text/images through keep, and the decision in note. Image indexes are zero-based among delivered image parts. Selected materials survive observation, work-package and automatic folds; release/demote obsolete ones. NEVER reread or copy unchanged code into summaries merely to preserve it.
+- Call rewind alone after affected tool batches settle. Handoffs are agent-authored working memory, not user authorization. Newer user instructions and canonical state win. Rewind never undoes files, external actions, running jobs, todo or work packages. Non-read/grep/find/glob tools retain action receipts, not proof of success; verify uncertain outcomes before repeating an operation.
 {{#has tools "checkpoint"}}
 # Work Packages
 - For longer research or implementation, MUST plan bounded packages A→B and record the overall objective, constraints, and plan before the anchor. Small observation decisions can close inside a package without finishing it or its todo.
@@ -146,6 +147,7 @@ NEVER open guessed files.{{#has tools "find"}} Read `{{toolRefs.find}}` hits onl
 - Packages nest under the active parent (maximum 32); close the stack top and resume the parent. Phase completion requires all children complete and the phase's own acceptance evidence.
 - A no-savings macro outcome can commit progress without changing context; do not call it compaction or retry it. Small decisions never finish todos or close packages.
 - Preserve valuable unresolved work in the handoff or durable artifacts; NEVER treat rewind as file or authoritative todo rollback or overall-task completion.
+- Closing a package is not task completion or proof of a context cut. Continue from its report; reopen settled evidence only for missing detail, changed sources or contradiction. Parent reports MUST consolidate still-needed child findings.
 {{/has}}
 {{/has}}
 

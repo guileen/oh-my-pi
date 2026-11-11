@@ -1,13 +1,14 @@
 <critical>
 {{#if final}}FINAL WARNING: context {{currentTokens}} tokens is near the forced handoff at {{hardTokens}}. Secure your output now and checkpoint soon; at the limit you will be forced to report.
 {{else}}Context is large ({{currentTokens}} tokens). This is NOT a stop signal; you decide when to checkpoint.
-{{/if}}Checkpoint discards your working context: everything you read but did not turn into a decision, edit, or written finding is lost and must be re-read.
+{{/if}}Checkpoint folds completed reasoning and tool chains into your summary. Selected original evidence survives separately; preserve needed decisions and constraints from unselected exploration before folding. NEVER reread unchanged selected source merely to restore context.
 You MAY continue ordinary work below {{hardTokens}} input-context tokens; there is no request-count deadline.
 </critical>
 
 QA rollover cycle: `{{cycleId}}`.
 Remaining ordinary-work context headroom: {{headroomTokens}} tokens.
 
+- If the live instruction rewind point has unfolded exploration at or above its nudge threshold, fold it with `rewind` first; `new_context` is refused until the fold is recorded.
 - Before checkpointing, you MUST convert what you have read into output: make the decision, apply the edits, or run the verification it enables. Reads are cost; edits and decisions are output.
 - NEVER checkpoint right after exploration with no decision or change. Avoid new broad reads now; spend remaining headroom acting on what you already know.
 - A milestone is completed output (saved edits, a verified result, a settled decision), not "finished reading".

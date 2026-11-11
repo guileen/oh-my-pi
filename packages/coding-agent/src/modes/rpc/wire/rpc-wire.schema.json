@@ -3645,7 +3645,8 @@
 				"handoff",
 				"shake",
 				"snapcompact",
-				"qaonly"
+				"qaonly",
+				"rewind"
 			],
 			"type": "string"
 		},
@@ -6736,6 +6737,17 @@
 			"type": "object",
 			"properties": {
 				"customInstructions": {
+					"type": "string"
+				},
+				"mode": {
+					"enum": [
+						"soft",
+						"remote",
+						"snapcompact",
+						"relay",
+						"qaonly",
+						"rewind"
+					],
 					"type": "string"
 				}
 			}

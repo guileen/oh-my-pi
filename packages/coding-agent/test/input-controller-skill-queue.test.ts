@@ -252,6 +252,21 @@ describe("InputController skill queue chip metadata", () => {
 		expect(queueCompactionMessage).toHaveBeenCalledWith("/skill:test-skill arg1 arg2", "steer", undefined);
 	});
 
+	it("keeps the existing loop body when a skill is submitted as an interjection", async () => {
+		const { ctx, editor, promptCustomMessage, setLoopPrompt } = createStubInputControllerContext({
+			skillCommands,
+			isStreaming: true,
+			loopModeEnabled: true,
+		});
+		ctx.loopPrompt = "original loop prompt";
+		const controller = new InputController(ctx);
+		controller.setupEditorSubmitHandler();
+		await editor.onSubmit?.("/skill:test-skill arg1");
+		expect(promptCustomMessage).toHaveBeenCalledTimes(1);
+		expect(setLoopPrompt).not.toHaveBeenCalled();
+		expect(ctx.loopPrompt).toBe("original loop prompt");
+	});
+
 	it("passes slash-form queueChipText for streaming skill follow-ups", async () => {
 		const { ctx, editor, promptCustomMessage } = createStubInputControllerContext({
 			skillCommands,

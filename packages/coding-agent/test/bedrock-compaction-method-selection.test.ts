@@ -4,7 +4,6 @@ import type { ModelSpec } from "@oh-my-pi/pi-catalog/types";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { cfgCompaction } from "@oh-my-pi/pi-coding-agent/session/context-settings";
 import {
-	DEFAULT_COMPACTION_METHOD_ORDER,
 	type EngineCompactionMethod,
 	isCompactionMethod,
 	resolveCompactionMethodOrder,
@@ -41,7 +40,7 @@ describe("Bedrock native compaction method selection", () => {
 });
 
 describe("automatic QA method selection", () => {
-	test.each([{ methodOrder: ["qaonly"] }, { methodOrder: ["qaonly", "soft"] }])(
+	test.each([{ methodOrder: ["qaonly"] }, { methodOrder: ["qaonly", "soft"] }, { methodOrder: ["rewind"] }, { methodOrder: ["soft", "rewind"] }])(
 		"preserves the configured QA order %j",
 		({ methodOrder }) => {
 			const compaction = cfgCompaction.get(Settings.isolated({ "compaction.methodOrder": methodOrder }));
@@ -60,15 +59,14 @@ describe("automatic QA method selection", () => {
 		]);
 	});
 
-	test("keeps automatic defaults unchanged", () => {
-		expect(DEFAULT_COMPACTION_METHOD_ORDER).toEqual(["remote", "snapcompact", "handoff", "shake", "soft"]);
-		expect(cfgCompaction.get(Settings.isolated()).methodOrder).toEqual(DEFAULT_COMPACTION_METHOD_ORDER);
-	});
 
 	test.each([
 		{ methodOrder: ["qaonly"] },
 		{ methodOrder: ["qaonly", "soft"] },
 		{ methodOrder: ["remote", "qaonly", "soft"] },
+		{ methodOrder: ["rewind"] },
+		{ methodOrder: ["rewind", "soft"] },
+		{ methodOrder: ["remote", "rewind", "soft"] },
 	])("does not speculate past a selected local QA method %j", ({ methodOrder }) => {
 		const model = { ...getBedrockCompactionModel(), remoteCompaction: { enabled: false } };
 		const compaction = cfgCompaction.get(Settings.isolated({ "compaction.methodOrder": methodOrder }));

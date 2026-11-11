@@ -16,6 +16,7 @@ import {
 	isEmptyErrorTurn,
 	PREWALK_PLAN_MESSAGE_TYPE,
 	REWIND_REPORT_MESSAGE_TYPE,
+	sanitizeAssistantForReparentedHistory,
 	VIBE_MODE_CONTEXT_MESSAGE_TYPE,
 } from "./messages";
 import { CONTEXT_NOTES_ENTRY_TYPE, getContextNotes, renderContextNotes } from "./context-notes";
@@ -30,7 +31,8 @@ import {
 import { QA_STATE_TYPE, QA_TOOL_TIP_TYPE } from "./compact-modes";
 import { renderQaCompactionCheckpoint, resolveQaCompactionCheckpoint } from "./qa-compaction";
 import { QA_CHECKPOINT_ENTRY_TYPE } from "./qa-rollover";
-import { activeSearchMaterialRefs, SEARCH_MATERIAL, SEARCH_REWIND_STATE } from "./search-rewind";
+import { activeSearchMaterialRefs, collectActiveSearchMaterials, fusedSearchReadRefs, keepSearchMessage, SEARCH_MATERIAL, SEARCH_REWIND_STATE } from "./search-rewind";
+import { INSTRUCTION_ANCHOR_MESSAGE_TYPE, resolveInstructionAnchors } from "./instruction-anchor";
 import { WORK_PACKAGE_STATE_TYPE } from "./work-package-state";
 
 // #4470 crash artifacts had legacy frames (no shape metadata) with 17 frames,
@@ -248,6 +250,17 @@ export function buildSessionContext(
 	byId?: Map<string, SessionEntry>,
 	options?: BuildSessionContextOptions,
 ): SessionContext {
+	return buildSessionContextWithSources(entries, leafId, byId, options, new Map(), false);
+}
+
+function buildSessionContextWithSources(
+	entries: SessionEntry[],
+	leafId: string | null | undefined,
+	byId: Map<string, SessionEntry> | undefined,
+	options: BuildSessionContextOptions | undefined,
+	localSources: Map<string, AgentMessage[]>,
+	preparingSource: boolean,
+): SessionContext {
 	// Build uuid index if not available
 	if (!byId) {
 		byId = new Map<string, SessionEntry>();
@@ -296,6 +309,37 @@ export function buildSessionContext(
 		current = current.parentId ? byId.get(current.parentId) : undefined;
 	}
 	path.reverse();
+
+	// Resolve source dependencies iteratively in journal order. Each source is
+	// reconstructed once, and nested folds consult this memo instead of growing
+	// the JS stack or recursively replaying already-folded exploration.
+	if (!preparingSource && !(options?.transcript && !options.collapseCompactedHistory)) {
+		const sources: { id: string; index: number }[] = [];
+		let indices: Map<string, number> | undefined;
+		let limit = path.length;
+		while (limit > 0) {
+			let index = limit - 1;
+			for (; index >= 0; index--) {
+				if (path[index].type === "compaction" || path[index].type === "reset_boundary") break;
+			}
+			const entry = path[index];
+			if (!entry || entry.type !== "compaction" || !isRecord(entry.details) || entry.details.kind !== "local-rewind") break;
+			const sourceId = entry.details.sourceLeafId;
+			const sourceIndex = typeof sourceId === "string"
+				? (indices ??= new Map(path.map((item, position) => [item.id, position]))).get(sourceId)
+				: undefined;
+			if (typeof sourceId !== "string" || sourceIndex === undefined || sourceIndex >= index) {
+				throw new Error("Invalid local rewind source path.");
+			}
+			sources.push({ id: sourceId, index: sourceIndex });
+			limit = sourceIndex + 1;
+		}
+		for (const source of sources.reverse()) {
+			const rebuilt = buildSessionContextWithSources(path.slice(0, source.index + 1), source.id, byId,
+				{ ...options, transcript: false }, localSources, true);
+			localSources.set(source.id, rebuilt.messages);
+		}
+	}
 
 	// Extract settings and find compaction
 	let thinkingLevel: string | undefined = "off";
@@ -421,6 +465,11 @@ export function buildSessionContext(
 		}
 	}
 	const searchMaterials = activeSearchMaterialRefs(path);
+	// A notice whose point was invalidated (later user input, compaction, reset,
+	// or a foreign branch summary) must not reach the model: it would advertise
+	// a point that resolves to "stale". Dropping it keeps both the model and
+	// display projections index-compatible and stops paying for dead notices.
+	const liveInstructionAnchors = new Set(resolveInstructionAnchors(path).map(anchor => anchor.entryId));
 
 	const appendMessage = (entry: SessionEntry) => {
 		handleEntryResetTracking(entry);
@@ -435,6 +484,7 @@ export function buildSessionContext(
 			pushMessage(entry.message);
 		} else if (entry.type === "custom_message") {
 			if (entry.customType === SEARCH_REWIND_STATE || entry.customType === WORK_PACKAGE_STATE_TYPE) return;
+			if (entry.customType === INSTRUCTION_ANCHOR_MESSAGE_TYPE && !liveInstructionAnchors.has(entry.id)) return;
 			if (
 				!options?.transcript &&
 				entry.customType === SEARCH_MATERIAL &&
@@ -453,6 +503,21 @@ export function buildSessionContext(
 			if (message) pushMessage(message);
 		} else if (entry.type === "branch_summary" && entry.summary && !rewindSummaryIds.has(entry.id)) {
 			pushMessage(createBranchSummaryMessage(entry.summary, entry.fromId, entry.timestamp));
+		}
+	};
+
+	const appendSearchMaterials = (source: readonly SessionEntry[]) => {
+		if (options?.transcript) return;
+		const represented = new Set(fusedSearchReadRefs(messages.filter(message => message.role === "toolResult")));
+		for (const message of messages) {
+			if (message.role === "custom" && message.customType === SEARCH_MATERIAL &&
+				isRecord(message.details) && typeof message.details.ref === "string") represented.add(message.details.ref);
+		}
+		for (const material of collectActiveSearchMaterials(source)) {
+			if (isRecord(material.details) && typeof material.details.ref === "string" &&
+				(!searchMaterials || searchMaterials.has(material.details.ref)) && !represented.has(material.details.ref)) {
+				pushMessage(material);
+			}
 		}
 	};
 
@@ -517,6 +582,34 @@ export function buildSessionContext(
 		for (let i = resetBoundaryIdx + 1; i < path.length; i++) {
 			appendMessage(path[i]);
 		}
+	} else if (compaction && isRecord(compaction.details) && compaction.details.kind === "local-rewind") {
+		const details = compaction.details;
+		const source = typeof details.sourceLeafId === "string" ? localSources.get(details.sourceLeafId) : undefined;
+		const { intervalStart, intervalEnd } = details;
+		if (details.version !== 1 || !source || details.sourceMessageCount !== source.length ||
+			!Number.isSafeInteger(intervalStart) || !Number.isSafeInteger(intervalEnd) ||
+			typeof intervalStart !== "number" || typeof intervalEnd !== "number" ||
+			intervalStart <= 0 || intervalStart >= intervalEnd || intervalEnd > source.length) {
+			throw new Error("Invalid local rewind context interval.");
+		}
+		const compactionIdx = path.findIndex(entry => entry.id === compaction.id);
+		const checkpoint = resolveQaCompactionCheckpoint(path.slice(0, compactionIdx), details.checkpointEntryId);
+		for (const message of source.slice(0, intervalStart)) {
+			if (!searchMaterials || keepSearchMessage(message, searchMaterials)) pushMessage(message);
+		}
+		pushMessage(createCustomMessage(QA_CHECKPOINT_ENTRY_TYPE, renderQaCompactionCheckpoint(checkpoint.data),
+			true, undefined, checkpoint.timestamp));
+		if (typeof details.state === "string" && details.state) {
+			pushMessage(createCustomMessage(QA_STATE_TYPE, details.state, false, undefined, compaction.timestamp));
+		}
+		// Only post-interval replay is rebound. Prefix messages stay byte-for-byte
+		// identical, including provider signatures and their original timestamps.
+		for (const message of source.slice(intervalEnd)) {
+			if (searchMaterials && !keepSearchMessage(message, searchMaterials)) continue;
+			pushMessage(message.role === "assistant" ? sanitizeAssistantForReparentedHistory(message) : message);
+		}
+		appendSearchMaterials(path.slice(0, compactionIdx + 1));
+		for (let i = compactionIdx + 1; i < path.length; i++) appendMessage(path[i]);
 	} else if (
 		compaction &&
 		isRecord(compaction.details) &&
@@ -564,6 +657,7 @@ export function buildSessionContext(
 			handleEntryResetTracking(compaction);
 			pushMessage(createCompactionSummaryMessage(compaction.summary, compaction.tokensBefore, compaction.timestamp));
 		}
+		appendSearchMaterials(path.slice(0, compactionIdx + 1));
 		for (let i = compactionIdx + 1; i < path.length; i++) appendMessage(path[i]);
 	} else if (compaction) {
 		const remotePayload = getOpenAiRemoteCompactionPayload(compaction);
@@ -716,6 +810,7 @@ export function buildSessionContext(
 			pushMessage(compactionSummaryMsg);
 		}
 
+		appendSearchMaterials(path.slice(0, compactionIdx + 1));
 		// Emit messages after compaction
 		for (let i = compactionIdx + 1; i < path.length; i++) {
 			const entry = path[i];
@@ -729,9 +824,14 @@ export function buildSessionContext(
 	}
 
 	if (!options?.transcript) {
+		// New selections after the latest compaction normally remain represented
+		// by their original delivered read; old selections keep their stable
+		// compaction-boundary position rather than moving after every new turn.
+		appendSearchMaterials(path);
 		const notes = getContextNotes(path);
 		const renderedNotes = renderContextNotes(path);
-		if (notes && renderedNotes.length > 0) {
+		if (notes && renderedNotes.length > 0 && !messages.some(message =>
+			message.role === "custom" && message.customType === CONTEXT_NOTES_ENTRY_TYPE)) {
 			const sourceEntry = path.find(entry => entry.id === notes.entryId);
 			if (sourceEntry) {
 				// A native Anthropic compaction block must open the request, and the

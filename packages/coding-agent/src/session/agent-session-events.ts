@@ -32,11 +32,11 @@ export type AgentSessionEvent =
 	| {
 			type: "auto_compaction_start";
 			reason: "threshold" | "overflow" | "idle" | "incomplete";
-			action: "context-full" | "remote" | "handoff" | "shake" | "snapcompact" | "qaonly";
+			action: "context-full" | "remote" | "handoff" | "shake" | "snapcompact" | "qaonly" | "rewind";
 	  }
 	| {
 			type: "auto_compaction_end";
-			action: "context-full" | "remote" | "handoff" | "shake" | "snapcompact" | "qaonly";
+			action: "context-full" | "remote" | "handoff" | "shake" | "snapcompact" | "qaonly" | "rewind";
 			result: CompactionResult | undefined;
 			aborted: boolean;
 			willRetry: boolean;

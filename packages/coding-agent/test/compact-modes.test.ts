@@ -20,6 +20,7 @@ describe("parseCompactArgs", () => {
 		expect(parseCompactArgs("soft")).toEqual({ mode: "soft" });
 		expect(parseCompactArgs("remote")).toEqual({ mode: "remote" });
 		expect(parseCompactArgs("snapcompact")).toEqual({ mode: "snapcompact" });
+		expect(parseCompactArgs("rewind")).toEqual({ mode: "rewind" });
 	});
 
 	it("splits a mode from its trailing focus instructions", () => {
@@ -30,6 +31,10 @@ describe("parseCompactArgs", () => {
 		expect(parseCompactArgs("remote   keep auth details")).toEqual({
 			mode: "remote",
 			instructions: "keep auth details",
+		});
+		expect(parseCompactArgs("Rewind keep exact evidence")).toEqual({
+			mode: "rewind",
+			instructions: "keep exact evidence",
 		});
 	});
 

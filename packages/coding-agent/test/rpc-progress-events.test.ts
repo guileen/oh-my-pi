@@ -38,6 +38,21 @@ async function start(): Promise<{ rpc: RpcClient; events: AgentSessionEvent[] }>
 }
 
 describe("RPC progress events", () => {
+	test("passes the one-shot rewind mode through the real RPC client and dispatcher", async () => {
+		const { rpc, events } = await start();
+		await expect(rpc.compact(undefined, { mode: "rewind" })).rejects.toThrow("Nothing to rewind");
+		expect(events.filter(event => event.type.startsWith("manual_compaction_"))).toEqual([
+			{ type: "manual_compaction_start", mode: "rewind" },
+			{
+				type: "manual_compaction_end",
+				aborted: false,
+				skipped: true,
+				errorMessage: "Nothing to rewind: complete an exploration interval after the latest user request first.",
+			},
+		]);
+		expect(events.some(event => event.type.startsWith("auto_compaction_"))).toBe(false);
+	}, 60_000);
+
 	test("manual compact emits manual_compaction_start and manual_compaction_end", async () => {
 		const { rpc, events } = await start();
 		await rpc.promptAndWait("first turn");

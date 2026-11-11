@@ -1,3 +1,4 @@
+import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import { isUserRequestEntry } from "@oh-my-pi/pi-tui/chat/transcript-entry";
 import { isRecord, prompt } from "@oh-my-pi/pi-utils";
 import type { GoalModeState } from "../goals/state";
@@ -220,5 +221,111 @@ export function prepareQaCompaction(
 			...(state ? { state } : {}),
 		},
 		summary: summaryParts.join("\n\n"),
+	};
+}
+
+/** A local fold replaces one complete interval, not the original request prefix. */
+export function prepareLocalRewindCompaction(
+	entries: readonly SessionEntry[],
+	messages: readonly AgentMessage[],
+	runtimeState?: QaCompactionRuntimeState,
+): { details: Record<string, unknown> & { retainedEntryIds: string[] }; summary: string } {
+	const prepared = prepareQaCompaction(entries, runtimeState);
+	const checkpoint = resolveQaCompactionCheckpoint(entries, prepared.details.checkpointEntryId);
+	const checkpointIndex = entries.findIndex(entry => entry.id === checkpoint.id);
+	const report = entries.slice(0, checkpointIndex).findLast(entry =>
+		entry.type === "message" && entry.message.role === "assistant");
+	if (report?.type !== "message" || report.message.role !== "assistant") {
+		throw new Error("Local rewind requires a journal-owned checkpoint reporting turn.");
+	}
+	const reportCalls = report.message.content.filter(block => block.type === "toolCall");
+	if (reportCalls.length !== 1) throw new Error("Local rewind requires a sole checkpoint report.");
+	const reportCall = reportCalls[0];
+	let name = reportCall.name.replace(/^xd:\/\//, "");
+	let args = reportCall.arguments;
+	if (name === "write" && args.path === "xd://new_context" && typeof args.content === "string") {
+		try {
+			const decoded: unknown = JSON.parse(args.content);
+			if (!isRecord(decoded)) throw new Error("Invalid checkpoint device arguments.");
+			args = decoded;
+			name = "new_context";
+		} catch {
+			throw new Error("Invalid checkpoint reporting call.");
+		}
+	}
+	if (name !== "new_context" || !isRecord(args.checkpoint) || args.checkpoint.cycleId !== checkpoint.data.cycleId) {
+		throw new Error("Checkpoint does not belong to the reporting call.");
+	}
+	const reportIndex = messages.findIndex(message => message.role === "assistant" &&
+		message.content.some(block => block.type === "toolCall" && block.id === reportCall.id));
+	const reportResult = messages.findIndex((message, index) => index > reportIndex &&
+		message.role === "toolResult" && message.toolCallId === reportCall.id);
+	if (reportIndex < 0 || reportResult < 0) throw new Error("Checkpoint reporting batch is incomplete.");
+	// Validate the delivered journal lane before context reconstruction can strip
+	// dangling calls. Incomplete/ambiguous batches must not become a valid fold.
+	const rawEnd = entries.findIndex(entry => entry.type === "message" && entry.message.role === "toolResult" &&
+		entry.message.toolCallId === reportCall.id);
+	if (rawEnd <= checkpointIndex) throw new Error("Checkpoint reporting result is unavailable.");
+	const rawBoundary = entries.slice(0, checkpointIndex).findLastIndex(entry =>
+		entry.type === "compaction" || entry.type === "reset_boundary");
+	const rawCalls = new Set<string>();
+	const rawResults = new Set<string>();
+	for (const entry of entries.slice(rawBoundary + 1)) {
+		if (entry.type !== "message") continue;
+		if (entry.message.role === "assistant") {
+			for (const block of entry.message.content) {
+				if (block.type !== "toolCall") continue;
+				if (rawCalls.has(block.id)) throw new Error("Ambiguous delivered tool batch.");
+				rawCalls.add(block.id);
+			}
+		} else if (entry.message.role === "toolResult") {
+			if (!rawCalls.has(entry.message.toolCallId) || rawResults.has(entry.message.toolCallId)) {
+				throw new Error("Incomplete delivered tool batch.");
+			}
+			rawResults.add(entry.message.toolCallId);
+		}
+	}
+	if (rawCalls.size !== rawResults.size) throw new Error("Incomplete delivered tool batch.");
+	let latestRequest = -1;
+	for (let index = 0; index < reportIndex; index++) {
+		const message = messages[index];
+		if (message.role === "user" || (message.role === "custom" && message.attribution === "user")) latestRequest = index;
+	}
+	if (latestRequest < 0) throw new Error("Local rewind has no original user request prefix.");
+	const start = messages.findIndex((message, index) => index > latestRequest && message.role === "assistant");
+	if (start < 0 || start >= reportIndex) throw new Error("Local rewind has no completed exploration interval.");
+	const end = reportResult + 1;
+	const interval = messages.slice(start, end);
+	const calls = new Set<string>();
+	const results = new Set<string>();
+	for (const message of interval) {
+		if (message.role === "user" || (message.role === "custom" && message.attribution === "user")) {
+			throw new Error("A user request superseded the local rewind interval.");
+		}
+		if (message.role === "assistant") {
+			for (const block of message.content) {
+				if (block.type !== "toolCall") continue;
+				if (calls.has(block.id)) throw new Error("Ambiguous local rewind tool call.");
+				calls.add(block.id);
+			}
+		} else if (message.role === "toolResult") {
+			if (!calls.has(message.toolCallId) || results.has(message.toolCallId)) throw new Error("Incomplete local rewind tool group.");
+			results.add(message.toolCallId);
+		}
+	}
+	if (calls.size !== results.size) throw new Error("Incomplete local rewind tool group.");
+	return {
+		details: {
+			...prepared.details,
+			kind: "local-rewind",
+			version: 1,
+			// Reference the immutable source path, including earlier compaction
+			// projections, rather than persisting a second full copy of its prefix.
+			sourceLeafId: entries.at(-1)!.id,
+			sourceMessageCount: messages.length,
+			intervalStart: start,
+			intervalEnd: end,
+		},
+		summary: checkpoint.data.summary,
 	};
 }

@@ -105,7 +105,11 @@ export function isSearchRewind(entry: SessionEntry): boolean {
 export function activeSearchMaterialRefs(branch: readonly SessionEntry[]): Set<string> | undefined {
 	for (let i = branch.length - 1; i >= 0; i--) {
 		const entry = branch[i];
-		if (entry.type === "compaction" || entry.type === "reset_boundary") return undefined;
+		if (entry.type === "reset_boundary") return undefined;
+		if (entry.type === "compaction" && isRecord(entry.details) && isRecord(entry.details.searchMaterials)) {
+			const refs = entry.details.searchMaterials.activeRefs;
+			if (Array.isArray(refs) && refs.every(ref => typeof ref === "string")) return new Set(refs);
+		}
 		if (entry.type !== "custom_message" || entry.customType !== SEARCH_REWIND_STATE || !isRecord(entry.details))
 			continue;
 		const refs = entry.details.activeRefs;
@@ -123,26 +127,102 @@ export function renderSearchMaterial(material: SearchMaterial): string {
 	return prompt.render(materialTemplate, { ...material });
 }
 
-function materialFromEntry(entry: SessionEntry): SearchMaterial | undefined {
-	if (entry.type !== "custom_message" || entry.customType !== SEARCH_MATERIAL || !isRecord(entry.details)) return;
-	const d = entry.details;
-	if (
-		typeof d.ref !== "string" ||
-		typeof d.path !== "string" ||
-		typeof d.tag !== "string" ||
-		typeof d.first !== "number" ||
-		typeof d.last !== "number" ||
-		typeof d.body !== "string"
-	)
-		return;
+/** References select delivered numbered snapshots, not every read in the journal. */
+export function fusedSearchReadRefs(results: readonly ToolResultMessage[]): string[] {
+	return results
+		.filter(message => !message.isError && resultKind(message) === "read" && readSnapshotMaterials(message).length > 0)
+		.map(message => searchReference("r", message.toolCallId));
+}
+
+function readSnapshotMaterials(message: ToolResultMessage): SearchMaterial[] {
+	const snapshots: SearchMaterial[] = [];
+	let current: { path: string; tag: string; rows: string[] } | undefined;
+	const flush = () => {
+		if (!current?.rows.length) return;
+		snapshots.push({
+			ref: searchReference("r", message.toolCallId),
+			path: current.path,
+			tag: current.tag,
+			first: Number(current.rows[0].split(":")[0]),
+			last: Number(current.rows[current.rows.length - 1].split(":")[0]),
+			body: current.rows.join("\n"),
+		});
+	};
+	for (const part of message.content) {
+		if (part.type !== "text") continue;
+		for (const line of part.text.split("\n")) {
+			const header = /^\[(.+)#([0-9A-Fa-f]{4,})\]$/.exec(line);
+			if (header) {
+				flush();
+				current = { path: header[1], tag: header[2], rows: [] };
+			} else if (current && /^\d+:/.test(line) && !/(?:\.\.\.|…|\[col \d+\])\s*$/.test(line)) {
+				current.rows.push(line);
+			}
+		}
+	}
+	flush();
+	return snapshots;
+}
+
+/** Lossless active evidence from immutable delivered journal data; never reread a file. */
+export function collectActiveSearchMaterials(entries: readonly SessionEntry[]): CustomMessage[] {
+	const active = activeSearchMaterialRefs(entries);
+	if (!active) return [];
+	const materials = new Map<string, CustomMessage[]>();
+	const boundary = entries.findLastIndex(entry => entry.type === "reset_boundary" ||
+		(entry.type === "compaction" && isRecord(entry.details) && isRecord(entry.details.searchMaterials) &&
+			Array.isArray(entry.details.searchMaterials.messages)));
+	for (const entry of entries.slice(Math.max(0, boundary))) {
+		if (entry.type === "compaction" && isRecord(entry.details) && isRecord(entry.details.searchMaterials)) {
+			const saved = entry.details.searchMaterials.messages;
+			if (Array.isArray(saved)) {
+				const savedMaterials = new Map<string, CustomMessage[]>();
+				for (const message of saved) {
+					if (!isRecord(message) || message.role !== "custom" || message.customType !== SEARCH_MATERIAL ||
+						!isRecord(message.details) || typeof message.details.ref !== "string" || !active.has(message.details.ref)) continue;
+					const ref = message.details.ref;
+					// A single selected read can contain multiple paths/snapshots.
+					const group = savedMaterials.get(ref) ?? [];
+					group.push(message as unknown as CustomMessage);
+					savedMaterials.set(ref, group);
+				}
+				for (const [ref, group] of savedMaterials) materials.set(ref, group);
+			}
+		} else if (entry.type === "custom_message" && entry.customType === SEARCH_MATERIAL &&
+			isRecord(entry.details) && typeof entry.details.ref === "string" && active.has(entry.details.ref)) {
+			materials.set(entry.details.ref, [{
+				role: "custom", customType: entry.customType, content: entry.content, details: entry.details,
+				display: entry.display, attribution: entry.attribution, timestamp: Date.parse(entry.timestamp),
+			}]);
+		} else if (entry.type === "message" && entry.message.role === "custom" &&
+			entry.message.customType === SEARCH_MATERIAL && isRecord(entry.message.details) &&
+			typeof entry.message.details.ref === "string" && active.has(entry.message.details.ref)) {
+			materials.set(entry.message.details.ref, [entry.message]);
+		} else if (entry.type === "message" && entry.message.role === "toolResult" &&
+			active.has(searchReference("r", entry.message.toolCallId))) {
+			const snapshots = readSnapshotMaterials(entry.message);
+			if (snapshots.length) materials.set(searchReference("r", entry.message.toolCallId), snapshots.map(material => ({
+				role: "custom", customType: SEARCH_MATERIAL, content: renderSearchMaterial(material),
+				details: material, display: false, attribution: "agent", timestamp: entry.message.timestamp,
+			})));
+		}
+	}
+	for (const ref of active) {
+		if (!materials.has(ref)) throw new ToolError(`Retained material ${ref} has no delivered snapshot on this branch.`);
+	}
+	return [...active].flatMap(ref => materials.get(ref) ?? []);
+}
+
+/** One durable metadata contract shared by every compaction method. */
+export function preserveSearchMaterials(entries: readonly SessionEntry[], details: unknown): unknown {
+	const active = activeSearchMaterialRefs(entries);
+	if (!active) return details;
 	return {
-		ref: d.ref,
-		path: d.path,
-		tag: d.tag,
-		first: d.first,
-		last: d.last,
-		body: d.body,
-		note: typeof d.note === "string" ? d.note : undefined,
+		...(isRecord(details) ? details : details === undefined ? {} : { originalDetails: details }),
+		searchMaterials: {
+			activeRefs: [...active],
+			messages: collectActiveSearchMaterials(entries),
+		},
 	};
 }
 
@@ -283,9 +363,14 @@ export function buildSearchRewindPlan(branch: readonly SessionEntry[], input: Se
 	for (const ref of [...(input.release ?? []), ...(input.demote ?? []).map(item => item.ref)]) {
 		if (!active.delete(ref)) throw new ToolError(`Retained material ${ref} is not active.`);
 	}
+	// Excluding a fused observation also excludes its implicit read retention.
+	for (const message of results.values()) active.delete(searchReference("r", message.toolCallId));
 	for (const demotion of input.demote ?? []) {
 		if (!demotion.note.trim()) throw new ToolError("A demoted material needs a concise fact or exclusion reason.");
-		const old = branch.map(materialFromEntry).findLast(material => material?.ref === demotion.ref);
+		const old = collectActiveSearchMaterials(branch)
+			.filter(message => isRecord(message.details) && message.details.ref === demotion.ref)
+			.map(message => message.details as SearchMaterial)
+			.find(material => typeof material.path === "string" && typeof material.body === "string");
 		if (!old) throw new ToolError("Retained source provenance is missing.");
 		const material = { ...old, ref: `${old.ref}n`, note: demotion.note.trim(), body: "" };
 		materials.push(material);

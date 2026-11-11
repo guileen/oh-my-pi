@@ -2034,6 +2034,7 @@ describe("AgentSession auto-compaction queue resume", () => {
 		expect(runtimeSignals.some(signal => signal.startsWith("compaction:end:"))).toBe(true);
 	});
 	it("runs active-goal threshold compaction before unexpected-stop retry continuation", async () => {
+		cfgCompactionMethodOrder.set(session.settings, ["soft"]);
 		const now = Date.now();
 		session.setGoalModeState({
 			enabled: true,
@@ -2093,6 +2094,7 @@ describe("AgentSession auto-compaction queue resume", () => {
 	});
 
 	it("settles a successful retry before active-goal compaction continuation starts", async () => {
+		cfgCompactionMethodOrder.set(session.settings, ["soft"]);
 		// A retry can succeed with a non-empty text stop that is already over the
 		// active-goal compaction threshold. The successful message itself must
 		// close the retry lifecycle before agent_end routes into compaction, so

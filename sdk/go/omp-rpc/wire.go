@@ -3519,6 +3519,7 @@ const (
 	AutoCompactionActionShake       AutoCompactionAction = "shake"
 	AutoCompactionActionSnapcompact AutoCompactionAction = "snapcompact"
 	AutoCompactionActionQaonly      AutoCompactionAction = "qaonly"
+	AutoCompactionActionRewind      AutoCompactionAction = "rewind"
 )
 
 func (v *AutoCompactionAction) UnmarshalJSON(data []byte) error {
@@ -3527,7 +3528,7 @@ func (v *AutoCompactionAction) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	switch value := AutoCompactionAction(s); value {
-	case AutoCompactionActionContextFull, AutoCompactionActionRemote, AutoCompactionActionHandoff, AutoCompactionActionShake, AutoCompactionActionSnapcompact, AutoCompactionActionQaonly:
+	case AutoCompactionActionContextFull, AutoCompactionActionRemote, AutoCompactionActionHandoff, AutoCompactionActionShake, AutoCompactionActionSnapcompact, AutoCompactionActionQaonly, AutoCompactionActionRewind:
 		*v = value
 		return nil
 	}
@@ -8172,7 +8173,8 @@ func (c Commands) SetInterruptMode(ctx context.Context, p SetInterruptModeComman
 
 // CompactCommand holds the parameters of "compact".
 type CompactCommand struct {
-	CustomInstructions *string `json:"customInstructions,omitempty"`
+	CustomInstructions *string             `json:"customInstructions,omitempty"`
+	Mode               *CompactCommandMode `json:"mode,omitempty"`
 }
 
 // Compact sends "compact": Compact the conversation.
@@ -8180,6 +8182,30 @@ func (c Commands) Compact(ctx context.Context, p CompactCommand) (CompactionResu
 	var out CompactionResult
 	err := c.call(ctx, "compact", p, 0, &out)
 	return out, err
+}
+
+type CompactCommandMode string
+
+const (
+	CompactCommandModeSoft        CompactCommandMode = "soft"
+	CompactCommandModeRemote      CompactCommandMode = "remote"
+	CompactCommandModeSnapcompact CompactCommandMode = "snapcompact"
+	CompactCommandModeRelay       CompactCommandMode = "relay"
+	CompactCommandModeQaonly      CompactCommandMode = "qaonly"
+	CompactCommandModeRewind      CompactCommandMode = "rewind"
+)
+
+func (v *CompactCommandMode) UnmarshalJSON(data []byte) error {
+	s, err := decodeString(data, "CompactCommandMode")
+	if err != nil {
+		return err
+	}
+	switch value := CompactCommandMode(s); value {
+	case CompactCommandModeSoft, CompactCommandModeRemote, CompactCommandModeSnapcompact, CompactCommandModeRelay, CompactCommandModeQaonly, CompactCommandModeRewind:
+		*v = value
+		return nil
+	}
+	return unknownValue("CompactCommandMode", s)
 }
 
 // SetAutoCompactionCommand holds the parameters of "set_auto_compaction".

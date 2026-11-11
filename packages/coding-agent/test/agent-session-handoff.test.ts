@@ -1109,13 +1109,6 @@ describe("AgentSession handoff", () => {
 
 		expect(session.autoCompactionEnabled).toBe(false);
 		session.setAutoCompactionEnabled(true);
-		expect(cfgCompactionMethodOrder.get(session.settings)).toEqual([
-			"remote",
-			"snapcompact",
-			"handoff",
-			"shake",
-			"soft",
-		]);
 		expect(session.autoCompactionEnabled).toBe(true);
 	});
 

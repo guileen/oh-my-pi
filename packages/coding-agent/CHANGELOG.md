@@ -1,8 +1,12 @@
 # Changelog
 
 ## [Unreleased]
-
 ### Added
+
+- Automatic compaction now tries a local interval rewind first, keeping the original prefix and selected exact source without a separate summary-model request; explicit method orders are preserved.
+- `/compact rewind [focus]` and RPC `mode: "rewind"` manually fold exploration while preserving the original prefix and selected exact source, without changing automatic settings or using a separate summarizer.
+- Every user instruction now opens an automatic rewind point (`R0`, `R1`, …) advertised in the request; each completed fold opens the next point and earlier points stay reusable. `rewind({checkpointId, report, nextAction})` folds exploration after the selected point into a retained report without creating a work package or touching todo state. The first point is preceded by a one-shot how-to-rewind skill notice (what/why/when/where/who/how); every later point carries a one-line reminder, and a compaction that drops the explanation re-opens it once.
+- Rewind timing is now explicit: a hidden advisory hint repeats every 12 settled tool results on the live point, and a text-only stop with at least 12 unfolded results gets one mandatory fold reminder that continues the loop once.
 
 - `/loop 100 5m` runs at most 100 turns; `/loop 6h 5m` runs for up to 6 hours. The interval starts after each turn. `--count`, `--duration`, and `--interval` can also be combined. A lone positional count retains its legacy repeat-count meaning.
 - `/stop-loop` cancels future loop iterations without interrupting the current turn, even during compaction; interactive extensions can also exit loop mode via `ctx.sessionModes.set()` while work is running.
@@ -89,6 +93,8 @@
 
 ### Changed
 
+- Rewind continuations show the concrete decision, next action and retained evidence without repeating generic safety preambles.
+
 - Checkpoint work packages can now nest, advance todo tasks atomically, and hand relevant findings and source indexes to siblings and parent acceptance.
 - Compaction handoffs now direct long-running work to the next actionable TODO, preserve all outstanding goals and verification, and discourage repeated exploration, checks, and job launches.
 - QA compaction no longer forces a stop at a fixed 200K: it gives an optional denoise hint near 100K, two advisory warnings (60% and 85% of the usable context), and forces a handoff only near the model's context limit; warnings tell the model to turn reads into edits or written findings before checkpointing.
@@ -98,6 +104,10 @@
 - `/compact qaonly` now preserves task progress, plan references, goals and background-job state without a model call, and makes its checkpoint and file references available immediately on automatic continuation and session reopen.
 
 ### Fixed
+
+- QA rollover no longer discards an unfolded instruction rewind point: `new_context` is refused with `QA_REWIND_FOLD_REQUIRED` until that point is folded, and only the hard context report keeps its safety exception.
+- Messages sent during a loop, including after pausing it, no longer replace its repeated prompt.
+- Rewind now completes fused source reads even when no cut saves context, and preserves selected code, line numbers, edit anchors, text and images across work-package and automatic folds.
 
 - `.`/`c` continue works again after `/handoff` or a compaction summarized away your last prompt, instead of reporting "Nothing to resume"
 - Fixed `omp bash` and `omp sh` starting without a visible prompt when `PS1` is unset

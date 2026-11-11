@@ -17,15 +17,15 @@ After reaching `finishWhen`, call `rewind({checkpointId, report, nextAction, out
 
 A successful context change replaces post-anchor conversation with the handoff and current todo state; later parent cuts replace child traces and summaries. With an explicit outcome, no net savings can still commit progress and close the scope without changing context. Acceptance is not proof of a cut: the final journal report's `contextChanged` is. Strict savings checks exclude the newly generated report. Files and external effects are never rolled back; stale anchors, changed binding identities and new user input fail closed. The persisted journal retains original history and recovers active parents and bindings.
 
-Child reports carry only what the parent and later siblings need: shared contracts and constraints, verified decisions, compact file/symbol indexes, evidence, and unresolved risks. Later sibling cuts preserve prior reports; parent closure consolidates still-needed findings into its own report before replacing child history. Macro cuts do not automatically retain child observation materials. File indexes locate evidence but are not fresh source snapshots.
+Child reports carry shared contracts, verified decisions, compact source/artifact indexes, verification evidence and unresolved risks. Later sibling cuts preserve prior reports; parent closure consolidates still-needed findings before replacing child history. Active selected observation materials, including immutable fused-read snapshots, survive separately through work-package and automatic cuts until released or demoted. Do not duplicate their code in reports; source indexes alone are not edit anchors.
 
 `checkpoint.enabled` gates both tools, with stable essential definitions when available; subagents require explicit inclusion. Cache eligibility estimates do not guarantee a hit; actual provider usage is evidence. This is separate from the threshold-driven QA `new_context` checkpoint protocol below.
 
-Small observation decisions need no checkpoint or handoff report. Every completed tool result, including failures, supplies an `observationId` except `rewind`, `checkpoint`, and `todo`. Prefer cuts for noisy searches or wrong reads; skip tiny/useful output. Optional `read: string[]` accepts ordinary paths/selectors: one rewind call keeps a one-line location/exclusion `note` plus original source before the next provider turn, with `nextAction` **after** those reads. Tests/bash, browser and Computer Use outputs are also eligible.
+Small observation decisions need no checkpoint or report. Every completed tool result, including failures, supplies an `observationId` except `rewind`, `checkpoint`, and `todo`. Retire resolved exploration with disposable output, failed approaches, or long completed reasoning/tool chains at the next settled boundary; skip only an already small, useful interval. Fuse needed source reads with `read: string[]`: one action delivers original paths, numbered code and edit tags before the next provider turn, with `nextAction` **after** those reads. Tests/bash, browser and Computer Use outputs are also eligible.
 
 Optional `retain` carries exact displayed source ranges by `readId`; `keep: [{observationId, text?, images?}]` carries exact delivered text substrings and zero-based delivered image-part indexes. Later hops inherit selected materials, notes and action receipts, with explicit release/demotion for obsolete materials. Non-read/grep/find/glob tools retain original name/arguments, `isError` and complete structured details; these receipts neither undo actions nor establish success. Discarded outcome details are unknown, not a reason to repeat an action automatically.
 
-Call rewind alone after affected tool batches settle. New input, lifecycle/context boundaries and incomplete batches reject the cut; unrelated async deliveries remain available. Small cuts require net savings, preserve canonical todo state and the enclosing package, and do not mark work complete. Fused reads use normal read permissions and preserve successes and full failures; journal recovery restores them without replay. See [selective rewind](./tools/rewind.md#small-observation-decisions) for exact evidence selection and safety limits.
+Call rewind alone after affected batches settle. New input, lifecycle boundaries and incomplete batches reject the cut; unrelated async deliveries remain available. A cut requires net savings, but valid fused reads still complete once when no cut helps. Small decisions preserve canonical todos and the enclosing package without marking work complete. Reads retain normal permissions, successes and full failures; recovery restores delivered snapshots without replay. See [selective rewind](./tools/rewind.md#small-observation-decisions).
 
 While a work package is active, ordinary mid-turn threshold cuts and QA advisories defer to its milestone. The hard context boundary and overflow recovery remain safety fallbacks; a fallback boundary invalidates the older package anchor.
 
@@ -65,15 +65,15 @@ Compaction and branch summaries are first-class session entries, not plain assis
    - `fromId`, `summary`
    - optional `details`, `fromExtension`
 
-When context is rebuilt (`buildSessionContext`):
+Context rebuilding (`buildSessionContext`) depends on the compaction method:
 
-1. Latest compaction on the active path is converted to one `compactionSummary` message.
-2. Kept entries from `firstKeptEntryId` to the compaction point are re-included.
-3. Later entries on the path are appended.
-4. `branch_summary` entries are converted to `branchSummary` messages.
-5. `custom_message` entries are converted to `custom` messages.
+- Ordinary summaries emit a `compactionSummary`, the kept tail from `firstKeptEntryId`, then later entries.
+- Local interval `rewind` reconstructs its journal-owned source, preserving the original prefix and ordered suffix around the folded interval. It does not insert a summary wrapper or rewrite marker ahead of that prefix.
+- QA retains selected Q&A and the accepted checkpoint/state rather than promising an unchanged prefix.
+- Active selected source/text/image evidence is restored at the compaction boundary without duplicating material already represented by a retained read.
+- Branch summaries and custom entries replay normally; selected materials remain subject to release/demotion.
 
-Those custom roles are then transformed into LLM-facing messages in `convertToLlm()`: `compactionSummary` and `branchSummary` become user messages rendered through the static templates
+In `convertToLlm()`, ordinary `compactionSummary` and `branchSummary` messages use these static templates:
 
 - `packages/agent/src/compaction/prompts/compaction-summary-context.md`
 - `packages/agent/src/compaction/prompts/branch-summary-context.md`
@@ -238,6 +238,16 @@ Including `shake` in `compaction.methodOrder` performs an inline, local reductio
 
 Threshold, incomplete-output, and overflow recovery advance to the next configured method when shake cannot reclaim enough context to get below the recovery band; this prevents repeated no-op shake loops. Idle shake does not use that fallback because the idle timer rechecks usage before running again. Manual `/shake` is a separate, more aggressive command that can target all eligible history.
 
+### Automatic local interval rewind
+
+`rewind` is the first default method. It shares the main-loop checkpoint lifecycle below: the working agent submits `new_context({checkpoint})`; no separate summary-model request is made.
+
+The runtime folds a complete contiguous exploration interval after the retained user boundary, preserves the original earlier prefix and any ordered later suffix, and carries the accepted report plus active exact source/text/image materials once. Completed reasoning and tool chains inside the interval leave active context; original journal history remains available. Tool-call/result groups stay intact, and retained suffix assistants are sanitized for their changed history. Source references and iterative replay avoid copying full prefixes into each compaction record or growing the reconstruction call stack with repeated folds.
+
+Local folding requires a reproducible prefix, net savings and recovery headroom. A mismatch with live provider-converted history, an unusable interval, or excessive retained context advances only to a later configured method; local-only configurations pause instead of silently paying for a summarizer. Explicit method orders are not changed.
+
+An unchanged prefix, stable system/tools and matching provider conditions preserve cache eligibility—not proof of a hit. Modifying the middle does not make the unchanged suffix reusable as part of the old contiguous cached prefix. Provider usage establishes actual cache reads.
+
 ### Automatic milestone QA compaction
 
 Opt in through **Compaction Method Order** in `/settings`, or configure:
@@ -247,7 +257,7 @@ compaction:
    methodOrder: [qaonly] # add soft afterward only to authorize paid summary fallback
 ```
 
-Defaults and user settings are unchanged. QA-first active work uses the model's safe capacity rather than the configured general compaction trigger: the report-input limit is the smaller of the normal prompt budget and `contextWindow − 8192`, and the ordinary-work stop is that limit minus 4,096. The hint starts at the smaller of 100,000 tokens and 50% of the stop; warnings follow at 60% and 85% of the stop. Unknown windows and unusable watermark ranges disable cooperative checkpointing. Experimental notes-backed management takes precedence.
+Both rewind-first and QA-first active work use the model's safe capacity rather than the configured general trigger: the report-input limit is the smaller of the normal prompt budget and `contextWindow − 8192`, and the ordinary-work stop is that limit minus 4,096. The hint starts at the smaller of 100,000 tokens and 50% of the stop; warnings follow at 60% and 85%. Unknown windows and unusable watermark ranges disable cooperative checkpointing. Experimental notes-backed management takes precedence.
 
 At eligible request boundaries, omp sends the highest newly reached advisory stage, sharing a cycle identifier across stages; a large jump can skip earlier advisories. The hint makes an early checkpoint optional when denoising would help; warnings remain advisory. The agent chooses an appropriate milestone autonomously, with no request-count quota below the ordinary-work stop. Executing synchronous tools settle normally; background jobs are not cancelled or awaited merely to checkpoint.
 
@@ -255,7 +265,9 @@ At the effective stop, ordinary work is forcibly paused. The next request, only 
 
 The agent acknowledges with `new_context({checkpoint})` as its sole tool call. The checkpoint contains `cycleId`, a nonblank `summary`, `disposition: continue | complete | blocked`, and a nonblank `nextAction` for `continue` only. Summary plus next action is limited to 4,096 tokens. Acceptance confirms durable recording, not successful compaction; invalid, stale, conflicting and failed-persistence requests return structured errors.
 
-QA locally retains original Q&A, the latest accepted checkpoint, and canonical todo/plan/goal/job state. Earlier operational checkpoints do not accumulate in the prompt; the journal remains available. The next request sees the saved summary and next action without the discarded tool payloads. New user instructions and live job state override historical checkpoints.
+An unfolded instruction rewind point owns the boundary: while it has at least 12 settled tool results and no completed fold, rollover is refused with `QA_REWIND_FOLD_REQUIRED` and the model folds first. The hard report is the exception, since rewind is no longer available at that point. Rollover rewrites the branch, so evidence not folded first cannot be recovered.
+
+QA locally retains original Q&A, the latest accepted checkpoint, active selected source/text/image evidence, and canonical todo/plan/goal/job state. Earlier operational checkpoints do not accumulate in the prompt; the journal remains available. The next request sees the saved summary, next action and selected evidence without discarded tool payloads. New user instructions and live job state override historical checkpoints.
 
 After verifying recovery headroom, unfinished work resumes once if auto-continue is enabled. QA-first continuation, including after any configured fallback method, must recover to at most 80% of the hint threshold to avoid immediately starting another cycle; it does not use the recovery band of a higher general trigger. Queued input wins over a synthetic continuation. `complete`, `blocked`, `autoContinue: false`, and user abort do not generate synthetic work; ordinary input and job-delivery mechanisms remain available. Reopening a saved session alone does not dispatch a request.
 
@@ -263,12 +275,14 @@ Without a checkpoint, or when retained Q&A/fixed instructions/pending input cann
 
 The QA transformation makes no summarization-model call. Checkpoint and continuation requests still incur ordinary provider charges; rewritten prefixes can miss provider caches. Q&A can grow without bound, so lower retained-token counts are not a promise of fixed monetary savings.
 
-### Manual relay and QA-only modes
+### Manual rewind, relay and QA-only modes
 
+- `/compact rewind [focus]` performs one local interval fold through a bounded checkpoint report in the primary agent loop, without a separate summary request or paid fallback. It preserves the reproducible original prefix, selected exact source/text/image evidence and complete ordered tool groups. The mode works below automatic thresholds, with automatic compaction disabled, and with other configured or experimental strategies; saved settings are unchanged.
+- Rewind stages its report and commits only after boundary, prefix and net-savings checks. Empty or unusable intervals, insufficient report capacity, cancellation, superseding input and no net savings do not publish a compaction. An idle manual request does not start unrelated work afterward.
 - `/compact relay [focus]` generates working memory using the live conversation and cache-aware handoff request, then compacts in the same session. Provider cache hits depend on the request and cache lifetime.
 - `/compact qaonly` locally retains user instructions and final answers plus an operational checkpoint, without a model call. The checkpoint records canonical todo phases, statuses and blockers; the planning/approved-plan reference; an enabled goal; and this session's running jobs and pending-delivery IDs. Existing context notes and eval-state snapshots keep their normal recovery paths.
 - The checkpoint and deduplicated file, skill and command references are immediately available to the next model request, including automatic continuation, and survive session reopen. They are hidden context, not tool calls or new user instructions. Checkpoints describe state at compaction; newer requests and tool state take precedence. Repeating QA-only compaction rebuilds state from current sources; `/clear` excludes earlier conversational state. The original journal remains available, and no missing findings are inferred.
-- Manual compaction still interrupts foreground work and follows `compaction.autoContinue`; the zero-model-call guarantee covers the compaction itself, not the ordinary execution turn it resumes.
+- Manual compaction still interrupts foreground work and follows `compaction.autoContinue` when resuming that work. QA-only makes no compaction-model call; rewind uses one primary-loop report. Either may resume the ordinary turn it interrupted.
 
 ### Snapcompact method
 
@@ -580,8 +594,8 @@ Defined in `packages/coding-agent/src/session/context-settings.ts`:
 
 - `compaction.enabled` = `true`
 - `compaction.experimentalContextManagement` = `false`. Opt-in persistent notes, branch-bound raw-history retrieval, and local context-window rollover; toggling it adds or removes `context_notes`/`new_context` in the running session.
-- `compaction.methodOrder` = `["remote", "snapcompact", "handoff", "shake", "soft"]`. `qaonly` is opt-in local Q&A/checkpoint retention; `remote` uses provider-native server compaction (OpenAI Responses compact, Anthropic compaction beta, including Bedrock Converse's Runtime side request) when available. Unavailable or failed methods advance only to a later configured preference.
-- `compaction.asyncEnabled` = `true`. Async (speculative) compaction: when context enters the pre-threshold band `[threshold − lead, threshold)` (lead = `clamp(threshold × 0.125, 8192, 32000)`), maintenance starts a background summarization for the first configured LLM-backed method (`remote`, `handoff`, or `soft`) off a branch snapshot, isolated from the live turn by a side session id. The armed result is committed instantly when the threshold is actually crossed, hiding summarization latency; post-snapshot turns are appended after the summary unchanged. Armed results are discarded when the branch prefix changes (new compaction, reset boundary, `/tree` navigation), when a provider-native replay payload is no longer readable by the active model, or when context grows past `keepRecentTokens` since compute (a fresh speculation replaces it). Speculation is skipped while an extension registers `session_before_compact`. The status line pulses the auto-compact icon while a speculation runs and holds it in accent when a result is armed.
+- `compaction.methodOrder` = `["rewind", "remote", "snapcompact", "handoff", "shake", "soft"]`. `rewind` folds a local exploration interval using a main-loop checkpoint while retaining its stable prefix and selected evidence. Opt-in `qaonly` retains Q&A/checkpoint state instead. `remote` uses eligible provider-native compaction. Unavailable or failed methods advance only to a later configured preference; explicit user orders are preserved.
+- `compaction.asyncEnabled` = `true`. In the pre-threshold band `[threshold − lead, threshold)` (`lead = clamp(threshold × 0.125, 8192, 32000)`), speculation runs only when the first usable configured method is LLM-backed (`remote`, `handoff`, or `soft`). A local-first method does not authorize a speculative summary of a later fallback. Speculation uses an isolated side session and a branch snapshot; its ready result can commit at threshold with later turns retained. Changed prefixes, unreadable native replay or growth beyond `keepRecentTokens` invalidate it. A `session_before_compact` hook disables speculation. The status line indicates running or armed speculation.
 - `compaction.reserveTokens` is unset by default. The effective reserve is `max(floor(contextWindow × 0.15), configuredReserve ?? 16384)`. Budget checks use the proportional reserve when the unset default is impractical on a small window, or when the effective reserve reaches/exceeds the whole window. Explicit reserves otherwise retain the 15% floor.
 - `compaction.keepRecentTokens` = `20000`. Preparation caps this budget so the compacted context lands in the recovery band (80% of the trigger): at most `0.8 × trigger − reserveFloor`, where `reserveFloor` is the smaller of the effective budget reserve and `compaction.reserveTokens` (or `16384` when unset), or half the band when the floor alone fills it. The cap applies before adjusting for measured usage, so a low trigger on a small or provider-capped window keeps less history instead of compacting again right away.
 - `compaction.autoContinue` = `true`

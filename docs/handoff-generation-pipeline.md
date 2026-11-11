@@ -116,9 +116,9 @@ On LLM conversion, `method: "handoff"` selects `packages/agent/src/compaction/pr
 
 ### Automatic handoff
 
-Manual `/handoff` works regardless of the context-maintenance method order. To use this pipeline automatically, include `handoff` in `compaction.methodOrder` (the default order is `remote`, `snapcompact`, `handoff`, `shake`, `soft`). Threshold-triggered handoffs (post-turn, pre-prompt, mid-turn) and `incomplete` recovery generate and commit the document inline; a post-turn handoff completes before the run's `agent_end` settles. Input `overflow` skips handoff generation because the request would carry the same oversized input — but an already-armed speculative handoff result can still be applied during overflow recovery.
+Manual `/handoff` works regardless of method order. Automatic handoff requires `handoff` in `compaction.methodOrder`; the default is `rewind`, `remote`, `snapcompact`, `handoff`, `shake`, `soft`, without changing explicit user orders. Threshold and `incomplete` handoffs generate and commit inline before post-turn `agent_end` settles. Input `overflow` skips new handoff generation because it would repeat oversized input, but may apply an already-armed speculative handoff.
 
-Async compaction (`compaction.asyncEnabled`) may also generate the handoff document speculatively in the pre-threshold band and commit it instantly when the threshold is crossed; see `docs/compaction.md`.
+Async compaction may speculate a handoff only when it is the first usable configured method; a local-first `rewind` does not authorize a side summary for a later fallback. See `docs/compaction.md`.
 
 If auto generation returns no document, maintenance advances to the next configured method. `compaction.handoffSaveToDisk` defaults to `false`; when enabled, only auto-triggered handoffs write the extra markdown artifact.
 

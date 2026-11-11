@@ -11,6 +11,11 @@ import type { CompactionSettings } from "./context-settings";
 /** Choices presented by the ordered compaction-method setting. */
 export const COMPACTION_METHOD_CHOICES = [
 	{
+		value: "rewind",
+		label: "Local interval rewind",
+		description: "Fold exploration using an agent-authored checkpoint, preserving the original prefix and selected exact source; no side summary call",
+	},
+	{
 		value: "remote",
 		label: "Server compaction",
 		description:
@@ -48,10 +53,11 @@ export const COMPACTION_METHOD_CHOICES = [
 export type CompactionMethod = (typeof COMPACTION_METHOD_CHOICES)[number]["value"];
 
 /** Methods the generic compaction engine can execute; QA is session-local. */
-export type EngineCompactionMethod = Exclude<CompactionMethod, "qaonly">;
+export type EngineCompactionMethod = Exclude<CompactionMethod, "qaonly" | "rewind">;
 
-/** Default fallback order: server-native first, portable summary last. */
+/** Default fallback order: local checkpoint fold before costly summaries. */
 export const DEFAULT_COMPACTION_METHOD_ORDER: CompactionMethod[] = [
+	"rewind",
 	"remote",
 	"snapcompact",
 	"handoff",
@@ -60,6 +66,7 @@ export const DEFAULT_COMPACTION_METHOD_ORDER: CompactionMethod[] = [
 ];
 
 const COMPACTION_METHODS: Record<CompactionMethod, true> = {
+	rewind: true,
 	remote: true,
 	snapcompact: true,
 	handoff: true,
@@ -67,6 +74,10 @@ const COMPACTION_METHODS: Record<CompactionMethod, true> = {
 	shake: true,
 	qaonly: true,
 };
+
+export function isLocalCheckpointCompactionMethod(method: unknown): method is "qaonly" | "rewind" {
+	return method === "qaonly" || method === "rewind";
+}
 
 /** Whether an unknown configuration value names a supported compaction method. */
 export function isCompactionMethod(value: unknown): value is CompactionMethod {

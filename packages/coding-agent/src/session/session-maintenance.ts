@@ -97,6 +97,7 @@ import {
 	type CompactionMethod,
 	canUseRemoteCompaction,
 	DEFAULT_COMPACTION_METHOD_ORDER,
+	isLocalCheckpointCompactionMethod,
 	resolveCompactionMethodOrder,
 	resolveMethodSettings,
 	resolveSpeculationMethod,
@@ -109,7 +110,13 @@ import {
 	stripImagesFromMessage,
 } from "./messages";
 import { isTerminalTextAssistantAnswer } from "./queued-messages";
-import { prepareQaCompaction, renderQaCompactionCheckpoint, type QaCompactionRuntimeState } from "./qa-compaction";
+import {
+	prepareLocalRewindCompaction,
+	prepareQaCompaction,
+	renderQaCompactionCheckpoint,
+	type QaCompactionRuntimeState,
+} from "./qa-compaction";
+import { preserveSearchMaterials } from "./search-rewind";
 import {
 	QA_CHECKPOINT_ENTRY_TYPE,
 	type QaCheckpointInput,
@@ -119,6 +126,7 @@ import {
 import qaRolloverHintPrompt from "../prompts/system/qa-rollover-hint.md" with { type: "text" };
 import qaRolloverWarningPrompt from "../prompts/system/qa-rollover-warning.md" with { type: "text" };
 import qaRolloverHardReportPrompt from "../prompts/system/qa-rollover-hard-report.md" with { type: "text" };
+import manualRewindReportPrompt from "../prompts/system/manual-rewind-report.md" with { type: "text" };
 import {
 	resolveCompactionConfiguredTarget,
 	resolveContextPromotionConfiguredTarget,
@@ -444,7 +452,12 @@ export interface SessionMaintenanceHost {
 	takeExperimentalContextRolloverRequest(context: AgentTurnEndContext | undefined): boolean;
 	queueExperimentalContextNotesReminder(prompt: string): void;
 	hasQaRolloverTool?(): boolean;
+	runManualRewindReport?(message: AgentMessage, signal: AbortSignal): Promise<AgentMessage[]>;
 	hasActiveWorkPackage?(): boolean;
+	/** Settled exploration the live instruction point still has to fold. */
+	pendingInstructionFold?(): { anchorId: string; toolResults: number } | undefined;
+	/** Open a fresh instruction rewind point on the post-compaction branch. */
+	openInstructionRewindPointAfterCompaction?(): void;
 	pendingQaMessages?(): AgentMessage[];
 	memoryBackendSession(): MemoryBackendOperationContext["session"];
 	emitSessionEvent(event: AgentSessionEvent, options?: { detachExtensions?: boolean }): Promise<void>;
@@ -570,6 +583,7 @@ interface QaRolloverCycle {
 	key: string;
 	phase: "warning-pending" | "draining" | "hard-report" | "ready" | "compacting" | "blocked";
 	reportRequestsUsed: number;
+	manual?: boolean;
 	reportPromptDelivered?: boolean;
 	/** Highest advisory stage delivered: 0 none, 1 hint, 2 warning, 3 final warning. */
 	advisoryStage: number;
@@ -658,6 +672,7 @@ export class SessionMaintenance {
 	>();
 	readonly #host: SessionMaintenanceHost;
 	#qaCycle: QaRolloverCycle | undefined;
+	#manualRewindCycle: QaRolloverCycle | undefined;
 	#qaParked = false;
 	#qaParkedModel: Model | undefined;
 	#qaParkedRevision = -1;
@@ -718,7 +733,7 @@ export class SessionMaintenance {
 		const selected = resolveCompactionMethodOrder(settings.methodOrder).find(candidate =>
 			isCompactionMethodUsable(candidate, "threshold", model, settings),
 		);
-		if (selected !== "qaonly") return;
+		if (!isLocalCheckpointCompactionMethod(selected)) return;
 		// Only the model safety boundary forces a stop; earlier stages are advisory.
 		const reportInputLimit = Math.min(promptBudgetTokens(window, settings), window - 8192);
 		const hard = reportInputLimit - 4096;
@@ -742,7 +757,11 @@ export class SessionMaintenance {
 	}
 
 	isQaRolloverEnabled(): boolean {
-		return this.#qaPolicy() !== undefined;
+		return this.#manualRewindCycle !== undefined || this.#qaPolicy() !== undefined;
+	}
+
+	get isManualRewindReporting(): boolean {
+		return this.#manualRewindCycle !== undefined;
 	}
 
 	/** Fresh queued input owns the next run even when QA suppressed synthetic continuation. */
@@ -759,6 +778,7 @@ export class SessionMaintenance {
 	}
 
 	#currentQaCycle(): QaRolloverCycle | undefined {
+		if (this.#manualRewindCycle) return this.#manualRewindCycle;
 		const cycle = this.#qaCycle;
 		if (cycle && cycle.key !== this.#qaPolicy()?.key) this.#qaCycle = undefined;
 		return this.#qaCycle;
@@ -766,6 +786,7 @@ export class SessionMaintenance {
 
 	/** Called after queued input is folded into the live context, before provider conversion. */
 	prepareQaModelCall(messages: AgentMessage[]): void {
+		if (this.#manualRewindCycle) return;
 		if (
 			this.#qaParked &&
 			(this.#qaParkedModel !== this.#model || this.#qaParkedRevision !== this.#host.settings.revision)
@@ -861,7 +882,30 @@ export class SessionMaintenance {
 	/** Admission is after conversion so pending input, tools and fixed instructions count. */
 	async beforeQaModelCall(context: Context, signal?: AbortSignal): Promise<AgentPreModelCallResult> {
 		if (signal?.aborted) return { stop: true, reason: "Cancelled" };
-		if (this.#qaParked) return { stop: true, reason: "QA rollover parked the old loop" };
+		if (this.#qaParked && !this.#manualRewindCycle) return { stop: true, reason: "QA rollover parked the old loop" };
+		const manual = this.#manualRewindCycle;
+		if (manual) {
+			if (manual.generation !== this.#host.promptGeneration() || this.#host.agent.hasQueuedMessages()) {
+				throw new CompactionCancelledError("Local rewind was superseded by new input; retry after it settles.");
+			}
+			if (manual.reportRequestsUsed > 0) return { stop: true, reason: "Manual rewind report complete" };
+			const tokens =
+				this.#tokenizer.countMessages(context.messages, { excludeEncryptedReasoning: true }) +
+				this.#tokenizer.countTokens(context.systemPrompt ?? []) +
+				estimateContextToolSchemaTokens(context.tools ?? [], this.#tokenizer, this.#model);
+			if (tokens > manual.reportInputLimit || !context.tools?.some(tool => tool.name === "new_context")) {
+				throw new Error("Local rewind has insufficient checkpoint reporting capacity; use a larger-context model.");
+			}
+			const model = this.#model!;
+			const budgetThinking = model.thinking?.mode === "budget" || model.thinking?.mode === "anthropic-budget-effort";
+			const canCapReport =
+				supportsOutputTokenLimit(model) &&
+				!(budgetThinking && model.thinking?.requiresEffort && !model.thinking.suppressWhenOff);
+			return {
+				maxTokens: canCapReport ? Math.min(8192, model.maxTokens ?? 8192) : undefined,
+				toolChoice: { type: "tool", name: "new_context" },
+			};
+		}
 		const policy = this.#qaPolicy();
 		if (!policy) return;
 		const cycle = this.#currentQaCycle();
@@ -909,7 +953,7 @@ export class SessionMaintenance {
 	/** Ordinary work has no request quota. Hard reporting permits one transport attempt, not retries. */
 	beforeQaProviderRequest(): void {
 		const cycle = this.#currentQaCycle();
-		if (this.#qaParked) throw new Error("QA rollover parked the old loop");
+		if (this.#qaParked && !this.#manualRewindCycle) throw new Error("QA rollover parked the old loop");
 		if (!cycle || cycle.phase === "warning-pending" || cycle.phase === "draining") return;
 		if (cycle.phase !== "hard-report" || cycle.reportRequestsUsed >= 1) {
 			throw new Error("QA checkpoint report attempt exhausted");
@@ -929,6 +973,19 @@ export class SessionMaintenance {
 				"An active work package owns this boundary; close it with rewind before requesting QA rollover.",
 				input.cycleId,
 			);
+		}
+		// Rollover rewrites the branch and drops the evidence a fold report keeps,
+		// so an unfolded instruction point owns the boundary. The hard report is
+		// the safety exception: the context is already spent, and rewind is gone.
+		if (!cycle.manual && cycle.phase !== "hard-report" && !cycle.checkpoint) {
+			const pending = this.#host.pendingInstructionFold?.();
+			if (pending) {
+				throw qaCheckpointError(
+					"QA_REWIND_FOLD_REQUIRED",
+					`Instruction rewind point \`${pending.anchorId}\` spans ${pending.toolResults} settled tool results; fold it with \`rewind({"checkpointId":"${pending.anchorId}","report":"…","nextAction":"…"})\` before requesting QA rollover.`,
+					input.cycleId,
+				);
+			}
 		}
 		if (cycle.checkpoint) {
 			if (
@@ -957,6 +1014,18 @@ export class SessionMaintenance {
 				"Checkpoint exceeds its size or active boundary.",
 				input.cycleId,
 			);
+		}
+		if (cycle.manual) {
+			if (cycle.generation !== this.#host.promptGeneration() || this.#host.agent.hasQueuedMessages()) {
+				throw qaCheckpointError("QA_STALE_CYCLE", "Manual rewind was superseded by new input.", input.cycleId);
+			}
+			cycle.checkpoint = input;
+			cycle.checkpointEntryId = `manual-checkpoint:${Snowflake.next()}`;
+			cycle.phase = "ready";
+			return {
+				requested: true,
+				checkpoint: { cycleId: input.cycleId, entryId: cycle.checkpointEntryId, status: "accepted" },
+			};
 		}
 		const current = () => !signal?.aborted && this.#currentQaCycle() === cycle && !this.#host.isDisposed();
 		let entryId: string;
@@ -1524,6 +1593,9 @@ export class SessionMaintenance {
 		// Resolve the `/compact <mode>` subcommand up front so input validation
 		// runs before we disconnect/abort the active agent operation below.
 		const compactMode = options?.mode ? findCompactMode(options.mode) : undefined;
+		if (options?.mode !== undefined && !compactMode) {
+			throw new Error(`Invalid compaction mode: ${String(options.mode)}`);
+		}
 		// Modes that produce no LLM summary (snapcompact) have nothing to focus.
 		// Reject focus text loudly so programmatic callers don't silently lose
 
@@ -1604,6 +1676,15 @@ export class SessionMaintenance {
 					{ type: "manual_compaction_start", ...(compactMode ? { mode: compactMode.name } : {}) },
 					false,
 				);
+			}
+			if (compactMode?.name === "rewind") {
+				const result = await this.#compactManualRewind(
+					[customInstructions, options?.internalGuidance].filter(Boolean).join("\n\n") || undefined,
+					compactionAbortController.signal,
+					markCommitted,
+				);
+				options?.onComplete?.(result);
+				return finish(result);
 			}
 			if (compactMode?.name === "qaonly") {
 				const runtimeState = await this.#host.getQaCompactionRuntimeState();
@@ -1714,12 +1795,13 @@ export class SessionMaintenance {
 					case "handoff":
 					case "shake":
 					case "qaonly":
+					case "rewind":
 						return false;
 				}
 			};
 			selectedMethodIndex = methods.findIndex((method, index) => index >= methodOffset && runsManually(method));
 			const selectedMethod = methods[selectedMethodIndex];
-			if (!selectedMethod || selectedMethod === "qaonly") {
+			if (!selectedMethod || isLocalCheckpointCompactionMethod(selectedMethod)) {
 				throw new Error("No configured compaction method can run manually.");
 			}
 			// `/compact snapcompact` pins the order to snapcompact alone, so its
@@ -2907,7 +2989,7 @@ export class SessionMaintenance {
 		const settings = this.#compactionSettings;
 		if (
 			armed.result.preserveData &&
-			(armed.method === "qaonly" ||
+			(isLocalCheckpointCompactionMethod(armed.method) ||
 				!remotePreserveReusable(armed.result.preserveData, model, resolveMethodSettings(settings, armed.method)))
 		) {
 			return false;
@@ -3011,6 +3093,185 @@ export class SessionMaintenance {
 		return run.armed;
 	}
 
+	async #compactManualRewind(
+		focus: string | undefined,
+		signal: AbortSignal,
+		onCommitted: () => void,
+	): Promise<CompactionResult> {
+		const model = this.#model;
+		const contextWindow = model?.contextWindow;
+		if (
+			!model ||
+			typeof contextWindow !== "number" ||
+			!Number.isFinite(contextWindow) ||
+			contextWindow <= 8192 ||
+			!this.#host.runManualRewindReport
+		) {
+			throw new Error("Local rewind requires a primary model with checkpoint reporting capacity.");
+		}
+		const manager = this.#host.sessionManager;
+		const source = manager.getBranch();
+		const sourceLeaf = manager.getLeafId();
+		const original = this.#host.messages().slice();
+		const messages = buildSessionContext(source, undefined, undefined, this.#contextBuildOptions).messages;
+		const lastRequest = messages.findLastIndex(
+			message => message.role === "user" || (message.role === "custom" && message.attribution === "user"),
+		);
+		if (lastRequest < 0 || !messages.slice(lastRequest + 1).some(message => message.role === "assistant")) {
+			throw new ManualCompactionNoOpError(
+				"Nothing to rewind: complete an exploration interval after the latest user request first.",
+			);
+		}
+		const prefixEnd = messages.findIndex((message, index) => index > lastRequest && message.role === "assistant");
+		if (
+			prefixEnd > original.length ||
+			JSON.stringify(this.#host.convertToLlmForSideRequest(messages.slice(0, prefixEnd))) !==
+				JSON.stringify(this.#host.convertToLlmForSideRequest(original.slice(0, prefixEnd)))
+		) {
+			throw new Error("Local rewind cannot reproduce the delivered prefix after runtime/provider transforms.");
+		}
+		const generation = this.#host.promptGeneration();
+		const sessionId = this.#host.sessionId();
+		const revision = this.#host.settings.revision;
+		const cleanupClaims = this.#promptsAwaitingCleanup;
+		const current = () =>
+			!signal.aborted &&
+			!this.#host.isDisposed() &&
+			this.#host.promptGeneration() === generation &&
+			this.#host.sessionId() === sessionId &&
+			this.#model === model &&
+			this.#host.settings.revision === revision &&
+			this.#promptsAwaitingCleanup === cleanupClaims &&
+			!this.#host.agent.hasQueuedMessages() &&
+			!this.#host.pendingQaMessages?.().length;
+		const sourceCurrent = () => current() && manager.getLeafId() === sourceLeaf;
+		const reportInputLimit = Math.min(
+			promptBudgetTokens(contextWindow, this.#compactionSettings),
+			contextWindow - 8192,
+		);
+		const cycle: QaRolloverCycle = {
+			cycleId: `qa:manual:${Snowflake.next()}`,
+			generation,
+			key: "",
+			manual: true,
+			phase: "hard-report",
+			reportRequestsUsed: 0,
+			advisoryStage: 0,
+			hard: reportInputLimit,
+			hint: 0,
+			warning: 0,
+			finalWarning: 0,
+			recovery: 0,
+			reportInputLimit,
+		};
+		const request: AgentMessage = {
+			role: "custom",
+			customType: "manual-rewind-report",
+			display: false,
+			timestamp: Date.now(),
+			content: prompt.render(manualRewindReportPrompt, { cycleId: cycle.cycleId, focus }),
+		};
+		const tokensBefore = this.#projectCurrentBranchContextTokens(source);
+		this.#manualRewindCycle = cycle;
+		try {
+			if (!sourceCurrent())
+				throw new CompactionCancelledError("Local rewind was superseded; retry after new input settles.");
+			const reportMessages = await this.#host.runManualRewindReport(request, signal);
+			if (!sourceCurrent())
+				throw new CompactionCancelledError("Local rewind was superseded; retry after new input settles.");
+			const checkpoint = cycle.checkpoint;
+			const assistant = reportMessages.find(message => message.role === "assistant");
+			const resultMessage = reportMessages.find(message => message.role === "toolResult");
+			if (
+				!checkpoint ||
+				reportMessages.length !== 2 ||
+				!assistant ||
+				assistant.role !== "assistant" ||
+				assistant.stopReason !== "toolUse" ||
+				!resultMessage ||
+				resultMessage.role !== "toolResult" ||
+				resultMessage.isError ||
+				reportMessages.some(message => message.role !== "assistant" && message.role !== "toolResult")
+			) {
+				throw new Error(
+					assistant?.role === "assistant" && assistant.errorMessage
+						? `Local rewind checkpoint report failed: ${assistant.errorMessage}`
+						: "Local rewind did not receive a valid sole checkpoint report; history was preserved. Retry /compact rewind.",
+				);
+			}
+			const timestamp = new Date().toISOString();
+			const reportId = `manual-report:${Snowflake.next()}`;
+			const checkpointId = cycle.checkpointEntryId!;
+			const resultId = `manual-result:${Snowflake.next()}`;
+			const staged: SessionEntry[] = [
+				...source,
+				{ type: "message", id: reportId, parentId: sourceLeaf, timestamp, message: assistant },
+				{
+					type: "custom",
+					id: checkpointId,
+					parentId: reportId,
+					timestamp,
+					customType: QA_CHECKPOINT_ENTRY_TYPE,
+					data: { version: 1, ...checkpoint },
+				},
+				{ type: "message", id: resultId, parentId: checkpointId, timestamp, message: resultMessage },
+			];
+			const runtime = await this.#host.getQaCompactionRuntimeState();
+			if (!sourceCurrent()) throw new CompactionCancelledError();
+			const prepare = (branch: SessionEntry[]) => {
+				const prepared = prepareLocalRewindCompaction(
+					branch,
+					buildSessionContext(branch, undefined, undefined, this.#contextBuildOptions).messages,
+					runtime,
+				);
+				const prefixEnd = prepared.details.intervalStart;
+				if (
+					typeof prefixEnd !== "number" ||
+					prefixEnd > original.length ||
+					JSON.stringify(this.#host.convertToLlmForSideRequest(messages.slice(0, prefixEnd))) !==
+						JSON.stringify(this.#host.convertToLlmForSideRequest(original.slice(0, prefixEnd)))
+				) {
+					throw new Error("Local rewind cannot reproduce the delivered prefix after runtime/provider transforms.");
+				}
+				return prepared;
+			};
+			const prepared = prepare(staged);
+			const result: CompactionResult = { ...prepared, firstKeptEntryId: "", tokensBefore };
+			const after = this.#projectCompactionContextTokens({ ...result, method: "rewind" }, staged);
+			if (after >= tokensBefore) {
+				throw new ManualCompactionNoOpError(
+					"Local rewind would not reduce context; continue working before retrying /compact rewind.",
+				);
+			}
+			await this.#commitCompactionEntry({
+				...result,
+				details: prepared.details,
+				shortSummary: undefined,
+				fromExtension: false,
+				preserveData: undefined,
+				method: "rewind",
+				codexCompaction: undefined,
+				advisorResetReason: "rewind",
+				durable: true,
+				validateCommit: current,
+				prepareAppend: () => {
+					if (!sourceCurrent()) throw new CompactionCancelledError();
+					manager.appendMessage(assistant);
+					const entryId = manager.appendCustomEntry(QA_CHECKPOINT_ENTRY_TYPE, { version: 1, ...checkpoint });
+					if (isRecord(resultMessage.details) && isRecord(resultMessage.details.checkpoint)) {
+						resultMessage.details.checkpoint.entryId = entryId;
+					}
+					manager.appendMessage(resultMessage);
+					Object.assign(prepared.details, prepare(manager.getBranch()).details);
+				},
+				onCommitted,
+			});
+			return result;
+		} finally {
+			this.#manualRewindCycle = undefined;
+		}
+	}
+
 	/**
 	 * Append a compaction entry and run the shared post-commit sequence:
 	 * rebuild the display context, swap live agent messages, re-anchor stats,
@@ -3031,18 +3292,24 @@ export class SessionMaintenance {
 		advisorResetReason: string;
 		detachExtensionEmit?: boolean;
 		durable?: boolean;
+		sourceLeafId?: string;
 		validateCommit?: () => boolean;
 		onCommitted?: () => void;
+		prepareAppend?: () => void;
 	}): Promise<CompactionEntry | undefined> {
 		const append = () => {
 			if (args.validateCommit && !args.validateCommit()) throw new CompactionCancelledError();
+			args.prepareAppend?.();
+			if (args.sourceLeafId && this.#host.sessionManager.getBranchView().at(-1)?.id !== args.sourceLeafId) {
+				throw new CompactionCancelledError();
+			}
 			return this.#host.sessionManager.appendCompaction(
 				args.summary,
 				args.shortSummary,
 				args.firstKeptEntryId,
 				args.tokensBefore,
 				{
-					details: args.details,
+					details: preserveSearchMaterials(this.#host.sessionManager.getBranch(), args.details),
 					fromExtension: args.fromExtension,
 					preserveData: args.preserveData,
 					method: args.method,
@@ -3066,10 +3333,9 @@ export class SessionMaintenance {
 		const sessionContext = this.#host.buildDisplaySessionContext();
 		this.#host.agent.replaceMessages(sessionContext.messages);
 		this.#host.rebaseAfterCompaction();
-		// Compaction discarded the conversation history that carried the approved
-		// plan reference. Clear the sent-flag so #buildPlanReferenceMessage re-reads
-		// the plan from disk and re-injects it on the next turn (issue #1246).
-		this.#host.resetPlanReference();
+		// Summary lanes discard the plan reference. A local interval fold keeps
+		// the delivered prefix intact, so do not prepend a newly rendered copy.
+		if (args.method !== "rewind") this.#host.resetPlanReference();
 		this.#host.resetAdvisorRuntimes(args.advisorResetReason, { compacted: true });
 		this.#host.syncTodoPhasesFromBranch();
 		if (args.codexCompaction) {
@@ -3096,6 +3362,10 @@ export class SessionMaintenance {
 				await compactEmit;
 			}
 		}
+		// Every compaction lands a branch boundary, so any point advertised before it
+		// is dead in replay. Keep folding available for the rest of the run by
+		// opening one on the rewritten branch.
+		this.#host.openInstructionRewindPointAfterCompaction?.();
 		return savedCompactionEntry;
 	}
 
@@ -3621,7 +3891,8 @@ export class SessionMaintenance {
 					if (!isCompactionMethodUsable(candidate, "overflow", payloadModel, payloadCompactionSettings, true))
 						return false;
 					if (candidate === "shake") return true;
-					if (candidate === "qaonly") return this.#currentQaCycle()?.checkpointEntryId !== undefined;
+					if (isLocalCheckpointCompactionMethod(candidate))
+						return this.#currentQaCycle()?.checkpointEntryId !== undefined;
 					const preparation = prepareCompaction(
 						payloadBranch,
 						resolveMethodSettings(payloadCompactionSettings, candidate),
@@ -4630,13 +4901,15 @@ export class SessionMaintenance {
 		return this.#projectCompactionContextTokens(args);
 	}
 
-	#projectCompactionContextTokens(args: CompactionProjectionArgs): number {
+	#projectCompactionContextTokens(
+		args: CompactionProjectionArgs,
+		branch: SessionEntry[] = this.#host.sessionManager.getBranch(),
+	): number {
 		const nonMessageTokens = computeNonMessageTokens(
 			this.#host.nonMessageTokenSource(),
 			this.#tokenizer,
 			this.#host.settings.revision,
 		);
-		const branch = this.#host.sessionManager.getBranch();
 		const leaf = branch.at(-1);
 		const archive = snapcompact.getPreservedArchive(args.preserveData);
 		const blocks = archive
@@ -4665,7 +4938,7 @@ export class SessionMaintenance {
 			firstKeptEntryId: args.firstKeptEntryId,
 			tokensBefore: args.tokensBefore,
 			method: args.method,
-			details: args.details,
+			details: preserveSearchMaterials(branch, args.details),
 			preserveData: args.preserveData,
 			providerReplayThroughEntryId: args.providerReplayThroughEntryId,
 		};
@@ -5157,7 +5430,7 @@ export class SessionMaintenance {
 			result.firstKeptEntryId,
 			result.tokensBefore,
 			{
-				details: result.details,
+				details: preserveSearchMaterials(this.#host.sessionManager.getBranch(), result.details),
 				preserveData: result.preserveData,
 				method: "snapcompact",
 				tokensAfter: this.#projectCompactedContextTokens({
@@ -5690,7 +5963,7 @@ export class SessionMaintenance {
 				? COMPACTION_CHECK_BLOCK_AUTOMATIC_CONTINUATION
 				: COMPACTION_CHECK_NONE;
 		}
-		if (method === "qaonly") {
+		if (isLocalCheckpointCompactionMethod(method)) {
 			this.cancelSpeculation();
 			const cycle = this.#currentQaCycle();
 			const recovery =
@@ -5702,8 +5975,8 @@ export class SessionMaintenance {
 			const activeWork =
 				options.phase === "mid_turn" || reason === "overflow" || reason === "incomplete" || !terminalTextAnswer;
 			let blocker =
-				activeWork && !cycle?.checkpointEntryId
-					? "Active work has no accepted QA checkpoint; its working history was preserved."
+				(activeWork || method === "rewind") && !cycle?.checkpointEntryId
+					? "Active work has no accepted agent-authored checkpoint; its working history was preserved."
 					: undefined;
 			let committed = false;
 			const controller = new AbortController();
@@ -5720,16 +5993,40 @@ export class SessionMaintenance {
 				this.#host.settings.revision === settingsRevision;
 			try {
 				if (!blocker) {
-					await this.#emitLifecycleEvent({ type: "auto_compaction_start", reason, action: "qaonly" }, false);
+					await this.#emitLifecycleEvent({ type: "auto_compaction_start", reason, action: method }, false);
 					const runtime = await this.#host.getQaCompactionRuntimeState();
 					if (!current()) return COMPACTION_CHECK_BLOCK_AUTOMATIC_CONTINUATION;
-					const prepared = prepareQaCompaction(this.#host.sessionManager.getBranch(), runtime);
+					const branch = this.#host.sessionManager.getBranch();
+					const prepared =
+						method === "rewind"
+							? prepareLocalRewindCompaction(
+									branch,
+									buildSessionContext(branch, undefined, undefined, this.#contextBuildOptions).messages,
+									runtime,
+								)
+							: prepareQaCompaction(branch, runtime);
+					if (method === "rewind") {
+						const prefixEnd = "intervalStart" in prepared.details ? prepared.details.intervalStart : undefined;
+						const replayed = this.#host.buildDisplaySessionContext().messages;
+						const live = this.#host.messages();
+						if (
+							typeof prefixEnd !== "number" ||
+							prefixEnd > replayed.length ||
+							prefixEnd > live.length ||
+							JSON.stringify(this.#host.convertToLlmForSideRequest(replayed.slice(0, prefixEnd))) !==
+								JSON.stringify(this.#host.convertToLlmForSideRequest(live.slice(0, prefixEnd)))
+						) {
+							throw new Error(
+								"Local rewind cannot reproduce the delivered prefix after runtime/provider transforms.",
+							);
+						}
+					}
 					const result: CompactionResult = {
 						...prepared,
 						firstKeptEntryId: "",
 						tokensBefore: options.triggerContextTokens ?? this.#estimateStoredContextTokens(),
 					};
-					const after = this.#projectCompactedContextTokens({ ...result, method: "qaonly" });
+					const after = this.#projectCompactedContextTokens({ ...result, method });
 					const pending =
 						(options.pendingContextTokens ?? 0) +
 						this.#tokenizer.countMessages(this.#host.pendingQaMessages?.() ?? [], {
@@ -5740,7 +6037,7 @@ export class SessionMaintenance {
 						after + pending > recovery ||
 						after >= this.#estimateStoredContextTokens()
 					) {
-						blocker = `QA cannot reclaim enough context (${after + pending} retained tokens; recovery target ${recovery}).`;
+						blocker = `${method === "rewind" ? "Local rewind" : "QA"} cannot reclaim enough context (${after + pending} retained tokens; recovery target ${recovery}).`;
 					} else {
 						if (cycle) cycle.phase = "compacting";
 						await this.#commitCompactionEntry({
@@ -5749,10 +6046,14 @@ export class SessionMaintenance {
 							shortSummary: undefined,
 							fromExtension: false,
 							preserveData: undefined,
-							method: "qaonly",
+							method,
 							codexCompaction: undefined,
-							advisorResetReason: "qaonly",
+							advisorResetReason: method,
 							durable: true,
+							sourceLeafId:
+								"sourceLeafId" in prepared.details && typeof prepared.details.sourceLeafId === "string"
+									? prepared.details.sourceLeafId
+									: undefined,
 							validateCommit: () =>
 								committed
 									? !controller.signal.aborted &&
@@ -5773,7 +6074,7 @@ export class SessionMaintenance {
 							await this.#emitLifecycleEvent(
 								{
 									type: "auto_compaction_end",
-									action: "qaonly",
+									action: method,
 									result,
 									aborted: false,
 									willRetry,
@@ -5789,7 +6090,7 @@ export class SessionMaintenance {
 							});
 							this.#host.emitNotice(
 								"info",
-								`QA compacted ${result.tokensBefore} → ${after} tokens; ${
+								`${method === "rewind" ? "Local rewind" : "QA"} compacted ${result.tokensBefore} → ${after} tokens; ${
 									options.phase === "mid_turn" && cycle?.checkpoint?.disposition === "continue"
 										? compactionSettings.autoContinue === false
 											? "paused"
@@ -5807,7 +6108,7 @@ export class SessionMaintenance {
 					await this.#emitLifecycleEvent(
 						{
 							type: "auto_compaction_end",
-							action: "qaonly",
+							action: method,
 							result: undefined,
 							aborted: false,
 							willRetry: false,
@@ -5819,10 +6120,13 @@ export class SessionMaintenance {
 				}
 			} catch (error) {
 				if (committed) {
-					logger.warn("QA post-commit notification failed", { error: toError(error).message });
+					logger.warn("Local checkpoint post-commit notification failed", {
+						method,
+						error: toError(error).message,
+					});
 					return { ...COMPACTION_CHECK_NONE, historyRewritten: true };
 				}
-				blocker = `QA compaction failed: ${toError(error).message}`;
+				blocker = `${method === "rewind" ? "Local rewind" : "QA compaction"} failed: ${toError(error).message}`;
 			} finally {
 				if (this.#autoCompactionAbortController === controller) this.#autoCompactionAbortController = undefined;
 			}

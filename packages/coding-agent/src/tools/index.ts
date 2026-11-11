@@ -561,6 +561,10 @@ export interface ToolSession {
 	setCheckpointState?: (state: CheckpointState | null) => void;
 	/** Get the most recent completed rewind, if this session just rewound a checkpoint. */
 	getLastCompletedRewind?: () => CompletedRewindState | undefined;
+	/** Get an instruction rewind point advertised in the current request. */
+	getInstructionAnchor?: (id?: string) => { id: string } | undefined;
+	/** Validate an instruction-bound fold without changing the active transcript. */
+	validateInstructionRewind?: (checkpointId: string, report: string, nextAction: string) => RewindContextEstimate;
 	/** Validate a work-package handoff without changing the active transcript. */
 	validateRewind?: (
 		checkpointId: string,

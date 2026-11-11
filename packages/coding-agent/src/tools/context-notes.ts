@@ -72,9 +72,9 @@ function resolveExperimentalContextSession(session: ToolSession): ExperimentalCo
 	return manager;
 }
 
-function supportsQaContext(session: ToolSession): boolean {
+function supportsQaContext(session: ToolSession, manualReport = false): boolean {
 	if (
-		cfgCompactionExperimentalContextManagement.get(session.settings) ||
+		(!manualReport && cfgCompactionExperimentalContextManagement.get(session.settings)) ||
 		session.isDisposed?.() ||
 		!session.qaRollover?.isEnabled()
 	) {
@@ -197,9 +197,17 @@ export class NewContextTool implements AgentTool<
 	readonly summary = "Request a fresh context window";
 
 	readonly #mode: "experimental" | "qa";
+	readonly #manualReport: boolean;
 
-	constructor(private readonly session: ToolSession) {
-		this.#mode = cfgCompactionExperimentalContextManagement.get(session.settings) ? "experimental" : "qa";
+	constructor(
+		private readonly session: ToolSession,
+		options?: { manualReport?: boolean },
+	) {
+		this.#manualReport = options?.manualReport === true;
+		this.#mode =
+			!this.#manualReport && cfgCompactionExperimentalContextManagement.get(session.settings)
+				? "experimental"
+				: "qa";
 		this.description = this.#mode === "experimental" ? newContextDescription : newContextQaDescription;
 		this.parameters = this.#mode === "experimental" ? newContextSchema : qaNewContextSchema;
 		this.strict = this.#mode === "experimental";
@@ -224,7 +232,7 @@ export class NewContextTool implements AgentTool<
 		const cycleId = checkpointCycleId(params);
 		if (this.#mode === "qa") {
 			const rollover = this.session.qaRollover;
-			if (!rollover || !supportsQaContext(this.session)) {
+			if (!rollover || !supportsQaContext(this.session, this.#manualReport)) {
 				throw qaCheckpointError("QA_NOT_ACTIVE", "QA rollover is unavailable for this session.", cycleId);
 			}
 			if (!qaNewContextSchema.allows(params)) {

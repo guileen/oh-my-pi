@@ -3245,7 +3245,7 @@ export class InteractiveMode implements InteractiveModeContext {
 
 	#scheduleLoopAutoSubmit(): void {
 		this.#cancelLoopAutoSubmit();
-		if (!this.loopModeEnabled || !this.loopPrompt || this.#isShuttingDown) return;
+		if (!this.loopModeEnabled || this.loopModePaused || !this.loopPrompt || this.#isShuttingDown) return;
 		if (isLoopLimitExhausted(this.loopLimit) || isLoopLimitExhausted(this.loopDurationLimit)) {
 			this.disableLoopMode("Loop limit reached. Loop mode disabled.");
 			return;
@@ -3271,7 +3271,7 @@ export class InteractiveMode implements InteractiveModeContext {
 						this.disableLoopMode("Loop time limit reached. Loop mode disabled.");
 						return;
 					}
-					if (!this.loopModeEnabled || !this.onInputCallback) return;
+					if (!this.loopModeEnabled || this.loopModePaused || !this.onInputCallback) return;
 					if (Date.now() < wakeMs) {
 						arm();
 						return;
@@ -3380,7 +3380,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 
 	#submitLoopPromptWhenReady(prompt: string): void {
-		if (!this.loopModeEnabled || this.loopPrompt !== prompt || !this.onInputCallback) return;
+		if (!this.loopModeEnabled || this.loopModePaused || this.loopPrompt !== prompt || !this.onInputCallback) return;
 		if (isLoopDurationExpired(this.loopLimit) || isLoopDurationExpired(this.loopDurationLimit)) {
 			this.disableLoopMode("Loop time limit reached. Loop mode disabled.");
 			return;
@@ -3404,7 +3404,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 
 	async #loopIteration(action: "prompt" | "compact" | "reset", prompt: string): Promise<void> {
-		if (!this.loopModeEnabled || this.loopPrompt !== prompt || !this.onInputCallback) return;
+		if (!this.loopModeEnabled || this.loopModePaused || this.loopPrompt !== prompt || !this.onInputCallback) return;
 		if (this.#isAutoSubmitBlocked()) {
 			this.#deferLoopAutoSubmit(() => {
 				void this.#runLoopIteration(action, prompt);
@@ -3499,7 +3499,13 @@ export class InteractiveMode implements InteractiveModeContext {
 		// Running the condition is an await point: Esc (pauseLoop) or a second
 		// /loop (disableLoopMode) can land mid-command, so re-check the same
 		// guards the method entry used before acting on a now-stale verdict.
-		if (!this.loopModeEnabled || this.loopPrompt !== prompt || !this.onInputCallback) return false;
+		if (
+			controller.signal.aborted ||
+			!this.loopModeEnabled ||
+			this.loopModePaused ||
+			this.loopPrompt !== prompt ||
+			!this.onInputCallback
+		) return false;
 		if (verdict.kind === "continue") return true;
 		if (verdict.kind === "aborted") return false;
 		this.disableLoopMode(verdict.message);
@@ -3574,12 +3580,9 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 
 	/**
-	 * Pause the loop without exiting it: drops the captured prompt and any
-	 * pending auto-resubmit. Loop mode stays enabled — the next prompt the
-	 * user submits becomes the new loop prompt and resumes iteration.
+	 * Pause without discarding the body; the next manual prompt resumes it.
 	 */
 	pauseLoop(): void {
-		this.loopPrompt = undefined;
 		this.loopModePaused = true;
 		this.#cancelLoopAutoSubmit();
 		this.#abortLoopCondition();
@@ -3856,10 +3859,11 @@ export class InteractiveMode implements InteractiveModeContext {
 						return async () => this.setLoopPrompt(prompt);
 					}
 					if (!this.loopModePaused) return undefined;
-					// A paused loop resumes waiting: the next prompt becomes its body again.
+					// Resume the retained body, or continue waiting for the first one.
 					return async () => {
 						this.loopModePaused = false;
 						this.#syncLoopModeStatus();
+						this.#scheduleLoopAutoSubmit();
 					};
 				}
 				return async () => {

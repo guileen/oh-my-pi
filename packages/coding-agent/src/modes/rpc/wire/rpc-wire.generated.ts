@@ -795,7 +795,7 @@ export interface PromptAck {
 
 export type AutoCompactionReason = "threshold" | "overflow" | "idle" | "incomplete";
 
-export type AutoCompactionAction = "context-full" | "remote" | "handoff" | "shake" | "snapcompact" | "qaonly";
+export type AutoCompactionAction = "context-full" | "remote" | "handoff" | "shake" | "snapcompact" | "qaonly" | "rewind";
 
 export type CacheWarmingPhase = "streaming" | "idle";
 
@@ -1749,6 +1749,7 @@ export interface SetInterruptModeParams {
 
 export interface CompactParams {
 	customInstructions?: string;
+	mode?: "soft" | "remote" | "snapcompact" | "relay" | "qaonly" | "rewind";
 }
 
 export interface SetAutoCompactionParams {

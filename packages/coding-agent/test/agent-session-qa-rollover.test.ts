@@ -2,7 +2,13 @@ import { afterAll, afterEach, beforeEach, describe, expect, it } from "bun:test"
 import * as path from "node:path";
 import { type } from "@oh-my-pi/omptype";
 import { Agent, type AgentMessage, type AgentTool, type StreamFn } from "@oh-my-pi/pi-agent-core";
-import { type AssistantMessage, type Context, ProviderRequestDeniedError, type ToolChoice } from "@oh-my-pi/pi-ai";
+import {
+	type AssistantMessage,
+	type Context,
+	type Message,
+	ProviderRequestDeniedError,
+	type ToolChoice,
+} from "@oh-my-pi/pi-ai";
 import * as AIError from "@oh-my-pi/pi-ai/error";
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
@@ -18,9 +24,10 @@ import {
 	type QaCheckpointInput,
 } from "@oh-my-pi/pi-coding-agent/session/qa-rollover";
 import type { SessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
+import { SEARCH_REWIND_STATE, searchReference } from "@oh-my-pi/pi-coding-agent/session/search-rewind";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { MemorySessionStorage, type WriteTextAtomicOptions } from "@oh-my-pi/pi-coding-agent/session/session-storage";
-import { CheckpointTool, type ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
+import { CheckpointTool, RewindTool, type ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { NewContextTool } from "@oh-my-pi/pi-coding-agent/tools/context-notes";
 import { computeNonMessageTokens } from "@oh-my-pi/pi-tui/status-line/context-usage";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
@@ -150,7 +157,8 @@ function cycleId(request: Request): string {
 			message.role === "custom" &&
 			(message.customType === "qa-rollover-hint" ||
 				message.customType === "qa-rollover-warning" ||
-				message.customType === "qa-rollover-hard-report"),
+				message.customType === "qa-rollover-hard-report" ||
+				message.customType === "manual-rewind-report"),
 	);
 	const text = warning && "content" in warning ? String(warning.content) : "";
 	const id = text.match(/\bqa:[\w:.-]+/)?.[0];
@@ -228,6 +236,7 @@ describe("AgentSession cooperative QA rollover", () => {
 		options: {
 			settings?: Record<string, unknown>;
 			toolResult?: string;
+			workToolName?: string;
 			storage?: QaStorage;
 			asyncJobManager?: AsyncJobManager;
 			allowSoftFallback?: boolean;
@@ -236,6 +245,7 @@ describe("AgentSession cooperative QA rollover", () => {
 			maxTokens?: number;
 			omitMaxOutputTokens?: boolean;
 			workPackages?: boolean;
+			rewind?: boolean;
 			afterCheckpointAccepted?: (
 				session: AgentSession,
 				input: QaCheckpointInput,
@@ -282,6 +292,9 @@ describe("AgentSession cooperative QA rollover", () => {
 			getSessionSpawns: () => "*",
 			isDisposed: () => session?.isDisposed ?? false,
 			getCheckpointState: () => session?.getCheckpointState(),
+			getInstructionAnchor: (id?: string) => session.getInstructionAnchor(id),
+			validateInstructionRewind: (checkpointId, report, nextAction) =>
+				session.validateInstructionRewind(checkpointId, report, nextAction),
 			qaRollover: {
 				isEnabled: () => session?.isQaRolloverEnabled() ?? false,
 				accept: async (input, signal) => {
@@ -293,7 +306,7 @@ describe("AgentSession cooperative QA rollover", () => {
 		};
 		const executions: number[] = [];
 		const workTool: AgentTool = {
-			name: "qa_work",
+			name: options.workToolName ?? "qa_work",
 			label: "QA work fixture",
 			description: "Return an isolated deterministic working observation.",
 			parameters: type({}),
@@ -306,6 +319,7 @@ describe("AgentSession cooperative QA rollover", () => {
 			workTool,
 			new NewContextTool(toolSession),
 			...(options.workPackages ? [new CheckpointTool(toolSession) as AgentTool] : []),
+			...(options.rewind ? [new RewindTool(toolSession) as AgentTool] : []),
 		];
 		const calls: Request[] = [];
 		const sideRequests: Context[] = [];
@@ -452,6 +466,79 @@ describe("AgentSession cooperative QA rollover", () => {
 		expect(h.calls).toHaveLength(5);
 	});
 
+	it("refuses QA rollover until the live instruction point is folded", async () => {
+		let cycle: string | undefined;
+		const rememberCycle: Step = request => {
+			const notice = request.messages.findLast(
+				message => message.role === "custom" && message.customType.startsWith("qa-rollover-"),
+			);
+			const text = notice && "content" in notice ? String(notice.content) : "";
+			cycle ??= text.match(/\bqa:[\w:.-]+/)?.[0];
+			return work();
+		};
+		const checkpointWithCycle: Step = request => {
+			if (!cycle) throw new Error("Expected a QA rollover cycle before checkpointing");
+			return assistant(
+				[
+					{
+						type: "toolCall",
+						id: `qa-checkpoint-${request.index}`,
+						name: "new_context",
+						arguments: {
+							checkpoint: {
+								cycleId: cycle,
+								summary: SUMMARY,
+								disposition: "continue",
+								nextAction: NEXT_ACTION,
+							},
+						},
+					},
+				],
+				WARNED_INPUT,
+			);
+		};
+		const h = await createHarness(
+			[
+				...Array.from({ length: 12 }, () => rememberCycle),
+				checkpointWithCycle,
+				request => {
+					// The settled point owns the boundary: rollover is refused, not queued.
+					expect(
+						request.messages.filter(
+							message => message.role === "toolResult" && message.toolName === "new_context",
+						),
+					).toMatchObject([{ isError: true, details: { code: "QA_REWIND_FOLD_REQUIRED" } }]);
+					return assistant(
+						[
+							{
+								type: "toolCall",
+								id: `instruction-fold-${request.index}`,
+								name: "rewind",
+								arguments: {
+									checkpointId: "R0",
+									report: "Parser behavior mapped at src/parser.ts:41; empty input is trimmed, not rejected.",
+									nextAction: "Run the parser integration scenario.",
+								},
+							},
+						],
+						WARNED_INPUT,
+					);
+				},
+				checkpointWithCycle,
+				() => finalAnswer(),
+			],
+			{ rewind: true },
+		);
+		await run(h.session);
+
+		expect(h.calls).toHaveLength(16);
+		const entries = await h.durableEntries();
+		expect(newContextResults(entries).map(result => result.isError)).toEqual([true, false]);
+		expect(newContextResults(entries)[0]?.details).toMatchObject({ code: "QA_REWIND_FOLD_REQUIRED" });
+		expect(checkpoints(entries)).toHaveLength(1);
+		expect(compactions(entries)).toHaveLength(1);
+	});
+
 	async function run(session: AgentSession, request = REQUEST): Promise<void> {
 		await session.prompt(request);
 		await session.waitForIdle();
@@ -549,6 +636,340 @@ describe("AgentSession cooperative QA rollover", () => {
 		]);
 	});
 
+	it.each(["rewind", "qaonly"])(
+		"preserves selected delivered source through %s and reload without a side summarizer",
+		async method => {
+			const readId = `selected-${method}`;
+			const source =
+				"[src/parser.ts#A1B2]\n41:export function parseExact(input: string) {\n42:  return input.trim();\n43:}";
+			const h = await createHarness(
+				[
+					() =>
+						assistant(
+							[
+								{
+									type: "thinking",
+									thinking: "FOLD_THIS_EXPLORATION",
+									thinkingSignature: "interval-signature",
+								},
+								{ type: "toolCall", id: readId, name: "read", arguments: { path: "src/parser.ts:41-43" } },
+							],
+							WARNED_INPUT,
+						),
+					request => {
+						h.manager.appendCustomMessageEntry(SEARCH_REWIND_STATE, "", false, {
+							activeRefs: [searchReference("r", readId)],
+						});
+						return checkpoint()(request);
+					},
+					() => finalAnswer(),
+					() =>
+						assistant(
+							[
+								{
+									type: "thinking",
+									thinking: "FOLD_THIS_SECOND_CHAIN",
+									thinkingSignature: "second-interval-signature",
+								},
+								{
+									type: "toolCall",
+									id: `${readId}-second`,
+									name: "read",
+									arguments: { path: "src/parser.ts:41-43" },
+								},
+							],
+							WARNED_INPUT,
+						),
+					checkpoint(),
+					() => finalAnswer(),
+				],
+				{
+					workToolName: "read",
+					toolResult: `${RAW_RESULT}\n${source}`,
+					settings: { "compaction.methodOrder": [method] },
+				},
+			);
+			const earlier = [
+				{ role: "user" as const, content: "Keep compatibility and do not deploy.", timestamp: Date.now() - 20 },
+				assistant([
+					{ type: "thinking", thinking: "ORIGINAL_PREFIX_REASONING", thinkingSignature: "prefix-signature" },
+					{ type: "text", text: "Compatibility constraint recorded." },
+				]),
+			];
+			for (const message of earlier) h.manager.appendMessage(message);
+			h.session.agent.replaceMessages(earlier);
+			await run(h.session);
+			expect(h.calls).toHaveLength(3);
+			expect(h.calls[2]!.compactions).toBe(1);
+			const rebuilt = JSON.stringify(h.calls[2]!.context.messages);
+			expect(rebuilt).toContain("[src/parser.ts#A1B2]");
+			expect(rebuilt).toContain("41:export function parseExact(input: string) {");
+			expect(rebuilt.match(/42:  return input\.trim\(\);/g)).toHaveLength(1);
+			expect(rebuilt).not.toContain(RAW_MARKER);
+			expect(rebuilt).not.toContain("FOLD_THIS_EXPLORATION");
+			expect(rebuilt.split(SUMMARY)).toHaveLength(2);
+			if (method === "rewind") {
+				expect(h.calls[2]!.context.messages.slice(0, h.calls[0]!.context.messages.length)).toEqual(
+					h.calls[0]!.context.messages,
+				);
+				expect(rebuilt).toContain("prefix-signature");
+			}
+			await run(h.session, "Continue the saved parser work without deployment.");
+			expect(h.calls).toHaveLength(6);
+			expect(h.calls[5]!.compactions).toBe(2);
+			const repeated = JSON.stringify(h.calls[5]!.context.messages);
+			expect(repeated.match(/42:  return input\.trim\(\);/g)).toHaveLength(1);
+			expect(repeated).not.toContain(RAW_MARKER);
+			expect(repeated).not.toContain("FOLD_THIS_SECOND_CHAIN");
+			if (method === "rewind") {
+				expect(h.calls[5]!.context.messages.slice(0, h.calls[3]!.context.messages.length)).toEqual(
+					h.calls[3]!.context.messages,
+				);
+			}
+			expect(h.sideRequests).toHaveLength(0);
+			const file = h.manager.getSessionFile()!;
+			const reopened = await SessionManager.open(file, path.dirname(file), h.storage, { suppressBreadcrumb: true });
+			try {
+				const restored = JSON.stringify(convertToLlm(reopened.buildSessionContext().messages));
+				expect(restored.match(/42:  return input\.trim\(\);/g)).toHaveLength(1);
+				expect(restored).toContain("[src/parser.ts#A1B2]");
+				expect(restored).not.toContain(RAW_MARKER);
+				expect(restored).not.toContain("FOLD_THIS_EXPLORATION");
+			} finally {
+				await reopened.close();
+			}
+		},
+	);
+
+	it.each([
+		{ enabled: false, experimental: false, order: ["soft"] },
+		{ enabled: true, experimental: false, order: ["qaonly"] },
+		{ enabled: true, experimental: false, order: ["soft"] },
+		{ enabled: false, experimental: true, order: ["soft"] },
+	])(
+		"manually rewinds below thresholds without changing settings ($enabled, $experimental, $order)",
+		async ({ enabled, experimental, order }) => {
+			const readId = "manual-selected-source";
+			const source =
+				"[src/parser.ts#A1B2]\n41:export function parseExact(input: string) {\n42:  return input.trim();\n43:}";
+			const h = await createHarness(
+				[
+					() =>
+						assistant([
+							{ type: "thinking", thinking: "FOLD_MANUAL_EXPLORATION", thinkingSignature: "manual-interval" },
+							{ type: "toolCall", id: readId, name: "read", arguments: { path: "src/parser.ts:41-43" } },
+						]),
+					() => finalAnswer("Exploration is saved."),
+					request => {
+						expect(JSON.stringify(request.context.messages)).toContain("keep exact evidence");
+						expect(request.context.tools?.map(tool => tool.name)).toEqual(["new_context"]);
+						expect(request.toolChoice).toEqual({ type: "tool", name: "new_context" });
+						return checkpoint()(request);
+					},
+					() => finalAnswer(),
+				],
+				{
+					workToolName: "read",
+					toolResult: `${RAW_RESULT}\n${source}`,
+					settings: {
+						"compaction.enabled": enabled,
+						"compaction.methodOrder": order,
+						"compaction.experimentalContextManagement": experimental,
+						"compaction.thresholdTokens": 250_000,
+					},
+				},
+			);
+			await run(h.session);
+			h.manager.appendCustomMessageEntry(SEARCH_REWIND_STATE, "", false, {
+				activeRefs: [searchReference("r", readId)],
+			});
+			const settingsRevision = h.session.settings.revision;
+			const tools = h.session.agent.state.tools;
+			const normalReportSchema = tools.find(tool => tool.name === "new_context")?.parameters;
+			const system = h.session.agent.state.systemPrompt.slice();
+			const prefix = structuredClone(h.calls[0]!.context.messages);
+			await h.session.compact("keep exact evidence", { mode: "rewind" });
+			expect(h.calls).toHaveLength(3);
+			expect(h.sideRequests).toHaveLength(0);
+			expect(h.session.agent.state.tools).toBe(tools);
+			expect(h.session.agent.state.tools.find(tool => tool.name === "new_context")?.parameters).toBe(
+				normalReportSchema,
+			);
+			expect(h.session.agent.state.systemPrompt).toEqual(system);
+			expect(h.session.settings.revision).toBe(settingsRevision);
+			expect(compactions(h.manager.getEntries())).toHaveLength(1);
+			expect(checkpoints(h.manager.getEntries())).toHaveLength(1);
+			expect(newContextResults(h.manager.getEntries())).toHaveLength(1);
+			expect(h.events.filter(event => event.type === "manual_compaction_start")).toHaveLength(1);
+			expect(h.events.filter(event => event.type === "manual_compaction_end")).toHaveLength(1);
+			const file = h.manager.getSessionFile()!;
+			const reopened = await SessionManager.open(file, path.dirname(file), h.storage, { suppressBreadcrumb: true });
+			try {
+				const restored = JSON.stringify(convertToLlm(reopened.buildSessionContext().messages));
+				expect(restored.match(/42:  return input\.trim\(\);/g)).toHaveLength(1);
+				expect(restored).toContain("[src/parser.ts#A1B2]");
+				expect(restored).not.toContain(RAW_MARKER);
+				expect(restored).not.toContain("FOLD_MANUAL_EXPLORATION");
+				expect(restored.split(SUMMARY)).toHaveLength(2);
+			} finally {
+				await reopened.close();
+			}
+			await run(h.session, "Continue without repeating the exploration.");
+			expect(h.calls).toHaveLength(4);
+			expect(h.calls[3]!.context.messages.slice(0, prefix.length)).toEqual(prefix);
+			expect(h.calls[3]!.context.tools?.map(tool => tool.name)).toEqual(tools.map(tool => tool.name));
+		},
+	);
+
+	it("refuses insufficient manual reporting capacity without a provider request or history change", async () => {
+		const h = await createHarness([], {
+			contextWindow: 8192,
+			maxTokens: 2048,
+			settings: { "compaction.enabled": false, "compaction.methodOrder": ["soft"] },
+		});
+		const messages: Message[] = [
+			{ role: "user", content: REQUEST, timestamp: Date.now() },
+			finalAnswer("Exploration saved."),
+		];
+		for (const message of messages) h.manager.appendMessage(message);
+		h.session.agent.replaceMessages(messages);
+		const entries = JSON.stringify(h.manager.getEntries());
+		await expect(h.session.compact(undefined, { mode: "rewind" })).rejects.toThrow("reporting capacity");
+		expect(JSON.stringify(h.manager.getEntries())).toBe(entries);
+		expect(h.session.messages).toEqual(messages);
+		expect(h.calls).toHaveLength(0);
+		expect(h.sideRequests).toHaveLength(0);
+	});
+
+	it("leaves manual no-benefit reports out of both live context and the journal", async () => {
+		const h = await createHarness([() => finalAnswer("ok"), checkpoint()], {
+			settings: { "compaction.enabled": false, "compaction.methodOrder": ["soft"] },
+		});
+		await run(h.session);
+		const entries = JSON.stringify(h.manager.getEntries());
+		const messages = h.session.messages.slice();
+		const tools = h.session.agent.state.tools;
+		await expect(h.session.compact(undefined, { mode: "rewind" })).rejects.toThrow("would not reduce context");
+		expect(JSON.stringify(h.manager.getEntries())).toBe(entries);
+		expect(h.session.messages).toEqual(messages);
+		expect(h.session.agent.state.tools).toBe(tools);
+		expect(h.calls).toHaveLength(2);
+		expect(h.sideRequests).toHaveLength(0);
+	});
+
+	it("cancels a pending manual report without publishing it or resuming idle work", async () => {
+		const gate = Promise.withResolvers<void>();
+		const entered = Promise.withResolvers<void>();
+		const h = await createHarness(
+			[
+				() => work(100),
+				() => finalAnswer(),
+				async request => {
+					entered.resolve();
+					await gate.promise;
+					return checkpoint()(request);
+				},
+			],
+			{ settings: { "compaction.enabled": false, "compaction.methodOrder": ["soft"] } },
+		);
+		await run(h.session);
+		const entries = JSON.stringify(h.manager.getEntries());
+		const messages = h.session.messages.slice();
+		const compact = h.session.compact(undefined, { mode: "rewind" });
+		await entered.promise;
+		const abort = h.session.abort();
+		gate.resolve();
+		await abort;
+		await expect(compact).rejects.toThrow();
+		expect(JSON.stringify(h.manager.getEntries())).toBe(entries);
+		expect(h.session.messages).toEqual(messages);
+		expect(h.calls).toHaveLength(3);
+		expect(h.sideRequests).toHaveLength(0);
+	});
+
+	it("uses the existing interrupted-turn resume policy after a manual rewind", async () => {
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const h = await createHarness(
+			[
+				() => work(100),
+				async () => {
+					entered.resolve();
+					await release.promise;
+					return finalAnswer("Interrupted response.");
+				},
+				checkpoint(),
+				() => finalAnswer("Resumed original work."),
+			],
+			{ settings: { "compaction.enabled": false, "compaction.methodOrder": ["soft"] } },
+		);
+		const original = run(h.session);
+		await entered.promise;
+		const compact = h.session.compact(undefined, { mode: "rewind" });
+		release.resolve();
+		await compact;
+		await original;
+		await h.session.waitForIdle();
+		expect(h.calls).toHaveLength(4);
+		expect(compactions(h.manager.getEntries())).toHaveLength(1);
+		expect(checkpoints(h.manager.getEntries())).toHaveLength(1);
+		expect(h.sideRequests).toHaveLength(0);
+		expect(h.session.getLastAssistantMessage()?.content).toEqual([{ type: "text", text: "Resumed original work." }]);
+	});
+
+	it("abandons a manual report superseded by queued user input without publishing a boundary", async () => {
+		const h = await createHarness(
+			[
+				() => work(100),
+				() => finalAnswer("Exploration saved."),
+				request => {
+					h.session.agent.steer({
+						role: "user",
+						content: "Inspect the new request instead.",
+						timestamp: Date.now(),
+					});
+					return checkpoint()(request);
+				},
+				() => finalAnswer("New request handled."),
+			],
+			{ settings: { "compaction.enabled": false, "compaction.methodOrder": ["soft"] } },
+		);
+		await run(h.session);
+		const entryCount = h.manager.getEntries().length;
+		const entries = JSON.stringify(h.manager.getEntries());
+		await expect(h.session.compact(undefined, { mode: "rewind" })).rejects.toThrow("superseded");
+		await h.session.waitForIdle();
+		expect(JSON.stringify(h.manager.getEntries().slice(0, entryCount))).toBe(entries);
+		expect(compactions(h.manager.getEntries())).toHaveLength(0);
+		expect(checkpoints(h.manager.getEntries())).toHaveLength(0);
+		expect(newContextResults(h.manager.getEntries())).toHaveLength(0);
+		expect(h.calls).toHaveLength(4);
+		expect(JSON.stringify(h.calls[3]!.context.messages)).toContain("Inspect the new request instead.");
+		expect(h.sideRequests).toHaveLength(0);
+	});
+
+	it("preserves live runtime-only prefix context and pauses rather than claiming an eligible local rewind", async () => {
+		const h = await createHarness([() => work(), checkpoint()], {
+			settings: { "compaction.methodOrder": ["rewind"] },
+		});
+		h.session.agent.replaceMessages([
+			{
+				role: "custom",
+				customType: "runtime-only-prefix",
+				display: false,
+				timestamp: Date.now(),
+				content: "RUNTIME_ONLY_DELIVERED_PREFIX: retain the live evaluation state.",
+			},
+		]);
+		await run(h.session);
+		expect(h.calls).toHaveLength(2);
+		expect(JSON.stringify(h.calls[0]!.context)).toContain("RUNTIME_ONLY_DELIVERED_PREFIX");
+		expect(compactions(await h.durableEntries())).toHaveLength(0);
+		expect(JSON.stringify(h.session.messages)).toContain("RUNTIME_ONLY_DELIVERED_PREFIX");
+		expect(JSON.stringify(h.session.messages)).toContain(RAW_MARKER);
+		expect(h.sideRequests).toHaveLength(0);
+	});
+
 	it("lets the agent choose a later appropriate milestone after more than three warned requests", async () => {
 		const h = await createHarness([
 			() => work(),
@@ -606,7 +1027,11 @@ describe("AgentSession cooperative QA rollover", () => {
 		expect(compactions(entries)).toHaveLength(0);
 		expect(checkpoints(entries)).toHaveLength(0);
 		const raw = entries.find(entry => entry.type === "message" && entry.message.role === "toolResult");
-		expect(raw).toMatchObject({ message: { content: [{ type: "text", text: payload }] } });
+		expect(
+			raw?.type === "message" &&
+				raw.message.role === "toolResult" &&
+				raw.message.content.some(block => block.type === "text" && block.text === payload),
+		).toBe(true);
 		expect(
 			h.session.agent.state.messages.some(
 				message =>
@@ -661,9 +1086,15 @@ describe("AgentSession cooperative QA rollover", () => {
 		expect(h.sideRequests).toHaveLength(0);
 	});
 
-	it.each(["fixed context", "retained Q&A"])("pauses once when the %s floor prevents recovery", async floor => {
+	it.each([
+		{ method: "qaonly", floor: "fixed context" },
+		{ method: "qaonly", floor: "retained Q&A" },
+		{ method: "rewind", floor: "fixed context" },
+		{ method: "rewind", floor: "retained Q&A" },
+	])("pauses once when $method cannot recover from the $floor floor", async ({ method, floor }) => {
 		const h = await createHarness([() => work(), checkpoint()], {
 			fixedContextTokens: floor === "fixed context" ? 98_000 : undefined,
+			settings: { "compaction.methodOrder": [method] },
 		});
 		await run(h.session, floor === "retained Q&A" ? textAtLeastTokens(h.session.agent, 98_000) : REQUEST);
 
@@ -681,27 +1112,32 @@ describe("AgentSession cooperative QA rollover", () => {
 		expect(h.sideRequests).toHaveLength(0);
 	});
 
-	it("requires configured fallback to recover below the QA warning rather than a higher general trigger", async () => {
-		const h = await createHarness([() => work(), checkpoint()], {
-			fixedContextTokens: 100_000,
-			allowSoftFallback: true,
-			settings: {
-				"compaction.methodOrder": ["qaonly", "soft"],
-				"compaction.thresholdTokens": 250_000,
-			},
-		});
-		await run(h.session);
+	it.each(["qaonly", "rewind"])(
+		"requires configured fallback when %s cannot retain the original context below recovery",
+		async method => {
+			const h = await createHarness([() => work(), checkpoint()], {
+				fixedContextTokens: 100_000,
+				allowSoftFallback: true,
+				settings: {
+					"compaction.methodOrder": [method, "soft"],
+					"compaction.thresholdTokens": 250_000,
+				},
+			});
+			await run(h.session);
 
-		expect(h.calls).toHaveLength(2);
-		expect(checkpoints(await h.durableEntries())).toHaveLength(1);
-		expect(h.sideRequests.length).toBeGreaterThanOrEqual(1);
-		expect(JSON.stringify(h.sideRequests[0])).toContain(SUMMARY);
-		expect(
-			h.events.some(event => event.type === "notice" && event.source === "compaction" && event.level === "warning"),
-		).toBe(true);
-		expect(h.calls.filter(call => call.compactions > 0)).toHaveLength(0);
-		expect(JSON.stringify(await h.durableEntries())).toContain(RAW_MARKER);
-	});
+			expect(h.calls).toHaveLength(2);
+			expect(checkpoints(await h.durableEntries())).toHaveLength(1);
+			expect(h.sideRequests.length).toBeGreaterThanOrEqual(1);
+			expect(JSON.stringify(h.sideRequests[0])).toContain(SUMMARY);
+			expect(
+				h.events.some(
+					event => event.type === "notice" && event.source === "compaction" && event.level === "warning",
+				),
+			).toBe(true);
+			expect(h.calls.filter(call => call.compactions > 0)).toHaveLength(0);
+			expect(JSON.stringify(await h.durableEntries())).toContain(RAW_MARKER);
+		},
+	);
 
 	it.each([false, true])("gives queued input precedence during QA commit (hard report=%s)", async hardReport => {
 		const storage = new QaStorage();
@@ -1216,6 +1652,12 @@ describe("AgentSession cooperative QA rollover", () => {
 			maxTokens: 8_192,
 		},
 		{
+			name: "an earlier selected summary method before local rewind",
+			settings: { "compaction.methodOrder": ["soft", "rewind"] },
+			contextWindow: 200_000,
+			maxTokens: 8_192,
+		},
+		{
 			name: "disabled mid-turn eligibility",
 			settings: { "compaction.midTurnEnabled": false },
 			contextWindow: 200_000,
@@ -1237,7 +1679,7 @@ describe("AgentSession cooperative QA rollover", () => {
 			h.events.filter(
 				event =>
 					(event.type === "auto_compaction_start" || event.type === "auto_compaction_end") &&
-					event.action === "qaonly",
+					(event.action === "qaonly" || event.action === "rewind"),
 			),
 		).toHaveLength(0);
 		expect(h.sideRequests).toHaveLength(0);

@@ -8,7 +8,7 @@
 
 Checkpoints nest under the active package, up to 32 levels. Only the stack top can close; its parent then resumes. These tools change conversation context, not files, working-tree contents, artifacts, running processes, or authoritative todo state by rollback.
 
-For a small locating decision, no explicit checkpoint is needed: `grep`/`find` return a search boundary and `read` returns a source reference. [Selective rewind](./rewind.md#small-search-decisions) preserves chosen code while discarding the locating trace, without closing this work package.
+Small observation decisions need no checkpoint: completed tools return `observationId`, and successful reads also return `readId`. [Selective rewind](./rewind.md#small-observation-decisions) preserves exact evidence while discarding completed exploration, including long reasoning/tool chains, without closing this package. Fuse the next source read into that action rather than adding a model round.
 
 ## Plan before anchoring
 
@@ -56,7 +56,7 @@ The persisted journal supports recovery of active parent packages and their bind
 - User input after the anchor prevents rewind across that input. Re-scope around the new instructions rather than dropping them.
 - A todo-bound handoff atomically commits its report and progress; do not call `todo.done` first. Phase completion requires all children completed and evidence for the phase's own acceptance.
 - With an explicit outcome, a no-savings handoff can commit progress and close the scope without changing context. It is not a successful compaction.
-- When a parent later compacts, it replaces child traces and summaries rather than accumulating them. Cache eligibility is an estimate, not evidence of a cache hit.
+- Parent handoffs replace child traces and summaries but inherit active selected source/text/image materials separately; release or demote obsolete evidence. Cache eligibility is an estimate, not evidence of a cache hit.
 
 ## Implementation
 

@@ -204,6 +204,10 @@ import goalTodoContextPrompt from "../prompts/goals/goal-todo-context.md" with {
 import anthropicUsageWrapUpPrompt from "../prompts/system/anthropic-usage-wrap-up.md" with { type: "text" };
 import autoContinuePrompt from "../prompts/system/auto-continue.md" with { type: "text" };
 import checkpointActiveNoticeTemplate from "../prompts/system/checkpoint-active-notice.md" with { type: "text" };
+import instructionRewindPointPrompt from "../prompts/system/instruction-rewind-point.md" with { type: "text" };
+import midRunRewindNudgePrompt from "../prompts/system/mid-run-rewind-nudge.md" with { type: "text" };
+import rewindSkillPrompt from "../prompts/system/rewind-skill.md" with { type: "text" };
+import rewindBeforeYieldPrompt from "../prompts/system/rewind-before-yield.md" with { type: "text" };
 import interruptedThinkingTemplate from "../prompts/system/interrupted-thinking.md" with { type: "text" };
 import manualContinuePrompt from "../prompts/system/manual-continue.md" with { type: "text" };
 import planModeActivePrompt from "../prompts/system/plan-mode-active.md" with { type: "text" };
@@ -239,6 +243,7 @@ import {
 } from "@oh-my-pi/pi-tui/thinking";
 import { isAttachmentOnlyTitleInput, isLowSignalTitleInput } from "../tiny/text";
 import type { ImageAttachmentEntry, ToolSession } from "../tools";
+import { NewContextTool } from "../tools/context-notes";
 import { resolveApproval } from "../tools/approval";
 import { type ApprovalGrantStore, getApprovalGrants } from "../tools/approval-cache";
 import { type AskToolDetails } from "@oh-my-pi/pi-tui/tools/ask";
@@ -381,6 +386,9 @@ import {
 import {
 	annotateSearchResult,
 	buildSearchRewindPlan,
+	collectActiveSearchMaterials,
+	activeSearchMaterialRefs,
+	fusedSearchReadRefs,
 	isSearchRewind,
 	isSearchRewindCall,
 	keepSearchMessage,
@@ -392,6 +400,16 @@ import {
 	type SearchRewindInput,
 	type SearchRewindPlan,
 } from "./search-rewind";
+import {
+	INSTRUCTION_ANCHOR_MESSAGE_TYPE,
+	INSTRUCTION_REWIND_KIND,
+	instructionAnchorSequence,
+	MID_RUN_REWIND_NUDGE_MESSAGE_TYPE,
+	REWIND_NUDGE_TOOL_RESULT_THRESHOLD,
+	REWIND_SKILL_MESSAGE_TYPE,
+	resolveInstructionAnchor,
+	type InstructionAnchorState,
+} from "./instruction-anchor";
 import type { ClientBridge } from "./client-bridge";
 import {
 	type ClaudeResetAction,
@@ -1461,6 +1479,19 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	/** Last `skillful` value applied to this session; dedupes {@link setSkillful} and its setting watch. */
 	#skillfulApplied = false;
 	#checkpointState: CheckpointState | undefined = undefined;
+	/** Current instruction rewind point; the journal notice is authoritative after recovery. */
+	#instructionAnchor: InstructionAnchorState | undefined = undefined;
+	#instructionAnchorSequence = 0;
+	/** User message whose instruction notice was prepended to the dispatch messages. */
+	#instructionNoticeMessage: AgentMessage | undefined = undefined;
+	/** Steered instruction notices persisted right after their user entry. */
+	#pendingInstructionNotice: { message: AgentMessage; messages: CustomMessage[] } | undefined = undefined;
+	/** Point id and settled-result count at the last mid-run aside; repeats every threshold. */
+	#rewindNudge: { id: string; toolResults: number } | undefined = undefined;
+	/** Point id whose instruction already folded; suppresses the pre-yield demand. */
+	#rewindFoldedAnchorId: string | undefined = undefined;
+	/** Point id that already received the mandatory pre-yield reminder. */
+	#rewindYieldRemindedAnchorId: string | undefined = undefined;
 	#pendingRewindReport: RewindToolDetails | undefined = undefined;
 	#lastCompletedRewind: CompletedRewindState | undefined = undefined;
 	#rewoundToolResultIds = new Set<string>();
@@ -2396,6 +2427,9 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			unexpectedStopJudgeTimeoutMs: config.unexpectedStopJudgeTimeoutMs,
 		});
 		this.#detachUsageBeforeQueueDequeue = this.agent.addBeforeQueuedMessageDequeueHook(async signal => {
+			if (this.#maintenance?.isManualRewindReporting) {
+				throw new Error("Manual rewind was superseded by queued input.");
+			}
 			if (
 				!cfgRetryUsageAwareFallback.get(this.settings) ||
 				(this.#usagePreflightReadyForNextModelCall && this.#usagePreflightReadyModel === this.model)
@@ -2409,6 +2443,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		});
 		this.agent.prepareQueuedMessages = this.#prepareQueuedUserMessages;
 		this.#detachUsageBeforeModelCall = this.agent.addBeforeModelCallHook(async signal => {
+			if (this.#maintenance?.isManualRewindReporting) return;
 			if (!cfgRetryUsageAwareFallback.get(this.settings)) return;
 			if (this.#usagePreflightReadyForNextModelCall) {
 				const checkedModel = this.#usagePreflightReadyModel;
@@ -2497,6 +2532,10 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		this.agent.setProviderResponseInterceptor(this.#onResponse);
 		this.agent.setRawSseEventInterceptor(this.#onSseEvent);
 		this.agent.setOnTurnEnd(async (messages, signal, context) => {
+			if (this.#maintenance.isManualRewindReporting) {
+				if (context) context.stop = true;
+				return;
+			}
 			if (signal?.aborted) return;
 			await this.#messageEndPersistenceTail;
 			if (signal?.aborted) return;
@@ -2519,6 +2558,11 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 						(details as unknown as RewindToolDetails).sourceReads,
 					);
 				}
+			}
+			const instructionReport = searchResult ? undefined : this.#extractInstructionRewindReport();
+			if (instructionReport) {
+				this.#pendingRewindReport = undefined;
+				await this.#applyInstructionRewind(instructionReport, messages, context, signal);
 			}
 			const rewindReport = searchResult ? undefined : this.#extractRewindReport(messages);
 			if (rewindReport) {
@@ -2626,6 +2670,9 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			// Mid-run todo reconciliation — evaluated at injection time so a turn
 			// that flips a todo just before this poll suppresses the nudge.
 			thunks.push(() => this.#todo.takeMidRunNudge());
+			// Mid-run fold reminder — same injection boundary, evaluated lazily so a
+			// fold that lands just before the poll suppresses a stale hint.
+			thunks.push(() => this.#takeMidRunRewindNudge());
 			const contextNotesReminder = this.#experimentalContextNotesReminder;
 			if (contextNotesReminder) {
 				this.#experimentalContextNotesReminder = undefined;
@@ -2962,7 +3009,10 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				this.#experimentalContextNotesReminder = { prompt, generation: this.#promptGeneration };
 			},
 			hasQaRolloverTool: () => this.#tools.getEnabledToolNames().includes("new_context"),
+			runManualRewindReport: (message, signal) => this.#runManualRewindReport(message, signal),
 			hasActiveWorkPackage: () => this.getCheckpointState() !== undefined,
+			pendingInstructionFold: () => this.#pendingInstructionFold(),
+			openInstructionRewindPointAfterCompaction: () => this.#openInstructionRewindPointAfterCompaction(),
 			pendingQaMessages: () => [
 				...this.agent.peekSteeringQueue(),
 				...this.agent.peekFollowUpQueue(),
@@ -4390,6 +4440,18 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		) {
 			return;
 		}
+		if (message.role === "toolResult") {
+			const semantic = semanticToolResult(message.toolName, message);
+			if (
+				semantic?.toolName === "rewind" &&
+				isRecord(semantic.details) &&
+				isRecord(semantic.details.search) &&
+				Array.isArray(semantic.details.sourceReads) &&
+				semantic.details.sourceReads.length > 0
+			)
+				// Commit the summary and its read pairs together, without journaling a second copy of the source payload.
+				return;
+		}
 		if (this.#sessionMessageAlreadyPersisted(message)) return;
 		if (message.role === "assistant") {
 			const assistantMsg = message as AssistantMessage;
@@ -4483,10 +4545,154 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		};
 	}
 
+	#instructionNoticeFor(
+		message: AgentMessage,
+	): { state: InstructionAnchorState; messages: CustomMessage[] } | undefined {
+		if (
+			message.role !== "user" ||
+			message.synthetic ||
+			message.attribution === "agent" ||
+			this.#maintenance.isManualRewindReporting ||
+			!cfgCheckpointEnabled.get(this.settings) ||
+			!this.getEnabledToolNames().includes("rewind")
+		)
+			return undefined;
+		const anchorId = `R${this.#instructionAnchorSequence++}`;
+		const content = prompt.render(instructionRewindPointPrompt, { anchorId });
+		const timestamp = Date.now();
+		const messages: CustomMessage[] = [];
+		if (!this.#hasRewindSkill())
+			messages.push({
+				role: "custom",
+				customType: REWIND_SKILL_MESSAGE_TYPE,
+				content: prompt.render(rewindSkillPrompt, { first: true }),
+				display: false,
+				attribution: "agent",
+				timestamp,
+			});
+		messages.push({
+			role: "custom",
+			customType: INSTRUCTION_ANCHOR_MESSAGE_TYPE,
+			content,
+			display: false,
+			details: { id: anchorId },
+			attribution: "agent",
+			timestamp,
+		});
+		return {
+			state: {
+				id: anchorId,
+				messageCount: this.agent.state.messages.length,
+				toolResults: 0,
+				startedAt: new Date().toISOString(),
+			},
+			messages,
+		};
+	}
+
+	/** True while the current context still carries the one-shot skill explanation. */
+	#hasRewindSkill(): boolean {
+		return this.agent.state.messages.some(
+			message => message.role === "custom" && message.customType === REWIND_SKILL_MESSAGE_TYPE,
+		);
+	}
+
+	/**
+	 * A compaction lands a branch boundary, so every point advertised before it is
+	 * unreachable in replay. Re-open one on the rewritten branch: the rest of the
+	 * run keeps a fold target without waiting for new user input.
+	 */
+	#openInstructionRewindPointAfterCompaction(): void {
+		if (
+			this.#isDisposed ||
+			this.#maintenance.isManualRewindReporting ||
+			!cfgCheckpointEnabled.get(this.settings) ||
+			!this.getEnabledToolNames().includes("rewind")
+		)
+			return;
+		const anchorId = `R${this.#instructionAnchorSequence++}`;
+		const content = prompt.render(instructionRewindPointPrompt, { anchorId });
+		// A compaction may have rewritten the context without the one-shot skill;
+		// re-open it before the first point that has no explanation above it.
+		if (!this.#hasRewindSkill()) {
+			const skill = prompt.render(rewindSkillPrompt, { first: false });
+			this.agent.appendMessage({
+				role: "custom",
+				customType: REWIND_SKILL_MESSAGE_TYPE,
+				content: skill,
+				display: false,
+				attribution: "agent",
+				timestamp: Date.now(),
+			});
+			this.sessionManager.appendCustomMessageEntry(REWIND_SKILL_MESSAGE_TYPE, skill, false, undefined, "agent");
+		}
+		const message: CustomMessage = {
+			role: "custom",
+			customType: INSTRUCTION_ANCHOR_MESSAGE_TYPE,
+			content,
+			display: false,
+			details: { id: anchorId },
+			attribution: "agent",
+			timestamp: Date.now(),
+		};
+		this.#instructionAnchor = {
+			id: anchorId,
+			messageCount: this.agent.state.messages.length,
+			toolResults: 0,
+			startedAt: new Date().toISOString(),
+		};
+		this.agent.appendMessage(message);
+		this.sessionManager.appendCustomMessageEntry(
+			INSTRUCTION_ANCHOR_MESSAGE_TYPE,
+			content,
+			false,
+			{ id: anchorId },
+			"agent",
+		);
+	}
+
+	/**
+	 * Exploration a QA rollover would discard: the live point crossed its nudge
+	 * threshold and no fold recorded it yet. Rollover rewrites the branch, so the
+	 * evidence cannot be folded afterwards; the checkpoint waits for the fold.
+	 */
+	#pendingInstructionFold(): { anchorId: string; toolResults: number } | undefined {
+		if (!cfgCheckpointEnabled.get(this.settings) || !this.getEnabledToolNames().includes("rewind")) return undefined;
+		const anchor = this.getInstructionAnchor();
+		if (!anchor || anchor.toolResults < REWIND_NUDGE_TOOL_RESULT_THRESHOLD) return undefined;
+		if (this.#rewindFoldedAnchorId === anchor.id) return undefined;
+		return { anchorId: anchor.id, toolResults: anchor.toolResults };
+	}
+
+	/**
+	 * Hidden aside offering a fold once enough tool output has accumulated after
+	 * the live instruction point. It repeats every threshold of settled results,
+	 * so a long turn is re-offered the fold instead of being hinted once. The
+	 * hint is advisory — the model may judge the output still needed.
+	 */
+	#takeMidRunRewindNudge(): AgentMessage | null {
+		const anchor = this.#instructionAnchor;
+		if (!anchor) return null;
+		if (this.#isDisposed || this.#maintenance.isManualRewindReporting) return null;
+		if (!cfgCheckpointEnabled.get(this.settings) || !this.getEnabledToolNames().includes("rewind")) return null;
+		const base = this.#rewindNudge?.id === anchor.id ? this.#rewindNudge.toolResults : 0;
+		if (anchor.toolResults < base + REWIND_NUDGE_TOOL_RESULT_THRESHOLD) return null;
+		this.#rewindNudge = { id: anchor.id, toolResults: anchor.toolResults };
+		return {
+			role: "custom",
+			customType: MID_RUN_REWIND_NUDGE_MESSAGE_TYPE,
+			content: prompt.render(midRunRewindNudgePrompt, { anchorId: anchor.id, toolResults: anchor.toolResults }),
+			display: false,
+			attribution: "agent",
+			timestamp: Date.now(),
+		};
+	}
+
 	#persistMessageEnd(message: AgentMessage, promptGeneration: number): void {
 		// Session transitions may replace the transcript before a queued commit
 		// runs. Never append the previous conversation to the replacement session.
 		if (this.#promptGeneration !== promptGeneration) {
+			if (this.#pendingInstructionNotice?.message === message) this.#pendingInstructionNotice = undefined;
 			// The message has already left the agent queue. If it was a deferred TTSR
 			// delivery, queue cleanup cannot clear its reservation.
 			if (message.role === "custom" && message.customType === "ttsr-injection") {
@@ -4494,6 +4700,9 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			}
 			return;
 		}
+		const pendingNotice =
+			this.#pendingInstructionNotice?.message === message ? this.#pendingInstructionNotice : undefined;
+		if (pendingNotice) this.#pendingInstructionNotice = undefined;
 		if (message.role === "hookMessage" || message.role === "custom") {
 			// One-run instructions must not return from persisted history: prewalk
 			// nudges are consumed once, and Vibe context is rebuilt only while active.
@@ -4516,6 +4725,17 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			return;
 		}
 		this.#persistSessionMessageIfMissing(message);
+		if (pendingNotice) {
+			for (const notice of pendingNotice.messages)
+				this.sessionManager.appendCustomMessageEntry(
+					notice.customType,
+					notice.content,
+					notice.display,
+					notice.details,
+					notice.attribution ?? "agent",
+					notice.timestamp,
+				);
+		}
 	}
 
 	/**
@@ -4692,6 +4912,9 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		// not progress an agent could mark done.
 		if (event.type === "message_end" && event.message.role === "toolResult") {
 			this.#todo.onToolResult(event.message.toolName, event.message.isError);
+			// Count settled output for the mid-run fold hint. Synchronous for the same
+			// reason as the todo counter above: the next aside poll may beat persistence.
+			if (this.#instructionAnchor) this.#instructionAnchor.toolResults++;
 		}
 		// Track the settled assistant turn synchronously as well: agent_end
 		// maintenance reads `#lastAssistantMessage`, and when a turn's events all
@@ -4774,9 +4997,24 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		if (interruptedThinkingMessage) {
 			this.agent.appendMessage(interruptedThinkingMessage);
 		}
-		if (event.type === "message_end" && event.message.role === "user" && this.#checkpointState) {
+		if (event.type === "message_end" && event.message.role === "user") {
 			this.#checkpointState = undefined;
 			this.#pendingRewindReport = undefined;
+			const message = event.message;
+			if (this.#instructionNoticeMessage === message) {
+				// Dispatch already put the notice in the run's initial messages.
+				this.#instructionNoticeMessage = undefined;
+			} else {
+				// A steered instruction bypasses dispatch: advertise its point in the
+				// live context; the journal keeps only the anchor state.
+				this.#instructionAnchor = undefined;
+				const notice = this.#instructionNoticeFor(message);
+				if (notice) {
+					this.#instructionAnchor = notice.state;
+					for (const custom of notice.messages) this.agent.appendMessage(custom);
+					this.#pendingInstructionNotice = { message, messages: notice.messages };
+				}
+			}
 		}
 
 		// message_end listeners are fire-and-forget, and the agent loop runs against
@@ -5456,6 +5694,10 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 					await emitAgentEndNotification({ willContinue: true });
 					return;
 				}
+				if (this.#enforceInstructionFoldBeforeYield()) {
+					await emitAgentEndNotification({ willContinue: true });
+					return;
+				}
 				const planModeContinuationScheduled = await this.#enforcePlanModeDecisionAtSettle();
 				if (planModeContinuationScheduled) {
 					await emitAgentEndNotification({ willContinue: true });
@@ -5741,6 +5983,48 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				onSkip: reason => this.#skipAgentContinue(reason, request),
 			},
 		);
+	}
+
+	async #runManualRewindReport(message: AgentMessage, signal: AbortSignal): Promise<AgentMessage[]> {
+		const original = this.agent.state.messages.slice();
+		const tools = this.agent.state.tools;
+		const systemPrompt = this.agent.state.systemPrompt.slice();
+		const error = this.agent.state.error;
+		const revision = this.settings.revision;
+		const model = this.model;
+		const tool = new NewContextTool(
+			{
+				cwd: this.sessionManager.getCwd(),
+				hasUI: false,
+				settings: this.settings,
+				sessionManager: this.sessionManager,
+				getSessionId: () => this.sessionId,
+				getSessionFile: () => this.sessionManager.getSessionFile() ?? null,
+				getSessionSpawns: () => null,
+				isDisposed: () => this.#isDisposed,
+				qaRollover: {
+					isEnabled: () => this.#maintenance.isManualRewindReporting,
+					accept: (checkpoint, toolSignal) => this.acceptQaCheckpoint(checkpoint, toolSignal),
+				},
+			},
+			{ manualReport: true },
+		);
+		const reportTools: AgentTool[] = [tool];
+		const abort = () => this.agent.abort();
+		signal.addEventListener("abort", abort, { once: true });
+		try {
+			signal.throwIfAborted();
+			this.agent.setTools(reportTools);
+			await this.agent.prompt(message);
+			signal.throwIfAborted();
+			return this.agent.state.messages.slice(original.length + 1);
+		} finally {
+			signal.removeEventListener("abort", abort);
+			this.agent.replaceMessages(original);
+			this.agent.state.error = error;
+			if (this.agent.state.tools === reportTools) this.agent.setTools(tools);
+			if (this.settings.revision === revision && this.model === model) this.agent.setSystemPrompt(systemPrompt);
+		}
 	}
 
 	isQaRolloverEnabled(): boolean {
@@ -8138,6 +8422,12 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 
 	#clearCheckpointRuntimeState(): void {
 		this.#checkpointState = undefined;
+		this.#instructionAnchor = undefined;
+		this.#rewindNudge = undefined;
+		this.#rewindFoldedAnchorId = undefined;
+		this.#rewindYieldRemindedAnchorId = undefined;
+		this.#instructionNoticeMessage = undefined;
+		this.#pendingInstructionNotice = undefined;
 		this.#pendingRewindReport = undefined;
 		this.#lastCompletedRewind = undefined;
 		this.#rewoundToolResultIds.clear();
@@ -8169,6 +8459,15 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 */
 	#rehydrateCheckpointRewindState(): void {
 		this.#clearCheckpointRuntimeState();
+		const restoredBranch = this.sessionManager.getBranch();
+		const restoredAnchor = resolveInstructionAnchor(restoredBranch);
+		this.#instructionAnchorSequence = Math.max(
+			this.#instructionAnchorSequence,
+			instructionAnchorSequence(this.sessionManager.getEntries()),
+		);
+		this.#instructionAnchor = restoredAnchor
+			? { id: restoredAnchor.id, messageCount: 0, toolResults: 0, startedAt: "" }
+			: undefined;
 		let completed: CompletedRewindState | undefined;
 		let pending: CheckpointState | undefined;
 		let messageCount = 0;
@@ -8248,6 +8547,40 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		return phases;
 	}
 
+	/** Validate the current instruction rewind point without changing context. */
+	validateInstructionRewind(checkpointId: string, report: string, nextAction: string): RewindContextEstimate {
+		const resolved = resolveInstructionAnchor(this.sessionManager.getBranch(), checkpointId);
+		if (!resolved)
+			throw new ToolError(
+				"Instruction rewind point is stale or unavailable. Rewind to a point advertised in the current request.",
+			);
+		if (!report.trim() || !nextAction.trim()) throw new ToolError("report and nextAction must be nonempty.");
+		if (!this.agent.tokenizer.checkTokenBudget([report, nextAction], 4096).fits)
+			throw new ToolError("Handoff exceeds 4096 tokens. Keep only decisions, evidence, risks and the next action.");
+		const state: CheckpointState = {
+			checkpointEntryId: resolved.entryId,
+			checkpointId: resolved.id,
+			startedAt: this.#instructionAnchor?.startedAt || new Date().toISOString(),
+			checkpointMessageCount: 0,
+		};
+		// No-savings folds are allowed here for the same reason `#applyInstructionRewind`
+		// allows them: the report is still worth recording, and only the cut is skipped.
+		return this.#validateRewindSavings(state, report, nextAction, [], true, this.#todo.phases);
+	}
+
+	/** Resolve one advertised instruction point, or the newest when no id is given. */
+	getInstructionAnchor(id?: string): InstructionAnchorState | undefined {
+		const resolved = resolveInstructionAnchor(this.sessionManager.getBranch(), id);
+		if (!resolved) {
+			if (!id) this.#instructionAnchor = undefined;
+			return undefined;
+		}
+		if (this.#instructionAnchor?.id === resolved.id) return this.#instructionAnchor;
+		const restored: InstructionAnchorState = { id: resolved.id, messageCount: 0, toolResults: 0, startedAt: "" };
+		this.#instructionAnchor = restored;
+		return restored;
+	}
+
 	validateRewind(
 		checkpointId: string,
 		report: string,
@@ -8324,6 +8657,36 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		};
 	}
 
+	#rewindSourceContext(state: CheckpointState): {
+		prefix: AgentMessage[];
+		materials: CustomMessage[];
+		activeRefs: string[];
+	} {
+		const branch = this.sessionManager.getBranch();
+		const active = activeSearchMaterialRefs(branch) ?? new Set<string>();
+		const prefix = buildSessionContext(this.sessionManager.getEntries(), state.checkpointEntryId).messages.filter(
+			message => keepSearchMessage(message, active),
+		);
+		const represented = new Set(
+			prefix.flatMap(message =>
+				message.role === "custom" &&
+				message.customType === SEARCH_MATERIAL &&
+				isRecord(message.details) &&
+				typeof message.details.ref === "string"
+					? [message.details.ref]
+					: [],
+			),
+		);
+		for (const ref of fusedSearchReadRefs(
+			prefix.filter((message): message is ToolResultMessage => message.role === "toolResult"),
+		))
+			represented.add(ref);
+		const materials = collectActiveSearchMaterials(branch).filter(
+			message => isRecord(message.details) && !represented.has(String(message.details.ref)),
+		);
+		return { prefix, materials, activeRefs: [...active] };
+	}
+
 	#validateRewindSavings(
 		state: CheckpointState,
 		report: string,
@@ -8332,8 +8695,13 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		allowNoSavings = false,
 		phases: TodoPhase[] = this.#todo.phases,
 	): RewindContextEstimate {
-		const prefix = buildSessionContext(this.sessionManager.getEntries(), state.checkpointEntryId).messages;
-		const projected = [...prefix, this.#rewindReportMessage(state, report, nextAction, phases), ...siblings];
+		const { prefix, materials } = this.#rewindSourceContext(state);
+		const projected = [
+			...prefix,
+			this.#rewindReportMessage(state, report, nextAction, phases),
+			...materials,
+			...siblings,
+		];
 		const current = this.agent.state.messages;
 		const lastAssistant = current.findLastIndex(message => message.role === "assistant");
 		const last = current[lastAssistant];
@@ -8387,7 +8755,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		}
 	}
 
-	#searchRewindMessages(plan: SearchRewindPlan, hasReads = false): CustomMessage[] {
+	#searchRewindMessages(plan: SearchRewindPlan): CustomMessage[] {
 		const messages: CustomMessage[] = plan.materials.map(material => ({
 			role: "custom",
 			customType: SEARCH_MATERIAL,
@@ -8404,7 +8772,6 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			content: prompt.render(observationRewindTemplate, {
 				note: plan.note,
 				nextAction: plan.nextAction,
-				hasReads,
 			}),
 			display: false,
 			attribution: "agent",
@@ -8431,16 +8798,13 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				: current;
 		const before = this.agent.tokenizer.countMessages(baseline, { excludeEncryptedReasoning: true });
 		const after = this.agent.tokenizer.countMessages(projected, { excludeEncryptedReasoning: true });
-		if (after >= before)
-			throw new ToolError(
-				`Observation rewind would not shrink context (${before} → ${after}). Keep working without cutting.`,
-			);
 		const fixed = computeNonMessageTokens(this, this.agent.tokenizer, this.settings.revision);
 		return {
 			beforeTokens: before + fixed,
 			afterTokens: after + fixed,
 			reusablePrefixTokens:
 				this.agent.tokenizer.countMessages(reusablePrefix, { excludeEncryptedReasoning: true }) + fixed,
+			willCompact: after < before,
 		};
 	}
 
@@ -8454,31 +8818,43 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		let committedLeaf = this.sessionManager.getLeafId();
 		const checkpoint = this.#checkpointState;
 		let restoredCheckpoint = checkpoint;
+		let compact = false;
 		const assistant = sourceReads?.length
 			? messages.findLast((message): message is AssistantMessage => message.role === "assistant")
 			: undefined;
 		if (sourceReads?.length && !assistant) throw new ToolError("Source reads have no owning assistant turn.");
 		await this.sessionManager.appendEntriesAtomically(
 			() => {
-				this.validateSearchRewind(input);
-				const plan = buildSearchRewindPlan(this.sessionManager.getBranch(), input);
+				compact = this.validateSearchRewind(input).willCompact !== false;
+				const branch = this.sessionManager.getBranch();
+				const plan = buildSearchRewindPlan(branch, input);
+				const activeRefs = [
+					...new Set([...plan.activeRefs, ...fusedSearchReadRefs(sourceReads?.map(read => read.result) ?? [])]),
+				];
+				if (activeRefs.length > 128)
+					throw new ToolError("Too many retained materials; release or demote completed evidence first.");
 				const phases = this.#todo.phases;
 				const previousTodoIdentity = getLatestTodoSnapshotIdentity(this.sessionManager.getBranch());
 				const mode = this.sessionManager.getBranch().findLast(entry => entry.type === "mode_change");
-				this.#bash.withBranchTransition(() =>
-					this.sessionManager.branchWithSummary(plan.anchorId, "", {
-						kind: SEARCH_REWIND_KIND,
-						observationId: input.observationId,
-					}),
-				);
-				this.sessionManager.appendCustomMessageEntry(
-					SEARCH_REWIND_STATE,
-					"",
-					false,
-					{ activeRefs: plan.activeRefs },
-					"agent",
-				);
-				for (const message of this.#searchRewindMessages(plan, Boolean(sourceReads?.length))) {
+				if (compact)
+					this.#bash.withBranchTransition(() =>
+						this.sessionManager.branchWithSummary(plan.anchorId, "", {
+							kind: SEARCH_REWIND_KIND,
+							observationId: input.observationId,
+						}),
+					);
+				for (const message of this.#searchRewindMessages(plan)) {
+					if (
+						!compact &&
+						branch.some(
+							entry =>
+								entry.type === "custom_message" &&
+								entry.customType === message.customType &&
+								JSON.stringify(entry.content) === JSON.stringify(message.content) &&
+								JSON.stringify(entry.details) === JSON.stringify(message.details),
+						)
+					)
+						continue;
 					this.sessionManager.appendCustomMessageEntry(
 						message.customType,
 						message.content,
@@ -8487,20 +8863,34 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 						message.attribution,
 					);
 				}
-				this.sessionManager.appendCustomEntry(USER_TODO_EDIT_CUSTOM_TYPE, { phases });
+				if (compact) this.sessionManager.appendCustomEntry(USER_TODO_EDIT_CUSTOM_TYPE, { phases });
 				restoredCheckpoint = refreshCheckpointTodoIdentity(
 					checkpoint,
 					getLatestTodoSnapshotIdentity(this.sessionManager.getBranch()),
 					previousTodoIdentity,
 				);
-				this.sessionManager.appendCustomMessageEntry(
-					WORK_PACKAGE_STATE_TYPE,
-					"",
-					false,
-					{ checkpoint: restoredCheckpoint ?? null },
-					"agent",
-				);
-				if (mode?.type === "mode_change") this.sessionManager.appendModeChange(mode.mode, mode.data);
+				if (compact) {
+					this.sessionManager.appendCustomMessageEntry(
+						WORK_PACKAGE_STATE_TYPE,
+						"",
+						false,
+						{ checkpoint: restoredCheckpoint ?? null },
+						"agent",
+					);
+					if (mode?.type === "mode_change") this.sessionManager.appendModeChange(mode.mode, mode.data);
+				}
+				if (!compact && sourceReads?.length) {
+					const result = messages.findLast(
+						(message): message is ToolResultMessage =>
+							message.role === "toolResult" &&
+							semanticToolResult(message.toolName, message)?.toolName === "rewind",
+					);
+					if (!result) throw new ToolError("Source reads have no owning rewind result.");
+					const recorded = structuredClone(result);
+					const semantic = semanticToolResult(recorded.toolName, recorded);
+					if (isRecord(semantic?.details)) delete semantic.details.sourceReads;
+					this.sessionManager.appendMessage(recorded);
+				}
 				if (sourceReads?.length && assistant) {
 					// The model requested these reads inside rewind; no extra provider request or usage is incurred.
 					this.sessionManager.appendMessage({
@@ -8522,6 +8912,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 					});
 					for (const read of sourceReads) this.sessionManager.appendMessage(read.result);
 				}
+				// Historical pre-read anchors must not reference snapshots delivered later in this atomic group.
+				this.sessionManager.appendCustomMessageEntry(SEARCH_REWIND_STATE, "", false, { activeRefs }, "agent");
 				committedLeaf = this.sessionManager.getLeafId();
 			},
 			{
@@ -8533,13 +8925,16 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		);
 		if (this.#promptGeneration !== generation || this.#checkpointState !== checkpoint) return;
 		this.#checkpointState = restoredCheckpoint;
+		// A completed observation fold satisfies the point's fold demand; the point
+		// itself stays valid and the counter keeps re-arming the mid-run hint.
+		if (this.#instructionAnchor) this.#rewindFoldedAnchorId = this.#instructionAnchor.id;
 		const rebuilt = this.buildDisplaySessionContext();
 		messages.splice(0, messages.length, ...rebuilt.messages);
 		this.agent.replaceMessages(messages);
 		this.#todo.syncFromBranch();
 		this.#modelMentions.syncFromBranch();
 		this.#advisors.resetSessionState({ preserveCost: true });
-		this.#closeCodexProviderSessionsForHistoryRewrite();
+		if (compact) this.#closeCodexProviderSessionsForHistoryRewrite();
 	}
 
 	/**
@@ -9732,6 +10127,12 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			// it subsumes, avoiding a contradictory materialized notice.
 			const xdevMountNoticeIndex = messages.length;
 			messages.push(message);
+			const instructionNotice = this.#instructionNoticeFor(message);
+			if (instructionNotice) {
+				for (const notice of instructionNotice.messages) messages.push(notice);
+				this.#instructionAnchor = instructionNotice.state;
+				this.#instructionNoticeMessage = message;
+			}
 			// Inject any pending "nextTurn" messages as context alongside the user message
 			for (const msg of this.#pendingNextTurnMessages) {
 				messages.push(msg);
@@ -12999,6 +13400,67 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		return true;
 	}
 
+	/**
+	 * At a text-only stop, demand one fold when the live instruction point still
+	 * carries unfolded exploration. Unlike the advisory mid-run hint, this owns
+	 * the settle boundary: once per point it continues the loop with a mandatory
+	 * call. A completed observation fold satisfies it; a declined reminder yields
+	 * to the user instead of looping.
+	 */
+	#enforceInstructionFoldBeforeYield(): boolean {
+		if (this.#isDisposed || this.#maintenance.isManualRewindReporting) return false;
+		if (!cfgCheckpointEnabled.get(this.settings) || !this.getEnabledToolNames().includes("rewind")) return false;
+		const anchor = this.getInstructionAnchor();
+		if (!anchor || anchor.toolResults < REWIND_NUDGE_TOOL_RESULT_THRESHOLD) return false;
+		if (this.#rewindFoldedAnchorId === anchor.id || this.#rewindYieldRemindedAnchorId === anchor.id) return false;
+		this.#rewindYieldRemindedAnchorId = anchor.id;
+		const reminder = prompt.render(rewindBeforeYieldPrompt, {
+			anchorId: anchor.id,
+			toolResults: anchor.toolResults,
+		});
+		const message: Message = {
+			role: "developer",
+			content: [{ type: "text", text: reminder }],
+			attribution: "agent",
+			timestamp: Date.now(),
+		};
+		this.agent.appendMessage(message);
+		this.sessionManager.appendMessage(message);
+		this.#scheduleAgentContinue({
+			source: "instruction-rewind-reminder",
+			generation: this.#promptGeneration,
+		});
+		return true;
+	}
+
+	#extractInstructionRewindReport(): RewindToolDetails | undefined {
+		const entries = this.sessionManager.getEntries();
+		// A fold appends its next point last, so any earlier result was already consumed.
+		let lastNotice = -1;
+		for (let index = entries.length - 1; index >= 0; index--) {
+			const entry = entries[index];
+			if (entry.type === "custom_message" && entry.customType === INSTRUCTION_ANCHOR_MESSAGE_TYPE) {
+				lastNotice = index;
+				break;
+			}
+		}
+		for (let index = entries.length - 1; index > lastNotice; index--) {
+			const entry = entries[index];
+			if (entry.type !== "message" || entry.message.role !== "toolResult" || entry.message.isError) continue;
+			const semantic = semanticToolResult(entry.message.toolName, entry.message);
+			if (semantic?.toolName !== "rewind") continue;
+			const details = isRecord(semantic.details) ? semantic.details : {};
+			if (details.instructionAnchor !== true) continue;
+			const checkpointId = stringProperty(details, "checkpointId");
+			const report = stringProperty(details, "report")?.trim() ?? "";
+			const nextAction = stringProperty(details, "nextAction")?.trim() ?? "";
+			if (!checkpointId || !report || !nextAction) continue;
+			if (!resolveInstructionAnchor(this.sessionManager.getBranch(), checkpointId)) continue;
+			return { report, rewound: true, checkpointId, nextAction, instructionAnchor: true };
+		}
+		return undefined;
+	}
+
 	#extractRewindReport(messages: AgentMessage[]): RewindToolDetails | undefined {
 		const checkpointState = this.#checkpointState;
 		if (!checkpointState) return undefined;
@@ -13009,7 +13471,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			const semanticResult = semanticToolResult(message.toolName, message);
 			if (semanticResult?.toolName !== "rewind") continue;
 			const details = isRecord(semanticResult.details) ? semanticResult.details : {};
-			if (isRecord(details.search)) continue;
+			if (isRecord(details.search) || details.instructionAnchor === true) continue;
 			const detailReport =
 				details && typeof details === "object" && "report" in details && typeof details.report === "string"
 					? details.report.trim()
@@ -13103,6 +13565,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 					: undefined;
 				const compact = estimate?.willCompact !== false;
 				details.contextChanged = compact;
+				const sources = compact ? this.#rewindSourceContext(state) : undefined;
 				if (compact)
 					this.#bash.withBranchTransition(() =>
 						this.sessionManager.branchWithSummary(state.checkpointEntryId, report, details),
@@ -13116,6 +13579,23 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 					"agent",
 				);
 				// Summary and report stay adjacent for provider-side deduplication.
+				if (sources) {
+					this.sessionManager.appendCustomMessageEntry(
+						SEARCH_REWIND_STATE,
+						"",
+						false,
+						{ activeRefs: sources.activeRefs },
+						"agent",
+					);
+					for (const material of sources.materials)
+						this.sessionManager.appendCustomMessageEntry(
+							material.customType,
+							material.content,
+							material.display,
+							material.details,
+							material.attribution,
+						);
+				}
 				this.sessionManager.appendCustomEntry(USER_TODO_EDIT_CUSTOM_TYPE, { phases });
 				details.parent = refreshCheckpointTodoIdentity(
 					state.parent,
@@ -13171,6 +13651,149 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		if (details.contextChanged) this.#closeCodexProviderSessionsForHistoryRewrite();
 		this.#checkpointState = details.parent;
 		this.#pendingRewindReport = undefined;
+	}
+
+	/**
+	 * Fold the current instruction's exploration into a retained report.
+	 *
+	 * The cut starts at the user message and removes the notice, every tool
+	 * chain and the rewind result itself; the instruction, report, selected
+	 * materials and receipts stay. Work-package state and todo bindings are
+	 * untouched because this point is not a package.
+	 */
+	async #applyInstructionRewind(
+		handoff: RewindToolDetails,
+		activeMessages?: AgentMessage[],
+		turn?: AgentTurnEndContext,
+		signal?: AbortSignal,
+	): Promise<void> {
+		const resolved = resolveInstructionAnchor(this.sessionManager.getBranch(), handoff.checkpointId);
+		if (!resolved) return;
+		const report = handoff.report;
+		const nextAction = handoff.nextAction ?? "";
+		const state: CheckpointState = {
+			checkpointEntryId: resolved.entryId,
+			checkpointId: resolved.id,
+			startedAt: this.#instructionAnchor?.startedAt || new Date().toISOString(),
+			checkpointMessageCount: 0,
+		};
+		const phases = this.#todo.phases;
+		const explorationPromptDigest = this.#tools.recordedPromptDigest();
+		const details: CompletedRewindState & { kind: string } = {
+			kind: INSTRUCTION_REWIND_KIND,
+			report,
+			nextAction,
+			checkpointId: resolved.id,
+			startedAt: state.startedAt,
+			rewoundAt: new Date().toISOString(),
+		};
+		const siblings: (AssistantMessage | ToolResultMessage | CustomMessage)[] = [];
+		if (turn?.message.role === "assistant") {
+			const results = turn.toolResults.filter(
+				result => semanticToolResult(result.toolName, result)?.toolName !== "rewind",
+			);
+			const ids = new Set(results.map(result => result.toolCallId));
+			const calls = turn.message.content.filter(
+				(block): block is ToolCall => block.type === "toolCall" && ids.has(block.id),
+			);
+			if (calls.length > 0) {
+				siblings.push(sanitizeAssistantForReparentedHistory({ ...turn.message, content: calls }));
+				siblings.push(...results);
+			}
+		}
+		const generation = this.#promptGeneration;
+		let committedLeaf = this.sessionManager.getLeafId();
+		let nextAnchorId: string | undefined;
+		await this.sessionManager.appendEntriesAtomically(
+			() => {
+				const estimate = this.#validateRewindSavings(state, report, nextAction, siblings, true, phases);
+				const compact = estimate.willCompact !== false;
+				details.contextChanged = compact;
+				if (compact) {
+					const sources = this.#rewindSourceContext(state);
+					this.#bash.withBranchTransition(() =>
+						this.sessionManager.branchWithSummary(resolved.entryId, report, details),
+					);
+					const retained = this.#rewindReportMessage(state, report, nextAction, phases);
+					this.sessionManager.appendCustomMessageEntry(
+						REWIND_REPORT_MESSAGE_TYPE,
+						retained.content,
+						false,
+						details,
+						"agent",
+					);
+					this.sessionManager.appendCustomMessageEntry(
+						SEARCH_REWIND_STATE,
+						"",
+						false,
+						{ activeRefs: sources.activeRefs },
+						"agent",
+					);
+					for (const material of sources.materials)
+						this.sessionManager.appendCustomMessageEntry(
+							material.customType,
+							material.content,
+							material.display,
+							material.details,
+							material.attribution,
+						);
+					this.sessionManager.appendCustomEntry(USER_TODO_EDIT_CUSTOM_TYPE, { phases });
+					if (siblings.length > 0) {
+						this.#tools.recordPromptDigest(explorationPromptDigest);
+						for (const message of siblings) {
+							if (message.role === "custom")
+								this.sessionManager.appendCustomMessageEntry(
+									message.customType,
+									message.content,
+									message.display,
+									message.details,
+									message.attribution,
+								);
+							else this.sessionManager.appendMessage(message);
+						}
+					}
+					// The point that was just used stays as its own boundary; the folded
+					// position opens the next point so no model-side point management is needed.
+					nextAnchorId = `R${this.#instructionAnchorSequence++}`;
+					this.sessionManager.appendCustomMessageEntry(
+						INSTRUCTION_ANCHOR_MESSAGE_TYPE,
+						prompt.render(instructionRewindPointPrompt, { anchorId: nextAnchorId }),
+						false,
+						{ id: nextAnchorId },
+						"agent",
+					);
+				}
+				committedLeaf = this.sessionManager.getLeafId();
+			},
+			{
+				commitGuard: () =>
+					!signal?.aborted &&
+					this.#promptGeneration === generation &&
+					this.sessionManager.getLeafId() === committedLeaf,
+			},
+		);
+		if (this.#promptGeneration !== generation) return;
+		this.#lastCompletedRewind = details;
+		this.#instructionNoticeMessage = undefined;
+		this.#pendingRewindReport = undefined;
+		// A recorded fold satisfies the point even when the cut had no net savings:
+		// the report is the deliverable, so the rollover gate and the pre-yield
+		// demand must not outlive it.
+		this.#rewindFoldedAnchorId = resolved.id;
+		if (!details.contextChanged) return;
+		// The used point remains its own boundary; adopt the point opened after the fold.
+		this.#instructionAnchor = nextAnchorId
+			? { id: nextAnchorId, messageCount: 0, toolResults: 0, startedAt: new Date().toISOString() }
+			: undefined;
+		// The cut removed any work-package anchor created inside this instruction.
+		this.#checkpointState = undefined;
+		const rebuilt = this.buildDisplaySessionContext();
+		if (activeMessages) activeMessages.splice(0, activeMessages.length, ...rebuilt.messages);
+		this.agent.replaceMessages(activeMessages ?? rebuilt.messages);
+		this.#advisors.resetSessionState({ preserveCost: true });
+		this.#todo.syncFromBranch();
+		this.#modelMentions.syncFromBranch();
+		if (details.contextChanged) this.#closeCodexProviderSessionsForHistoryRewrite();
 	}
 	/** Plan-mode decision affordances: `ask`, or plan approval via `write xd://propose`. */
 	#isPlanDecisionTool(toolCall: { name: string; arguments?: Record<string, unknown> }): boolean {

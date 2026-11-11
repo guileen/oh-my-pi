@@ -592,10 +592,7 @@ export class InputController {
 			}
 
 			if (this.ctx.loopModeEnabled) {
-				// Esc suspends the loop even mid-iteration: abort the live turn,
-				// then drop the captured prompt so the 800ms auto-resubmit never
-				// fires. Loop stays enabled (paused) — the next manual prompt
-				// resumes with a new body.
+				// Esc suspends the loop and cancels its pending iteration.
 				if (this.ctx.session.isStreaming) {
 					this.#abortStreamingTurn();
 				}
@@ -1265,10 +1262,11 @@ export class InputController {
 			// During compaction, queue immediately so bash/python/loop-mode branches do
 			// not consume the skill before the compaction-resume path re-parses it.
 			if (text && isKnownSkillCommand(this.ctx, text)) {
-				// Capture here too: this branch's own early returns below would
-				// otherwise skip the non-skill capture further down.
-				if (this.ctx.loopModeEnabled) {
+				// Only an explicit loop body or the first prompt replaces the body.
+				if (this.ctx.loopModeEnabled && (submittedMode === "loop" || this.ctx.loopPrompt === undefined)) {
 					this.ctx.setLoopPrompt(text);
+				} else if (this.ctx.loopModeEnabled && this.ctx.loopModePaused && this.ctx.loopPrompt !== undefined) {
+					this.ctx.setLoopPrompt(this.ctx.loopPrompt);
 				}
 				if (this.ctx.session.isCompacting) {
 					const images = inputImages && inputImages.length > 0 ? [...inputImages] : undefined;
@@ -1331,12 +1329,21 @@ export class InputController {
 			if (this.ctx.session.isCompacting) {
 				const images = inputImages && inputImages.length > 0 ? [...inputImages] : undefined;
 				this.ctx.queueCompactionMessage(text, "steer", images);
-				// An inline `/loop` body queued here arms the loop only when it is
-				// an actual model prompt. Skill/bash/python bodies never reach this
-				// branch, but an extension-command body would otherwise be retained
-				// as loopPrompt while the drain executes it locally — and idle
-				// submissions never arm commands.
-				if (submittedMode === "loop" && !this.#isLocalExtensionCommand(text)) this.ctx.setLoopPrompt(text);
+				// Only model prompts can become a loop body, not local commands.
+				if (
+					this.ctx.loopModeEnabled &&
+					(submittedMode === "loop" || this.ctx.loopPrompt === undefined) &&
+					!this.#isLocalExtensionCommand(text)
+				) {
+					this.ctx.setLoopPrompt(text);
+				} else if (
+					this.ctx.loopModeEnabled &&
+					this.ctx.loopModePaused &&
+					this.ctx.loopPrompt !== undefined &&
+					!this.#isLocalExtensionCommand(text)
+				) {
+					this.ctx.setLoopPrompt(this.ctx.loopPrompt);
+				}
 				return;
 			}
 
@@ -1388,7 +1395,20 @@ export class InputController {
 					// retain a body whose dispatch rejects, resubmitting a failed
 					// prompt after every yield. A rejection leaves prior loop
 					// state untouched, so the previous body (if any) survives.
-					if (submittedMode === "loop" && forwarded) this.ctx.setLoopPrompt(text);
+					if (
+						this.ctx.loopModeEnabled &&
+						(submittedMode === "loop" || this.ctx.loopPrompt === undefined) &&
+						forwarded
+					) {
+						this.ctx.setLoopPrompt(text);
+					} else if (
+						forwarded &&
+						this.ctx.loopModeEnabled &&
+						this.ctx.loopModePaused &&
+						this.ctx.loopPrompt !== undefined
+					) {
+						this.ctx.setLoopPrompt(this.ctx.loopPrompt);
+					}
 				} catch (error) {
 					// Don't lose the queued steer draft: restore images then the collapsed
 					// text so chip tokens (and band cards) survive the retry.
@@ -1407,14 +1427,14 @@ export class InputController {
 				return;
 			}
 			// Normal message submission
-			// While loop mode is on, an idle user-typed prompt becomes the new loop
-			// prompt that auto-resubmits after each yield. This arms synchronously,
-			// before any await: arming after a turn-length dispatch would race the
-			// reschedule timer and strand the waiter. Non-forward outcomes (local
-			// consume, rejection) park the loop at their own dispatch sites, so a
-			// failed body degrades to idle instead of looping errors.
-			if (this.ctx.loopModeEnabled) {
+			// Arm a new body synchronously before dispatch; ordinary interjections
+			// must leave an existing loop body intact.
+			const armedLoopPrompt =
+				this.ctx.loopModeEnabled && (submittedMode === "loop" || this.ctx.loopPrompt === undefined);
+			if (armedLoopPrompt) {
 				this.ctx.setLoopPrompt(text);
+			} else if (this.ctx.loopModeEnabled && this.ctx.loopModePaused && this.ctx.loopPrompt !== undefined) {
+				this.ctx.setLoopPrompt(this.ctx.loopPrompt);
 			}
 			// First, move any pending bash components to chat
 			this.ctx.flushPendingBashComponents();
@@ -1465,7 +1485,7 @@ export class InputController {
 					// The idle block above already armed this body synchronously.
 					// A locally-consumed dispatch starts no turn: park the armed
 					// loop instead of resubmitting a local action on next idle.
-					if (!forwarded && this.ctx.loopPrompt === text) this.ctx.pauseLoop();
+					if (armedLoopPrompt && !forwarded && this.ctx.loopPrompt === text) this.ctx.pauseLoop();
 				} catch (error) {
 					// Don't lose the message: hand images then collapsed text back to the
 					// editor so the user can retry (e.g. prompt dispatch rejecting an
@@ -1481,7 +1501,7 @@ export class InputController {
 					this.ctx.showError(error instanceof Error ? error.message : String(error));
 					// Dispatch rejected after the body was armed: park it so the
 					// failed prompt is not resubmitted on next idle.
-					if (this.ctx.loopPrompt === text) this.ctx.pauseLoop();
+					if (armedLoopPrompt && this.ctx.loopPrompt === text) this.ctx.pauseLoop();
 				}
 				this.ctx.updatePendingMessagesDisplay();
 				this.ctx.ui.requestRender();

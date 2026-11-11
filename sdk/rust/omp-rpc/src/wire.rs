@@ -3569,6 +3569,8 @@ pub enum AutoCompactionAction {
 	Snapcompact,
 	#[serde(rename = "qaonly")]
 	Qaonly,
+	#[serde(rename = "rewind")]
+	Rewind,
 }
 
 impl AutoCompactionAction {
@@ -3581,6 +3583,7 @@ impl AutoCompactionAction {
 			Self::Shake => "shake",
 			Self::Snapcompact => "snapcompact",
 			Self::Qaonly => "qaonly",
+			Self::Rewind => "rewind",
 		}
 	}
 }
@@ -5461,6 +5464,8 @@ pub struct SetInterruptModeParams {
 pub struct CompactParams {
 	#[serde(rename = "customInstructions", default, skip_serializing_if = "Option::is_none")]
 	pub custom_instructions: Option<String>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub mode: Option<CompactParamsMode>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -6001,6 +6006,36 @@ impl HostUriResultContentType {
 			Self::TextMarkdown => "text/markdown",
 			Self::ApplicationJson => "application/json",
 			Self::TextPlain => "text/plain",
+		}
+	}
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum CompactParamsMode {
+	#[serde(rename = "soft")]
+	Soft,
+	#[serde(rename = "remote")]
+	Remote,
+	#[serde(rename = "snapcompact")]
+	Snapcompact,
+	#[serde(rename = "relay")]
+	Relay,
+	#[serde(rename = "qaonly")]
+	Qaonly,
+	#[serde(rename = "rewind")]
+	Rewind,
+}
+
+impl CompactParamsMode {
+	/// Wire value.
+	pub fn as_str(self) -> &'static str {
+		match self {
+			Self::Soft => "soft",
+			Self::Remote => "remote",
+			Self::Snapcompact => "snapcompact",
+			Self::Relay => "relay",
+			Self::Qaonly => "qaonly",
+			Self::Rewind => "rewind",
 		}
 	}
 }
@@ -6845,6 +6880,8 @@ impl Command for SetInterruptModeCommand {
 pub struct CompactCommand {
 	#[serde(rename = "customInstructions", default, skip_serializing_if = "Option::is_none")]
 	pub custom_instructions: Option<String>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub mode: Option<CompactParamsMode>,
 }
 
 impl Command for CompactCommand {

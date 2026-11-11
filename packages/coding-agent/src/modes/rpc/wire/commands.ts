@@ -6,6 +6,7 @@
  * `<Command>Params` / `<Command>Result`; a string names a shared definition.
  */
 import { doc } from "./dsl";
+import { COMPACT_MODES } from "../../../session/compact-modes";
 
 /** One RPC command as described to generators. */
 export interface RpcCommandSpec {
@@ -251,7 +252,7 @@ export const rpcCommands: readonly RpcCommandSpec[] = [
 	{
 		name: "compact",
 		doc: "Compact the conversation.",
-		params: { "customInstructions?": "string" },
+		params: { "customInstructions?": "string", "mode?": COMPACT_MODES.map(mode => `'${mode.name}'`).join(" | ") },
 		result: "CompactionResult",
 	},
 	{ name: "set_auto_compaction", doc: "Enable or disable auto-compaction.", params: { enabled: "boolean" } },

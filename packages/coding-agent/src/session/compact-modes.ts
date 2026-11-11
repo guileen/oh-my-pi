@@ -13,7 +13,7 @@
 import type { CompactionMethod } from "./compaction-methods";
 
 /** Subcommand selecting a one-off compaction mode for manual `/compact`. */
-export type CompactMode = "soft" | "remote" | "snapcompact" | "relay" | "qaonly";
+export type CompactMode = "soft" | "remote" | "snapcompact" | "relay" | "qaonly" | "rewind";
 
 export const QA_TOOL_TIP_TYPE = "qa-compaction-tool-tip";
 export const QA_STATE_TYPE = "qa-compaction-state";
@@ -65,6 +65,11 @@ export const COMPACT_MODES: readonly CompactModeDef[] = [
 		description: "Keep Q&A and operational state without model calls",
 		overrides: {},
 		rejectsFocus: true,
+	},
+	{
+		name: "rewind",
+		description: "Fold completed exploration locally with one main-agent checkpoint",
+		overrides: { methodOrder: ["rewind"] },
 	},
 ];
 

@@ -30,7 +30,8 @@ export type QaCheckpointErrorCode =
 	| "QA_STALE_CYCLE"
 	| "QA_INVALID_CHECKPOINT"
 	| "QA_CHECKPOINT_CONFLICT"
-	| "QA_PERSIST_FAILED";
+	| "QA_PERSIST_FAILED"
+	| "QA_REWIND_FOLD_REQUIRED";
 
 export interface QaCheckpointErrorDetails extends Record<string, unknown> {
 	code: QaCheckpointErrorCode;

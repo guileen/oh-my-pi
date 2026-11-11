@@ -101,7 +101,11 @@ import {
 } from "@oh-my-pi/pi-tui/thinking";
 import type { AgentSessionEvent } from "./agent-session-events";
 import type { ClientBridge } from "./client-bridge";
-import { resolveCompactionMethodOrder, resolveMethodSettings } from "./compaction-methods";
+import {
+	isLocalCheckpointCompactionMethod,
+	resolveCompactionMethodOrder,
+	resolveMethodSettings,
+} from "./compaction-methods";
 import { type CustomMessage, type CustomMessagePayload, isUserAuthoredMessage, isUserTurnInitiator } from "./messages";
 import { isAdvisorCard, isTerminalTextAssistantAnswer } from "./queued-messages";
 import {
@@ -2405,9 +2409,12 @@ export class SessionAdvisors {
 		if (!configuredCompaction.enabled || methods.length === 0) {
 			return false;
 		}
-		// Advisors have no QA checkpoint lifecycle. A QA-first configuration
-		// authorizes a paid summary only when a later engine method is explicit.
-		if (methods.includes("qaonly") && !methods.some(method => method === "remote" || method === "soft")) {
+		// Advisors have no main-loop checkpoint lifecycle. Local-only methods
+		// authorize a paid summary only when a later engine method is explicit.
+		if (
+			methods.some(isLocalCheckpointCompactionMethod) &&
+			!methods.some(method => method === "remote" || method === "soft")
+		) {
 			return false;
 		}
 		const compactionMethod = methods.includes("remote") ? "remote" : "soft";

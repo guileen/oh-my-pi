@@ -186,12 +186,21 @@ Important edge behavior from runtime:
 
 ### Compaction
 
-- `{ id?, type: "compact", customInstructions?: string }`
+- `{ id?, type: "compact", customInstructions?: string, mode?: "soft" | "remote" | "snapcompact" | "relay" | "qaonly" | "rewind" }`
 - `{ id?, type: "set_auto_compaction", enabled: boolean }`
 
 `compact` answers with the `CompactionResult` once the compaction ends. Progress
 arrives as `manual_compaction_start` and `manual_compaction_end` events (see
 [Progress events](#progress-events)).
+
+`mode` is a one-shot override and never changes saved compaction settings. `rewind`
+uses one bounded primary-loop checkpoint report to fold a local exploration interval,
+preserving its original prefix and selected exact evidence; it does not fall back
+to another summarizer. Invalid modes fail before interrupting work. Empty, stale
+or nonshrinking intervals return an error without publishing a compaction.
+
+The TypeScript client accepts `compact(customInstructions?, { mode? })`, for example
+`await client.compact(undefined, { mode: "rewind" })`.
 
 ### Cache warming
 

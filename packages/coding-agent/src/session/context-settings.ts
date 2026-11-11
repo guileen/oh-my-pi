@@ -149,7 +149,7 @@ export const cfgCompactionMethodOrder = register({
 		group: "Compaction",
 		label: "Compaction Method Order",
 		description:
-			"Preferred automatic maintenance order; unavailable or failed methods advance only to later choices. QA-only never adds an unconfigured summary fallback",
+			"Preferred automatic maintenance order; unavailable or failed methods advance only to later choices. Local rewind preserves the original prefix and selected exact evidence; local methods never add an unconfigured summary fallback",
 		options: COMPACTION_METHOD_CHOICES,
 		ordered: true,
 	},
