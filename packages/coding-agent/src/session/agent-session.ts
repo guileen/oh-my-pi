@@ -410,6 +410,14 @@ import {
 	resolveInstructionAnchor,
 	type InstructionAnchorState,
 } from "./instruction-anchor";
+import {
+	PLAINTEXT_REASONING_SIGNATURES,
+	THINK_NOTE_MESSAGE_TYPE,
+	applyThinkNoteToAssistant,
+	THINK_NOTE_TOOL_NAME,
+	THINK_NOTE_TOKEN_RATIO,
+	type ThinkNoteDetails,
+} from "./think-note";
 import type { ClientBridge } from "./client-bridge";
 import {
 	type ClaudeResetAction,
@@ -1492,6 +1500,12 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	#rewindFoldedAnchorId: string | undefined = undefined;
 	/** Point id that already received the mandatory pre-yield reminder. */
 	#rewindYieldRemindedAnchorId: string | undefined = undefined;
+	/** Message-end think-note decisions, consumed by their tool results. */
+	#thinkNoteOutcomes = new Map<string, ThinkNoteDetails>();
+	/** Marker to persist right after the assistant entry that owns it. */
+	#pendingThinkNotes = new Map<AgentMessage, CustomMessage<ThinkNoteDetails>>();
+	/** Applied decisions, rewritten again on every converted request. */
+	#appliedThinkNotes = new Map<string, ThinkNoteDetails>();
 	#pendingRewindReport: RewindToolDetails | undefined = undefined;
 	#lastCompletedRewind: CompletedRewindState | undefined = undefined;
 	#rewoundToolResultIds = new Set<string>();
@@ -3131,6 +3145,10 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				this.#maintenance.renderArchiveForModel(context.messages),
 			),
 		);
+		// The loop converts a snapshot taken at run start, so a marker appended to
+		// the transcript at message end is absent from the current tool loop. Rewrite
+		// the converted request instead, matching the assistant by its tool call.
+		this.addDisposer(this.agent.addBeforeModelCall(context => this.#rewriteThinkNotesInRequest(context)));
 		// A request past the cap mid-run stops the run before it is sent: no turn opens, nothing is billed.
 		// The gate is registered only while a cap is set, avoiding an unnecessary
 		// admission check on every provider request.
@@ -4664,6 +4682,90 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		return { anchorId: anchor.id, toolResults: anchor.toolResults };
 	}
 
+	/** Consume the message-end decision for one think-note tool result. */
+	takeThinkNoteOutcome(toolCallId: string): ThinkNoteDetails | undefined {
+		const outcome = this.#thinkNoteOutcomes.get(toolCallId);
+		this.#thinkNoteOutcomes.delete(toolCallId);
+		return outcome;
+	}
+
+	/**
+	 * Rewrite this turn's reasoning for the next provider request only. Signed or
+	 * encrypted reasoning stays: its provider binds the content to it. The note
+	 * must beat the reasoning it replaces, because the note is output plus one
+	 * first-replay input while the reasoning is one first-replay input.
+	 */
+	#applyThinkNoteOnMessageEnd(message: AssistantMessage): void {
+		if (this.#isDisposed) return;
+		if (message.stopReason === "error" || message.stopReason === "aborted") return;
+		let call: ToolCall | undefined;
+		for (const block of message.content) {
+			if (block.type === "toolCall" && block.name === THINK_NOTE_TOOL_NAME) call = block;
+		}
+		if (!call) return;
+		const details = this.#evaluateThinkNote(message, call);
+		this.#thinkNoteOutcomes.set(call.id, details);
+		if (details.mode === "kept") return;
+		this.#appliedThinkNotes.set(call.id, details);
+		const marker: CustomMessage<ThinkNoteDetails> = {
+			role: "custom",
+			customType: THINK_NOTE_MESSAGE_TYPE,
+			content: "",
+			display: false,
+			details,
+			attribution: "agent",
+			timestamp: Date.now(),
+		};
+		this.agent.appendMessage(marker);
+		this.#pendingThinkNotes.set(message, marker);
+	}
+
+	#rewriteThinkNotesInRequest(context: Context): void {
+		if (this.#appliedThinkNotes.size === 0) return;
+		let changed = false;
+		const messages = context.messages.map(message => {
+			if (message.role !== "assistant") return message;
+			for (const details of this.#appliedThinkNotes.values()) {
+				if (!message.content.some(block => block.type === "toolCall" && block.id === details.toolCallId)) continue;
+				changed = true;
+				return applyThinkNoteToAssistant(message, details);
+			}
+			return message;
+		});
+		if (changed) context.messages = messages;
+	}
+
+	#evaluateThinkNote(message: AssistantMessage, call: ToolCall): ThinkNoteDetails {
+		const kept = (reason: string, beforeTokens = 0): ThinkNoteDetails => ({
+			toolCallId: call.id,
+			mode: "kept",
+			beforeTokens,
+			afterTokens: 0,
+			reason,
+		});
+		if (message.content.some(block => block.type === "redactedThinking"))
+			return kept("encrypted reasoning is replayed as-is");
+		const thinking: string[] = [];
+		for (const block of message.content) {
+			if (block.type !== "thinking") continue;
+			if (block.thinkingSignature && !PLAINTEXT_REASONING_SIGNATURES[block.thinkingSignature])
+				return kept("signed reasoning is bound to its content");
+			if (block.thinking.trim().length > 0) thinking.push(block.thinking);
+		}
+		if (thinking.length === 0) return kept("no thinking to rewrite");
+		const beforeTokens = this.agent.tokenizer.countTokens(thinking.join("\n"));
+		const args = isRecord(call.arguments) ? call.arguments : {};
+		const noteArg = args.note;
+		if (noteArg === null) return { toolCallId: call.id, mode: "drop", beforeTokens, afterTokens: 0 };
+		if (typeof noteArg !== "string" || noteArg.trim().length === 0)
+			return kept("note must be a nonempty string or null", beforeTokens);
+		const note = noteArg.trim();
+		const afterTokens = this.agent.tokenizer.countTokens(note);
+		if (afterTokens * THINK_NOTE_TOKEN_RATIO > beforeTokens)
+			return kept(`note is not small enough (${afterTokens} vs ${beforeTokens} tokens)`, beforeTokens);
+		return { toolCallId: call.id, mode: "replace", note, beforeTokens, afterTokens };
+	}
+
 	/**
 	 * Hidden aside offering a fold once enough tool output has accumulated after
 	 * the live instruction point. It repeats every threshold of settled results,
@@ -4725,6 +4827,18 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			return;
 		}
 		this.#persistSessionMessageIfMissing(message);
+		const thinkNote = this.#pendingThinkNotes.get(message);
+		if (thinkNote) {
+			this.#pendingThinkNotes.delete(message);
+			this.sessionManager.appendCustomMessageEntry(
+				thinkNote.customType,
+				thinkNote.content,
+				thinkNote.display,
+				thinkNote.details,
+				thinkNote.attribution ?? "agent",
+				thinkNote.timestamp,
+			);
+		}
 		if (pendingNotice) {
 			for (const notice of pendingNotice.messages)
 				this.sessionManager.appendCustomMessageEntry(
@@ -4996,6 +5110,9 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		// extension delivery or persistence can stall this handler.
 		if (interruptedThinkingMessage) {
 			this.agent.appendMessage(interruptedThinkingMessage);
+		}
+		if (event.type === "message_end" && event.message.role === "assistant" && !interruptedThinkingMessage) {
+			this.#applyThinkNoteOnMessageEnd(event.message as AssistantMessage);
 		}
 		if (event.type === "message_end" && event.message.role === "user") {
 			this.#checkpointState = undefined;
@@ -8431,6 +8548,9 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		this.#pendingRewindReport = undefined;
 		this.#lastCompletedRewind = undefined;
 		this.#rewoundToolResultIds.clear();
+		this.#thinkNoteOutcomes.clear();
+		this.#pendingThinkNotes.clear();
+		this.#appliedThinkNotes.clear();
 	}
 
 	/** Drop mutable tool decisions and directives owned by the previous logical session. */

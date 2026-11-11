@@ -2682,7 +2682,10 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 								resolveCompactionMethodOrder(cfgCompactionMethodOrder.get(settings)).find(
 									method =>
 										method !== "remote" ||
-										canUseRemoteCompaction(model, resolveMethodSettings(cfgCompaction.get(settings), "remote")),
+										canUseRemoteCompaction(
+											model,
+											resolveMethodSettings(cfgCompaction.get(settings), "remote"),
+										),
 								),
 							) &&
 							typeof model?.contextWindow === "number" &&
@@ -2770,6 +2773,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			getInstructionAnchor: id => session.getInstructionAnchor(id),
 			validateInstructionRewind: (checkpointId, report, nextAction) =>
 				session.validateInstructionRewind(checkpointId, report, nextAction),
+			takeThinkNoteOutcome: toolCallId => session.takeThinkNoteOutcome(toolCallId),
 			validateRewind: (checkpointId, report, nextAction, outcome, reason) =>
 				session.validateRewind(checkpointId, report, nextAction, outcome, reason),
 			bindCheckpointTodo: target => session.bindCheckpointTodo(target),

@@ -38,6 +38,7 @@ import type { QaCheckpointAcceptance, QaCheckpointInput } from "../session/qa-ro
 import type { UsageStatistics } from "../session/session-entries";
 import type { SessionManager } from "../session/session-manager";
 import type { SearchRewindInput } from "../session/search-rewind";
+import type { ThinkNoteDetails } from "../session/think-note";
 import type { ToolChoiceQueue } from "../session/tool-choice-queue";
 import { TaskTool } from "../task";
 import type { AgentOutputManager } from "../task/output-manager";
@@ -61,6 +62,7 @@ import {
 } from "./checkpoint";
 import { ContextNotesTool, NewContextTool } from "./context-notes";
 import { DebugTool } from "./debug";
+import { ThinkNoteTool } from "./think-note";
 import { cfgIdaAvailable } from "../ida/install";
 import { EvalTool } from "./eval";
 import { resolveEvalBackends } from "./eval-backends";
@@ -135,6 +137,7 @@ export type {
 } from "@oh-my-pi/pi-tui/tools/bash";
 export * from "./browser";
 export * from "./checkpoint";
+export * from "./think-note";
 export * from "./computer";
 export * from "./computer/supervisor";
 export * from "./context-notes";
@@ -565,6 +568,8 @@ export interface ToolSession {
 	getInstructionAnchor?: (id?: string) => { id: string } | undefined;
 	/** Validate an instruction-bound fold without changing the active transcript. */
 	validateInstructionRewind?: (checkpointId: string, report: string, nextAction: string) => RewindContextEstimate;
+	/** Message-end think-note decision for one tool call, consumed by its result. */
+	takeThinkNoteOutcome?: (toolCallId: string) => ThinkNoteDetails | undefined;
 	/** Validate a work-package handoff without changing the active transcript. */
 	validateRewind?: (
 		checkpointId: string,
@@ -641,6 +646,7 @@ export const BUILTIN_TOOLS: Record<BuiltinToolName, ToolFactory> = {
 	lsp: LspTool.createIf,
 	checkpoint: CheckpointTool.createIf,
 	rewind: RewindTool.createIf,
+	thinknote: ThinkNoteTool.createIf,
 	context_notes: ContextNotesTool.createIf,
 	new_context: NewContextTool.createIf,
 	task: s => TaskTool.create(s),

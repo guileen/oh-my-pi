@@ -57,7 +57,9 @@ type CheckpointParams = typeof checkpointSchema.infer;
 const rewindSchema = type({
 	"checkpointId?": type("string").describe("work-package checkpoint; mutually exclusive with observationId"),
 	"observationId?": type("string").describe("completed tool observation to retire; no checkpoint needed"),
-	"note?": type("string").describe("brief decision or scoped exclusion that must survive the observation"),
+	"note?": type("string").describe(
+		"brief decision: replaces report on an instruction point, or a scoped exclusion on an observation",
+	),
 	"keep?": type({ observationId: "string", "text?": "string", "images?": "number[]" })
 		.array()
 		.describe("exact delivered text substring and/or zero-based image indexes to retain"),
@@ -292,7 +294,6 @@ export class RewindTool implements AgentTool<typeof rewindSchema, RewindToolDeta
 			this.session.getCheckpointState?.()?.checkpointId !== params.checkpointId
 		) {
 			if (
-				params.note !== undefined ||
 				params.keep ||
 				params.read ||
 				params.retain ||
@@ -301,10 +302,12 @@ export class RewindTool implements AgentTool<typeof rewindSchema, RewindToolDeta
 				params.outcome !== undefined ||
 				params.reason !== undefined
 			)
-				throw new ToolError("Instruction rewind accepts only report and nextAction.");
-			const report = params.report?.trim() ?? "";
+				throw new ToolError("Instruction rewind accepts only report or note, plus nextAction.");
+			if (params.report !== undefined && params.note !== undefined)
+				throw new ToolError("Instruction rewind accepts report or note, not both.");
+			const report = (params.note ?? params.report)?.trim() ?? "";
 			const nextAction = params.nextAction.trim();
-			if (!report || !nextAction) throw new ToolError("report and nextAction must be nonempty.");
+			if (!report || !nextAction) throw new ToolError("report (or note) and nextAction must be nonempty.");
 			if (!this.session.validateInstructionRewind)
 				throw new ToolError("Instruction rewind requires a live session.");
 			const estimate = this.session.validateInstructionRewind(params.checkpointId, report, nextAction);

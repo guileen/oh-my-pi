@@ -15,6 +15,7 @@ export const BUILTIN_TOOL_NAMES = [
 	"lsp",
 	"checkpoint",
 	"rewind",
+	"thinknote",
 	"context_notes",
 	"new_context",
 	"security_scan",

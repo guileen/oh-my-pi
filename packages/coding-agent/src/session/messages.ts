@@ -6,6 +6,12 @@
  */
 import { type AgentMessage, isProviderRefusalMessage } from "@oh-my-pi/pi-agent-core";
 import {
+	THINK_NOTE_MESSAGE_TYPE,
+	applyThinkNoteToAssistant,
+	parseThinkNoteDetails,
+	type ThinkNoteDetails,
+} from "./think-note";
+import {
 	isUserInterruptAbort,
 	isCustomMessageContent,
 	type BashExecutionMessage,
@@ -1073,7 +1079,8 @@ function convertImageBearingCustomMessage(message: CustomMessage | HookMessage):
  * copy. Identity keying keeps the cache off spread copies.
  */
 interface ConvertMemoEntry {
-	interruptedNext: boolean;
+	/** Neighbor-sensitive state key; `""` when neither marker applies. */
+	neighborKey: string;
 	fragment: Message[];
 }
 const convertCache = new WeakMap<AgentMessage, ConvertMemoEntry>();
@@ -1117,7 +1124,7 @@ registerMessageCacheInvalidator(message => {
 
 /** Convert one message to its LLM fragment. `interruptedNext` is true only for an
  *  assistant turn immediately followed by its interrupted-thinking marker. */
-function convertOne(m: AgentMessage, interruptedNext: boolean): Message[] {
+function convertOne(m: AgentMessage, interruptedNext: boolean, thinkNote?: ThinkNoteDetails): Message[] {
 	switch (m.role) {
 		case "bashExecution":
 			if (m.excludeFromContext) {
@@ -1183,6 +1190,9 @@ function convertOne(m: AgentMessage, interruptedNext: boolean): Message[] {
 			return out;
 		}
 		case "custom": {
+			// A think-note marker carries only details; the rewrite lands on the
+			// assistant turn it follows, so the marker itself contributes nothing.
+			if (m.customType === THINK_NOTE_MESSAGE_TYPE) return [];
 			if (!isCustomMessageContent(m.content)) return [];
 			if (isSteeringUserMessage(m)) {
 				const converted = convertMessageToLlm(wrapSteeringUserMessage(m));
@@ -1215,7 +1225,8 @@ function convertOne(m: AgentMessage, interruptedNext: boolean): Message[] {
 			// encrypted blocks replay natively; incomplete unsigned runs are
 			// stripped whether or not they were long enough for a continuity note.
 			const userInterrupted = m.stopReason === "aborted" && isUserInterruptAbort(m);
-			const source = interruptedNext || userInterrupted ? stripDemotedThinkingForLlm(m) : m;
+			const demoted = interruptedNext || userInterrupted ? stripDemotedThinkingForLlm(m) : m;
+			const source = thinkNote ? applyThinkNoteToAssistant(demoted, thinkNote) : demoted;
 			// An empty interrupted response still carries the controls its request
 			// sent (e.g. an Anthropic `tool_removal`); later requests replay them from it.
 			if (userInterrupted && !interruptedNext && source.content.length === 0 && m.requestControls === undefined) {
@@ -1257,10 +1268,19 @@ function convertOne(m: AgentMessage, interruptedNext: boolean): Message[] {
 function convertMessageAt(
 	messages: AgentMessage[],
 	index: number,
-	convert: (m: AgentMessage, interruptedNext: boolean) => Message[],
+	convert: (m: AgentMessage, interruptedNext: boolean, thinkNote?: ThinkNoteDetails) => Message[],
 ): Message[] {
 	const message = messages[index];
-	return convert(message, message.role === "assistant" && followedByInterruptedThinking(messages, index));
+	const thinkNote = message.role === "assistant" ? thinkNoteAfter(messages, index) : undefined;
+	return convert(message, message.role === "assistant" && followedByInterruptedThinking(messages, index), thinkNote);
+}
+
+/** Marker written by the message-end handler directly after its assistant turn. */
+function thinkNoteAfter(messages: AgentMessage[], index: number): ThinkNoteDetails | undefined {
+	const next = messages[index + 1];
+	return next?.role === "custom" && next.customType === THINK_NOTE_MESSAGE_TYPE
+		? parseThinkNoteDetails(next.details)
+		: undefined;
 }
 
 /** A converted viewer message and its position in the source and converted histories. */
@@ -1298,12 +1318,17 @@ export function convertMessagesForContextView(messages: AgentMessage[]): Context
 
 /** Cached per-message conversion. Reuses the stored fragment while identity and
  *  `interruptedNext` neighbor state hold; recomputes on a neighbor flip. */
-function convertOneCached(m: AgentMessage, interruptedNext: boolean): Message[] {
+function convertOneCached(m: AgentMessage, interruptedNext: boolean, thinkNote?: ThinkNoteDetails): Message[] {
+	const neighborKey = interruptedNext
+		? "interrupted"
+		: thinkNote
+			? `note\0${thinkNote.mode}\0${thinkNote.note ?? ""}`
+			: "";
 	const cached = convertCache.get(m);
-	if (cached !== undefined && cached.interruptedNext === interruptedNext) return cached.fragment;
-	const fragment = convertOne(m, interruptedNext);
+	if (cached !== undefined && cached.neighborKey === neighborKey) return cached.fragment;
+	const fragment = convertOne(m, interruptedNext, thinkNote);
 	for (const message of fragment) copyPerCallContextMessage(message, m);
-	convertCache.set(m, { interruptedNext, fragment });
+	convertCache.set(m, { neighborKey, fragment });
 	return fragment;
 }
 

@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, spyOn } from "bun:test";
 import * as path from "node:path";
 import { type } from "@oh-my-pi/omptype";
 import { Agent, type AgentMessage, type AgentTool, type AgentToolResult } from "@oh-my-pi/pi-agent-core";
-import type { AssistantMessage, Message, ThinkingContent } from "@oh-my-pi/pi-ai";
+import type { AssistantMessage, Message, ThinkingContent, ToolResultMessage } from "@oh-my-pi/pi-ai";
 import {
 	createMockModel,
 	type MockContent,
@@ -23,7 +23,7 @@ import {
 } from "@oh-my-pi/pi-coding-agent/session/instruction-anchor";
 import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
-import { CheckpointTool, RewindTool, type ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
+import { CheckpointTool, RewindTool, ThinkNoteTool, type ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { GrepTool } from "@oh-my-pi/pi-coding-agent/tools/grep";
 import { ReadTool } from "@oh-my-pi/pi-coding-agent/tools/read";
 import { SEARCH_MATERIAL, searchReference } from "@oh-my-pi/pi-coding-agent/session/search-rewind";
@@ -139,6 +139,7 @@ async function createHarness(
 		realTools?: boolean;
 		checkpoints?: boolean;
 		realSearchTools?: boolean;
+		thinkNote?: boolean;
 		todoBinding?: boolean;
 		persist?: boolean;
 		initialMessages?: AgentMessage[];
@@ -174,8 +175,10 @@ async function createHarness(
 			bindCheckpointTodo: options.todoBinding ? target => session.bindCheckpointTodo(target) : undefined,
 			validateSearchRewind: input => session.validateSearchRewind(input),
 			getToolForEvalBridge: name => session.getToolForEvalBridge(name),
+			takeThinkNoteOutcome: toolCallId => session.takeThinkNoteOutcome(toolCallId),
 		});
 		tools = [new CheckpointTool(toolSession) as AgentTool, new RewindTool(toolSession) as AgentTool, ...tools];
+		if (options.thinkNote) tools.push(new ThinkNoteTool(toolSession) as AgentTool);
 		if (options.realSearchTools)
 			tools.push(new GrepTool(toolSession) as AgentTool, new ReadTool(toolSession) as AgentTool);
 	}
@@ -597,6 +600,84 @@ describe("AgentSession checkpoint rewind branch context", () => {
 		expect(afterRootFold).not.toContain("Instruction rewind point `R2`");
 		expect(afterRootFold).not.toContain("Instruction rewind point `R3`");
 		expect(afterRootFold).not.toContain("INSTRUCTION_NEEDLE");
+	});
+
+	it("replaces settled reasoning with a note while keeping tool output", async () => {
+		const responses = (async function* () {
+			yield {
+				content: [
+					{ type: "thinking", thinking: "deliberation ".repeat(50) } as unknown as MockContent,
+					{ type: "toolCall", id: "note_1", name: "thinknote", arguments: { note: "go with A" } },
+					{ type: "toolCall", id: "probe_1", name: "probe", arguments: {} },
+				],
+				stopReason: "toolUse" as const,
+			};
+			yield { content: ["Done."], stopReason: "stop" as const };
+		})() as MockResponseSource;
+		const { session, mock } = await createHarness(responses, [probeTool as AgentTool], {
+			realTools: true,
+			thinkNote: true,
+		});
+		await session.prompt("explore");
+
+		const request = JSON.stringify(mock.calls[1]!.context.messages);
+		expect(request).not.toContain("deliberation");
+		expect(request).toContain("go with A");
+		expect(request).toContain("ok");
+		const result = session.messages.find(
+			(message): message is ToolResultMessage => message.role === "toolResult" && message.toolName === "thinknote",
+		);
+		expect(result?.details).toMatchObject({ mode: "replace", note: "go with A" });
+	});
+
+	it("drops the reasoning when the note is null", async () => {
+		const responses = (async function* () {
+			yield {
+				content: [
+					{ type: "thinking", thinking: "deliberation ".repeat(50) } as unknown as MockContent,
+					{ type: "toolCall", id: "note_null", name: "thinknote", arguments: { note: null } },
+					{ type: "toolCall", id: "probe_null", name: "probe", arguments: {} },
+				],
+				stopReason: "toolUse" as const,
+			};
+			yield { content: ["Done."], stopReason: "stop" as const };
+		})() as MockResponseSource;
+		const { session, mock } = await createHarness(responses, [probeTool as AgentTool], {
+			realTools: true,
+			thinkNote: true,
+		});
+		await session.prompt("explore");
+
+		expect(JSON.stringify(mock.calls[1]!.context.messages)).not.toContain("deliberation");
+		const result = session.messages.find(
+			(message): message is ToolResultMessage => message.role === "toolResult" && message.toolName === "thinknote",
+		);
+		expect(result?.details).toMatchObject({ mode: "drop" });
+	});
+
+	it("keeps signed reasoning that the provider binds to its content", async () => {
+		const responses = (async function* () {
+			yield {
+				content: [
+					signedThinking("signed deliberation ".repeat(20), "opaque-signature"),
+					{ type: "toolCall", id: "note_signed", name: "thinknote", arguments: { note: "small" } },
+					{ type: "toolCall", id: "probe_signed", name: "probe", arguments: {} },
+				],
+				stopReason: "toolUse" as const,
+			};
+			yield { content: ["Done."], stopReason: "stop" as const };
+		})() as MockResponseSource;
+		const { session, mock } = await createHarness(responses, [probeTool as AgentTool], {
+			realTools: true,
+			thinkNote: true,
+		});
+		await session.prompt("explore");
+
+		expect(JSON.stringify(mock.calls[1]!.context.messages)).toContain("signed deliberation");
+		const result = session.messages.find(
+			(message): message is ToolResultMessage => message.role === "toolResult" && message.toolName === "thinknote",
+		);
+		expect(result?.details).toMatchObject({ mode: "kept" });
 	});
 
 	it("rejects a todo binding already owned by a non-immediate ancestor", async () => {

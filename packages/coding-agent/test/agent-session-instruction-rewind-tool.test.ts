@@ -127,6 +127,28 @@ describe("instruction rewind through the session tool bridge", () => {
 		).rejects.toThrow("Instruction rewind point R7 is stale or unavailable");
 	});
 
+	it("accepts a one-line note in place of the report", async () => {
+		const opened = await openSessionWithPoint("R0");
+		const result = await rewindTool(opened).execute("call-note", {
+			checkpointId: "R0",
+			note: "decision: keep the guard",
+			nextAction: "apply the fix",
+		});
+		expect(result.details).toMatchObject({ instructionAnchor: true, report: "decision: keep the guard" });
+	});
+
+	it("rejects a fold that supplies both report and note", async () => {
+		const opened = await openSessionWithPoint("R0");
+		await expect(
+			rewindTool(opened).execute("call-both", {
+				checkpointId: "R0",
+				report: "first",
+				note: "second",
+				nextAction: "continue",
+			}),
+		).rejects.toThrow("report or note, not both");
+	});
+
 	it("treats null-valued optional parameters as omitted", async () => {
 		const opened = await openSessionWithPoint("R0");
 		const result = await rewindTool(opened).execute("call-4", {
