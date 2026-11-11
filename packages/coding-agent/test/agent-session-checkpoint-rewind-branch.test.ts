@@ -21,9 +21,23 @@ import {
 	REWIND_SKILL_MESSAGE_TYPE,
 	resolveInstructionAnchors,
 } from "@oh-my-pi/pi-coding-agent/session/instruction-anchor";
+import {
+	CONTEXT_MEMORY_BLOCK_MESSAGE_TYPE,
+	CONTEXT_MEMORY_LINE_CUSTOM_TYPE,
+	DAY_NOTE_CUSTOM_TYPE,
+	linesSinceDay,
+	recentDayNotes,
+	renderContextMemoryBlock,
+} from "@oh-my-pi/pi-coding-agent/session/context-memory";
 import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
-import { CheckpointTool, RewindTool, ThinkNoteTool, type ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
+import {
+	CheckpointTool,
+	RememberTool,
+	RewindTool,
+	ThinkNoteTool,
+	type ToolSession,
+} from "@oh-my-pi/pi-coding-agent/tools";
 import { GrepTool } from "@oh-my-pi/pi-coding-agent/tools/grep";
 import { ReadTool } from "@oh-my-pi/pi-coding-agent/tools/read";
 import { SEARCH_MATERIAL, searchReference } from "@oh-my-pi/pi-coding-agent/session/search-rewind";
@@ -145,7 +159,7 @@ async function createHarness(
 		initialMessages?: AgentMessage[];
 		shortCircuitCompaction?: boolean;
 	},
-): Promise<Harness & { mock: MockModel }> {
+): Promise<Harness & { mock: MockModel; tools: AgentTool[] }> {
 	const tempDir = TempDir.createSync("@pi-checkpoint-rewind-branch-");
 	const authStorage = await AuthStorage.create(":memory:");
 	authStorage.keys.setRuntime("mock", "test-key");
@@ -176,9 +190,11 @@ async function createHarness(
 			validateSearchRewind: input => session.validateSearchRewind(input),
 			getToolForEvalBridge: name => session.getToolForEvalBridge(name),
 			takeThinkNoteOutcome: toolCallId => session.takeThinkNoteOutcome(toolCallId),
+			rememberContextLine: line => session.rememberContextLine(line),
 		});
 		tools = [new CheckpointTool(toolSession) as AgentTool, new RewindTool(toolSession) as AgentTool, ...tools];
 		if (options.thinkNote) tools.push(new ThinkNoteTool(toolSession) as AgentTool);
+		tools.push(new RememberTool(toolSession) as AgentTool);
 		if (options.realSearchTools)
 			tools.push(new GrepTool(toolSession) as AgentTool, new ReadTool(toolSession) as AgentTool);
 	}
@@ -239,7 +255,7 @@ async function createHarness(
 	});
 	const harness = { session, authStorage, tempDir, extraSessions: [] };
 	activeHarnesses.push(harness);
-	return { ...harness, mock };
+	return { ...harness, mock, tools };
 }
 
 /** Branch with enough tokens for a manual compaction at `keepRecentTokens = 1`. */
@@ -463,6 +479,11 @@ describe("AgentSession checkpoint rewind branch context", () => {
 		expect(afterFold).toContain(nextAction);
 		expect(afterFold).not.toContain("INSTRUCTION_NEEDLE");
 		expect(afterFold).toContain("Instruction rewind point `R1`");
+		expect(afterFold).toContain("Day notes (newest last)");
+		const dayNotes = session.sessionManager
+			.getEntries()
+			.filter(entry => entry.type === "custom" && entry.customType === DAY_NOTE_CUSTOM_TYPE);
+		expect(dayNotes).toHaveLength(1);
 		expect(session.getInstructionAnchor()?.id).toBe("R1");
 		expect(session.getInstructionAnchor("R0")?.id).toBe("R0");
 		expect(() => session.validateInstructionRewind("R0", report, nextAction)).not.toThrow();
@@ -3975,4 +3996,132 @@ describe("AgentSession checkpoint rewind branch context", () => {
 		).toHaveLength(0);
 		expect(resolveInstructionAnchors(branch)).toHaveLength(0);
 	});
+
+	it("re-injects recorded lines after a compaction replaces the context", async () => {
+		const { session } = await createHarness([], [], {
+			realTools: true,
+			shortCircuitCompaction: true,
+			initialMessages: compactableSeed(),
+		});
+		expect(session.rememberContextLine("engine default must stay rust")).toMatchObject({ ok: true });
+		cfgCompactionKeepRecentTokens.set(session.settings, 1);
+		session.agent.replaceMessages(session.buildDisplaySessionContext().messages);
+
+		await session.compact();
+
+		const branch = session.sessionManager.getBranch();
+		const blocks = branch.filter(
+			entry => entry.type === "custom_message" && entry.customType === CONTEXT_MEMORY_BLOCK_MESSAGE_TYPE,
+		);
+		expect(blocks).toHaveLength(1);
+		let blockText = "";
+		for (const message of session.agent.state.messages) {
+			if (
+				message.role === "custom" &&
+				message.customType === CONTEXT_MEMORY_BLOCK_MESSAGE_TYPE &&
+				typeof message.content === "string"
+			)
+				blockText = message.content;
+		}
+		expect(blockText).toContain("engine default must stay rust");
+		const anchorIndex = branch.findIndex(
+			entry => entry.type === "custom_message" && entry.customType === INSTRUCTION_ANCHOR_MESSAGE_TYPE,
+		);
+		expect(branch.indexOf(blocks[0]!)).toBeGreaterThan(anchorIndex);
+	});
+
+	it("injects no memory block when no line was recorded", async () => {
+		const { session } = await createHarness([], [], {
+			realTools: true,
+			shortCircuitCompaction: true,
+			initialMessages: compactableSeed(),
+		});
+		cfgCompactionKeepRecentTokens.set(session.settings, 1);
+		session.agent.replaceMessages(session.buildDisplaySessionContext().messages);
+
+		await session.compact();
+
+		expect(
+			session.sessionManager
+				.getBranch()
+				.filter(entry => entry.type === "custom_message" && entry.customType === CONTEXT_MEMORY_BLOCK_MESSAGE_TYPE),
+		).toHaveLength(0);
+	});
+
+	it("renders day notes and lines into one block", () => {
+		const block = renderContextMemoryBlock(
+			[{ ts: "2026-11-11T10:00:00.000Z", text: "day one settled the build switch" }],
+			[{ ts: "2026-11-11T10:05:00.000Z", text: "engine default stays rust", chars: 24 }],
+		);
+		expect(block).toContain("Day notes");
+		expect(block).toContain("day one settled the build switch");
+		expect(block).toContain("engine default stays rust");
+		expect(renderContextMemoryBlock([], [])).toBeUndefined();
+	});
+
+	it("scopes the line budget to the current day", () => {
+		const lines = [
+			{ ts: "2026-11-10T23:00:00.000Z", text: "yesterday", chars: 9 },
+			{ ts: "2026-11-11T09:00:00.000Z", text: "today", chars: 5 },
+		];
+		expect(linesSinceDay(lines, "2026-11-11T00:00:00.000Z").map(line => line.text)).toEqual(["today"]);
+		expect(linesSinceDay(lines, undefined)).toHaveLength(2);
+	});
+
+	it("keeps only the newest four day notes in the block window", () => {
+		const notes = Array.from({ length: 8 }, (_, index) => ({
+			ts: `2026-11-1${index}T00:00:00.000Z`,
+			text: `day ${index}`,
+		}));
+		expect(recentDayNotes(notes).map(note => note.text)).toEqual(["day 4", "day 5", "day 6", "day 7"]);
+		expect(recentDayNotes(notes.slice(0, 3))).toHaveLength(3);
+	});
+
+	it("records a long-term line and reports the daily count", async () => {
+		const { session, tools } = await createHarness([], [], { realTools: true });
+		const remember = tools.find(tool => tool.name === "remember") as RememberTool;
+		const first = await remember.execute("m1", { line: "  perf gate: mach tick ×41.667 is decisive  " });
+		expect(resultText(first)).toContain("1/20");
+		const second = await remember.execute("m2", {
+			line: "Disproved: pinning the V8 API path; the runtime ships no headers",
+		});
+		expect(resultText(second)).toContain("2/20");
+		const texts: string[] = [];
+		let lineEntries = 0;
+		for (const entry of session.sessionManager.getBranch()) {
+			if (entry.type !== "custom" || entry.customType !== CONTEXT_MEMORY_LINE_CUSTOM_TYPE) continue;
+			lineEntries++;
+			const data = entry.data;
+			if (data && typeof data === "object" && "text" in data && typeof data.text === "string") texts.push(data.text);
+		}
+		expect(lineEntries).toBe(2);
+		expect(texts).toEqual([
+			"perf gate: mach tick ×41.667 is decisive",
+			"Disproved: pinning the V8 API path; the runtime ships no headers",
+		]);
+	});
+
+	it("rejects an over-long or empty line instead of truncating", async () => {
+		const { tools } = await createHarness([], [], { realTools: true });
+		const remember = tools.find(tool => tool.name === "remember") as RememberTool;
+		await expect(remember.execute("m1", { line: "x".repeat(401) })).rejects.toThrow(/hard limit is 400/);
+		await expect(remember.execute("m2", { line: "   " })).rejects.toThrow(/empty/);
+		const hinted = await remember.execute("m3", { line: "y".repeat(250) });
+		expect(resultText(hinted)).toContain("over the 200-char hint");
+	});
+
+	it("stops at the daily line budget", async () => {
+		const { session, tools } = await createHarness([], [], { realTools: true });
+		const remember = tools.find(tool => tool.name === "remember") as RememberTool;
+		for (let index = 0; index < 20; index++) await remember.execute(`m${index}`, { line: `line ${index}` });
+		await expect(remember.execute("m21", { line: "one more" })).rejects.toThrow(/20 lines this day/);
+		expect(session.rememberContextLine("after the budget")).toMatchObject({ ok: false, reason: "daily_limit" });
+	});
 });
+
+/** Result text of a tool call, narrowed without assuming an unchecked shape. */
+function resultText(result: { content: readonly { type: string; text?: string }[] }): string {
+	const block = result.content[0];
+	if (!block || block.type !== "text" || typeof block.text !== "string") throw new Error("expected a text result");
+	return block.text;
+}

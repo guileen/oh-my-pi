@@ -2774,6 +2774,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			validateInstructionRewind: (checkpointId, report, nextAction) =>
 				session.validateInstructionRewind(checkpointId, report, nextAction),
 			takeThinkNoteOutcome: toolCallId => session.takeThinkNoteOutcome(toolCallId),
+			rememberContextLine: line => session.rememberContextLine(line),
 			validateRewind: (checkpointId, report, nextAction, outcome, reason) =>
 				session.validateRewind(checkpointId, report, nextAction, outcome, reason),
 			bindCheckpointTodo: target => session.bindCheckpointTodo(target),

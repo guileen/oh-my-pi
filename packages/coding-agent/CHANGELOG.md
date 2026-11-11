@@ -9,6 +9,7 @@
 - Rewind timing is now explicit: a hidden advisory hint repeats every 12 settled tool results on the live point, and a text-only stop with at least 12 unfolded results gets one mandatory fold reminder that continues the loop once.
 - Instruction folds accept a one-line `note` in place of `report`, so a settled decision no longer needs a handoff document.
 - Added `thinknote`: it replaces the current turn's reasoning with a note that is at most a quarter of its tokens, or drops it with `note: null`, while keeping the tool output and the persisted transcript intact. Signed or encrypted reasoning is never rewritten.
+- Added `remember`: appends one long-term memory line (200-character hint, 400-character hard limit, 20 per day) as a journal entry that survives context cuts; an over-long line is rejected with a rewrite request instead of being truncated.
 
 - `/loop 100 5m` runs at most 100 turns; `/loop 6h 5m` runs for up to 6 hours. The interval starts after each turn. `--count`, `--duration`, and `--interval` can also be combined. A lone positional count retains its legacy repeat-count meaning.
 - `/stop-loop` cancels future loop iterations without interrupting the current turn, even during compaction; interactive extensions can also exit loop mode via `ctx.sessionModes.set()` while work is running.

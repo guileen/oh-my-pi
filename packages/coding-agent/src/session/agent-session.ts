@@ -418,6 +418,24 @@ import {
 	THINK_NOTE_TOKEN_RATIO,
 	type ThinkNoteDetails,
 } from "./think-note";
+import {
+	CONTEXT_MEMORY_BLOCK_MESSAGE_TYPE,
+	CONTEXT_MEMORY_LINE_CUSTOM_TYPE,
+	CONTEXT_MEMORY_LINE_HINT_CHARS,
+	CONTEXT_MEMORY_LINE_MAX_CHARS,
+	CONTEXT_MEMORY_LINES_PER_DAY,
+	DAY_NOTE_CUSTOM_TYPE,
+	DAY_NOTE_MAX_CHARS,
+	normalizeContextMemoryLine,
+	linesSinceDay,
+	parseContextMemoryLine,
+	parseDayNote,
+	recentDayNotes,
+	renderContextMemoryBlock,
+	type ContextMemoryLine,
+	type ContextMemoryRememberResult,
+	type DayNote,
+} from "./context-memory";
 import type { ClientBridge } from "./client-bridge";
 import {
 	type ClaudeResetAction,
@@ -4597,6 +4615,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			attribution: "agent",
 			timestamp,
 		});
+		const block = this.#contextMemoryBlockMessage();
+		if (block) messages.push(block);
 		return {
 			state: {
 				id: anchorId,
@@ -4667,6 +4687,44 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			{ id: anchorId },
 			"agent",
 		);
+		this.#injectContextMemoryBlock();
+	}
+
+	/** Append the memory block to the live context and the journal when it is absent. */
+	#injectContextMemoryBlock(): void {
+		const block = this.#contextMemoryBlockMessage();
+		if (!block) return;
+		this.agent.appendMessage(block);
+		this.sessionManager.appendCustomMessageEntry(
+			CONTEXT_MEMORY_BLOCK_MESSAGE_TYPE,
+			block.content,
+			false,
+			undefined,
+			"agent",
+		);
+	}
+
+	/**
+	 * Recorded lines as one block, injected once per context: a cut removes the
+	 * previous block, so the next day starts with the memory it needs.
+	 */
+	#contextMemoryBlockMessage(
+		messages: readonly AgentMessage[] = this.agent.state.messages,
+	): CustomMessage | undefined {
+		const already = messages.some(
+			message => message.role === "custom" && message.customType === CONTEXT_MEMORY_BLOCK_MESSAGE_TYPE,
+		);
+		if (already) return undefined;
+		const content = renderContextMemoryBlock(recentDayNotes(this.#dayNotes()), this.#contextMemoryLines());
+		if (!content) return undefined;
+		return {
+			role: "custom",
+			customType: CONTEXT_MEMORY_BLOCK_MESSAGE_TYPE,
+			content,
+			display: false,
+			attribution: "agent",
+			timestamp: Date.now(),
+		};
 	}
 
 	/**
@@ -4687,6 +4745,47 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		const outcome = this.#thinkNoteOutcomes.get(toolCallId);
 		this.#thinkNoteOutcomes.delete(toolCallId);
 		return outcome;
+	}
+
+	/** Append one long-term memory line for this day. */
+	rememberContextLine(raw: string): ContextMemoryRememberResult {
+		const text = normalizeContextMemoryLine(raw);
+		if (!text) return { ok: false, reason: "empty", chars: 0 };
+		if (text.length > CONTEXT_MEMORY_LINE_MAX_CHARS) return { ok: false, reason: "too_long", chars: text.length };
+		const lines = this.#contextMemoryLines();
+		const today = linesSinceDay(lines, this.#dayNotes().at(-1)?.ts);
+		if (today.length >= CONTEXT_MEMORY_LINES_PER_DAY) return { ok: false, reason: "daily_limit", chars: text.length };
+		const line: ContextMemoryLine = { ts: new Date().toISOString(), text, chars: text.length };
+		this.sessionManager.appendCustomEntry(CONTEXT_MEMORY_LINE_CUSTOM_TYPE, line);
+		lines.push(line);
+		return {
+			ok: true,
+			chars: line.chars,
+			count: lines.length,
+			hint: line.chars > CONTEXT_MEMORY_LINE_HINT_CHARS,
+		};
+	}
+
+	/** Lines in this session, in append order; abandoned branches keep theirs. */
+	#contextMemoryLines(): ContextMemoryLine[] {
+		const lines: ContextMemoryLine[] = [];
+		for (const entry of this.sessionManager.getEntries()) {
+			if (entry.type !== "custom" || entry.customType !== CONTEXT_MEMORY_LINE_CUSTOM_TYPE) continue;
+			const line = parseContextMemoryLine(entry.data);
+			if (line) lines.push(line);
+		}
+		return lines;
+	}
+
+	/** Day notes in this session, in append order. */
+	#dayNotes(): DayNote[] {
+		const notes: DayNote[] = [];
+		for (const entry of this.sessionManager.getEntries()) {
+			if (entry.type !== "custom" || entry.customType !== DAY_NOTE_CUSTOM_TYPE) continue;
+			const note = parseDayNote(entry.data);
+			if (note) notes.push(note);
+		}
+		return notes;
 	}
 
 	/**
@@ -13883,6 +13982,14 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 						"agent",
 					);
 				}
+				// The fold is the day's rewrite whether or not it cut: record it as a
+				// day note so the next day starts from what this one settled.
+				const dayNoteText = report.trim();
+				if (dayNoteText && dayNoteText.length <= DAY_NOTE_MAX_CHARS)
+					this.sessionManager.appendCustomEntry(DAY_NOTE_CUSTOM_TYPE, {
+						ts: new Date().toISOString(),
+						text: dayNoteText,
+					});
 				committedLeaf = this.sessionManager.getLeafId();
 			},
 			{
@@ -13908,6 +14015,17 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		// The cut removed any work-package anchor created inside this instruction.
 		this.#checkpointState = undefined;
 		const rebuilt = this.buildDisplaySessionContext();
+		const block = this.#contextMemoryBlockMessage(rebuilt.messages);
+		if (block) {
+			rebuilt.messages.push(block);
+			this.sessionManager.appendCustomMessageEntry(
+				CONTEXT_MEMORY_BLOCK_MESSAGE_TYPE,
+				block.content,
+				false,
+				undefined,
+				"agent",
+			);
+		}
 		if (activeMessages) activeMessages.splice(0, activeMessages.length, ...rebuilt.messages);
 		this.agent.replaceMessages(activeMessages ?? rebuilt.messages);
 		this.#advisors.resetSessionState({ preserveCost: true });

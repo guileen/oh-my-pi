@@ -208,9 +208,9 @@ line.
 | `thinknote` + marker + convert rewrite | `tools/think-note.ts`, `session/think-note.ts`, `session/messages.ts` | exists |
 | instruction points, notices, nudge, pre-yield gate | `agent-session.ts`, `session/instruction-anchor.ts` | exists |
 | QA gate + rollover | `session/session-maintenance.ts`, `session/qa-rollover.ts` | exists |
-| `remember` tool + line store | new: `tools/remember.ts`, `session/context-memory.ts` | new |
-| day-note store, rolling window, compression | `session/context-memory.ts` | new |
-| harness injection of day notes + lines | `agent-session.ts` (request assembly) | new |
+| `remember` tool + line store | `tools/remember.ts`, `session/context-memory.ts` | exists |
+| day-note store + rolling window (4 kept) | `session/context-memory.ts`, `agent-session.ts` | exists; model-driven compression at 8 not implemented |
+| harness injection of day notes + lines | `agent-session.ts` (day start, post-fold, post-compaction) | exists |
 | Δtokens / Δsteps counters | `session/context-memory.ts` | new |
 | threshold reuse | `resolveThresholdTokens`, `resolveModelCompactionSettings` | reuse |
 | prompt files | `prompts/system/rewind-skill.md` (reframe as memory), `night.md`, memory-hint | edit/new |

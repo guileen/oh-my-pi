@@ -39,6 +39,7 @@ import type { UsageStatistics } from "../session/session-entries";
 import type { SessionManager } from "../session/session-manager";
 import type { SearchRewindInput } from "../session/search-rewind";
 import type { ThinkNoteDetails } from "../session/think-note";
+import type { ContextMemoryRememberResult } from "../session/context-memory";
 import type { ToolChoiceQueue } from "../session/tool-choice-queue";
 import { TaskTool } from "../task";
 import type { AgentOutputManager } from "../task/output-manager";
@@ -63,6 +64,7 @@ import {
 import { ContextNotesTool, NewContextTool } from "./context-notes";
 import { DebugTool } from "./debug";
 import { ThinkNoteTool } from "./think-note";
+import { RememberTool } from "./remember";
 import { cfgIdaAvailable } from "../ida/install";
 import { EvalTool } from "./eval";
 import { resolveEvalBackends } from "./eval-backends";
@@ -138,6 +140,7 @@ export type {
 export * from "./browser";
 export * from "./checkpoint";
 export * from "./think-note";
+export * from "./remember";
 export * from "./computer";
 export * from "./computer/supervisor";
 export * from "./context-notes";
@@ -570,6 +573,8 @@ export interface ToolSession {
 	validateInstructionRewind?: (checkpointId: string, report: string, nextAction: string) => RewindContextEstimate;
 	/** Message-end think-note decision for one tool call, consumed by its result. */
 	takeThinkNoteOutcome?: (toolCallId: string) => ThinkNoteDetails | undefined;
+	/** Append one long-term memory line; returns the acceptance or the reason to rewrite. */
+	rememberContextLine?: (line: string) => ContextMemoryRememberResult;
 	/** Validate a work-package handoff without changing the active transcript. */
 	validateRewind?: (
 		checkpointId: string,
@@ -647,6 +652,7 @@ export const BUILTIN_TOOLS: Record<BuiltinToolName, ToolFactory> = {
 	checkpoint: CheckpointTool.createIf,
 	rewind: RewindTool.createIf,
 	thinknote: ThinkNoteTool.createIf,
+	remember: RememberTool.createIf,
 	context_notes: ContextNotesTool.createIf,
 	new_context: NewContextTool.createIf,
 	task: s => TaskTool.create(s),

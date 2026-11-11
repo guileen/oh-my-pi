@@ -37,6 +37,7 @@ export const ESSENTIAL_BUILTIN_TOOL_NAMES: Record<string, true> = {
 	checkpoint: true,
 	rewind: true,
 	thinknote: true,
+	remember: true,
 };
 
 /**
