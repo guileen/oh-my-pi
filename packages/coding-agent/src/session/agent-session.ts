@@ -419,7 +419,7 @@ import {
 	type ThinkNoteDetails,
 } from "./think-note";
 import {
-	CONTEXT_MEMORY_BLOCK_MESSAGE_TYPE,
+	CONTEXT_MEMORY_BLOCK_TAG,
 	CONTEXT_MEMORY_LINE_CUSTOM_TYPE,
 	CONTEXT_MEMORY_LINE_HINT_CHARS,
 	CONTEXT_MEMORY_LINE_MAX_CHARS,
@@ -3167,6 +3167,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		// the transcript at message end is absent from the current tool loop. Rewrite
 		// the converted request instead, matching the assistant by its tool call.
 		this.addDisposer(this.agent.addBeforeModelCall(context => this.#rewriteThinkNotesInRequest(context)));
+		this.addDisposer(this.agent.addBeforeModelCall(context => this.#injectMemoryBlockIntoRequest(context)));
 		// A request past the cap mid-run stops the run before it is sent: no turn opens, nothing is billed.
 		// The gate is registered only while a cap is set, avoiding an unnecessary
 		// admission check on every provider request.
@@ -4615,8 +4616,6 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			attribution: "agent",
 			timestamp,
 		});
-		const block = this.#contextMemoryBlockMessage();
-		if (block) messages.push(block);
 		return {
 			state: {
 				id: anchorId,
@@ -4687,44 +4686,6 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			{ id: anchorId },
 			"agent",
 		);
-		this.#injectContextMemoryBlock();
-	}
-
-	/** Append the memory block to the live context and the journal when it is absent. */
-	#injectContextMemoryBlock(): void {
-		const block = this.#contextMemoryBlockMessage();
-		if (!block) return;
-		this.agent.appendMessage(block);
-		this.sessionManager.appendCustomMessageEntry(
-			CONTEXT_MEMORY_BLOCK_MESSAGE_TYPE,
-			block.content,
-			false,
-			undefined,
-			"agent",
-		);
-	}
-
-	/**
-	 * Recorded lines as one block, injected once per context: a cut removes the
-	 * previous block, so the next day starts with the memory it needs.
-	 */
-	#contextMemoryBlockMessage(
-		messages: readonly AgentMessage[] = this.agent.state.messages,
-	): CustomMessage | undefined {
-		const already = messages.some(
-			message => message.role === "custom" && message.customType === CONTEXT_MEMORY_BLOCK_MESSAGE_TYPE,
-		);
-		if (already) return undefined;
-		const content = renderContextMemoryBlock(recentDayNotes(this.#dayNotes()), this.#contextMemoryLines());
-		if (!content) return undefined;
-		return {
-			role: "custom",
-			customType: CONTEXT_MEMORY_BLOCK_MESSAGE_TYPE,
-			content,
-			display: false,
-			attribution: "agent",
-			timestamp: Date.now(),
-		};
 	}
 
 	/**
@@ -4761,7 +4722,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		return {
 			ok: true,
 			chars: line.chars,
-			count: lines.length,
+			count: today.length + 1,
 			hint: line.chars > CONTEXT_MEMORY_LINE_HINT_CHARS,
 		};
 	}
@@ -4817,6 +4778,23 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		};
 		this.agent.appendMessage(marker);
 		this.#pendingThinkNotes.set(message, marker);
+	}
+
+	/**
+	 * Push current memory into every request: day notes must never be frozen at
+	 * the first render, and the model never asks for them. The block is appended
+	 * as the request's own tail, so the conversation prefix stays cacheable.
+	 */
+	#injectMemoryBlockIntoRequest(context: Context): void {
+		const content = renderContextMemoryBlock(recentDayNotes(this.#dayNotes()), this.#contextMemoryLines());
+		const kept = context.messages.filter(
+			message => typeof message.content !== "string" || !message.content.includes(CONTEXT_MEMORY_BLOCK_TAG),
+		);
+		if (!content) {
+			if (kept.length !== context.messages.length) context.messages = kept;
+			return;
+		}
+		context.messages = [...kept, { role: "user", content, timestamp: Date.now() }];
 	}
 
 	#rewriteThinkNotesInRequest(context: Context): void {
@@ -13985,10 +13963,13 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				// The fold is the day's rewrite whether or not it cut: record it as a
 				// day note so the next day starts from what this one settled.
 				const dayNoteText = report.trim();
-				if (dayNoteText && dayNoteText.length <= DAY_NOTE_MAX_CHARS)
+				if (dayNoteText)
 					this.sessionManager.appendCustomEntry(DAY_NOTE_CUSTOM_TYPE, {
 						ts: new Date().toISOString(),
-						text: dayNoteText,
+						text:
+							dayNoteText.length <= DAY_NOTE_MAX_CHARS
+								? dayNoteText
+								: `${dayNoteText.slice(0, DAY_NOTE_MAX_CHARS - 12)} [truncated]`,
 					});
 				committedLeaf = this.sessionManager.getLeafId();
 			},
@@ -14015,17 +13996,6 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		// The cut removed any work-package anchor created inside this instruction.
 		this.#checkpointState = undefined;
 		const rebuilt = this.buildDisplaySessionContext();
-		const block = this.#contextMemoryBlockMessage(rebuilt.messages);
-		if (block) {
-			rebuilt.messages.push(block);
-			this.sessionManager.appendCustomMessageEntry(
-				CONTEXT_MEMORY_BLOCK_MESSAGE_TYPE,
-				block.content,
-				false,
-				undefined,
-				"agent",
-			);
-		}
 		if (activeMessages) activeMessages.splice(0, activeMessages.length, ...rebuilt.messages);
 		this.agent.replaceMessages(activeMessages ?? rebuilt.messages);
 		this.#advisors.resetSessionState({ preserveCost: true });

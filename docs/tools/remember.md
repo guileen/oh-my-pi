@@ -33,7 +33,7 @@ Each accepted line is persisted as a `context-memory-line` custom entry in the s
 
 The tool never cuts, rewrites, merges or deletes a line. Curation is initiated by the harness, not by the model.
 
-After a fold or a compaction replaces the context, the harness injects the stored lines together with the last four day notes as one `context-memory-block` notice at the new day start. The block is created once per context: the next cut removes it and the next day re-creates it, so recorded lines survive without a retrieval step.
+The harness appends the stored lines together with the last four day notes to every request as one `<system-notice>` block. The block is never journaled and is rendered from current state, so it cannot freeze at its first render; the conversation prefix stays cacheable because the block sits at the request tail.
 
 ## Source
 

@@ -22,7 +22,6 @@ import {
 	resolveInstructionAnchors,
 } from "@oh-my-pi/pi-coding-agent/session/instruction-anchor";
 import {
-	CONTEXT_MEMORY_BLOCK_MESSAGE_TYPE,
 	CONTEXT_MEMORY_LINE_CUSTOM_TYPE,
 	DAY_NOTE_CUSTOM_TYPE,
 	linesSinceDay,
@@ -3997,55 +3996,33 @@ describe("AgentSession checkpoint rewind branch context", () => {
 		expect(resolveInstructionAnchors(branch)).toHaveLength(0);
 	});
 
-	it("re-injects recorded lines after a compaction replaces the context", async () => {
-		const { session } = await createHarness([], [], {
-			realTools: true,
-			shortCircuitCompaction: true,
-			initialMessages: compactableSeed(),
-		});
-		expect(session.rememberContextLine("engine default must stay rust")).toMatchObject({ ok: true });
-		cfgCompactionKeepRecentTokens.set(session.settings, 1);
-		session.agent.replaceMessages(session.buildDisplaySessionContext().messages);
+	it("refreshes the memory block on the next day instead of freezing the first render", async () => {
+		const responses = (async function* () {
+			yield {
+				content: [
+					{
+						type: "toolCall",
+						id: "fold_day_one",
+						name: "rewind",
+						arguments: { checkpointId: "R0", report: "day one settled the guard", nextAction: "continue" },
+					},
+				],
+				stopReason: "toolUse" as const,
+			};
+			yield { content: ["First day done."], stopReason: "stop" as const };
+			yield { content: ["Second day done."], stopReason: "stop" as const };
+		})() as MockResponseSource;
+		const { session, mock } = await createHarness(responses, [], { realTools: true });
 
-		await session.compact();
+		await session.prompt("First task.");
+		expect(session.rememberContextLine("engine default stays rust")).toMatchObject({ ok: true });
+		await session.prompt("Second task.");
 
-		const branch = session.sessionManager.getBranch();
-		const blocks = branch.filter(
-			entry => entry.type === "custom_message" && entry.customType === CONTEXT_MEMORY_BLOCK_MESSAGE_TYPE,
-		);
-		expect(blocks).toHaveLength(1);
-		let blockText = "";
-		for (const message of session.agent.state.messages) {
-			if (
-				message.role === "custom" &&
-				message.customType === CONTEXT_MEMORY_BLOCK_MESSAGE_TYPE &&
-				typeof message.content === "string"
-			)
-				blockText = message.content;
-		}
-		expect(blockText).toContain("engine default must stay rust");
-		const anchorIndex = branch.findIndex(
-			entry => entry.type === "custom_message" && entry.customType === INSTRUCTION_ANCHOR_MESSAGE_TYPE,
-		);
-		expect(branch.indexOf(blocks[0]!)).toBeGreaterThan(anchorIndex);
-	});
-
-	it("injects no memory block when no line was recorded", async () => {
-		const { session } = await createHarness([], [], {
-			realTools: true,
-			shortCircuitCompaction: true,
-			initialMessages: compactableSeed(),
-		});
-		cfgCompactionKeepRecentTokens.set(session.settings, 1);
-		session.agent.replaceMessages(session.buildDisplaySessionContext().messages);
-
-		await session.compact();
-
-		expect(
-			session.sessionManager
-				.getBranch()
-				.filter(entry => entry.type === "custom_message" && entry.customType === CONTEXT_MEMORY_BLOCK_MESSAGE_TYPE),
-		).toHaveLength(0);
+		const secondRequest = mock.calls[2]!.context.messages.map(messageText).join("\n");
+		// The new line is pushed on the next request, and the block appears once.
+		expect(secondRequest.split("engine default stays rust")).toHaveLength(2);
+		expect(secondRequest.split("Long-term memory recorded earlier")).toHaveLength(2);
+		expect(secondRequest).toContain("day one settled the guard");
 	});
 
 	it("renders day notes and lines into one block", () => {

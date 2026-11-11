@@ -100,8 +100,8 @@ runaway text.
 
 | Artifact | Written by | Injected by | Growth | Lifetime |
 | --- | --- | --- | --- | --- |
-| day note | model, at night | harness, at the next day | 1 per day | keep 4 days; compress at 8 |
-| line | model, during the day, as a `remember` tool call in the stream | harness, at the next night, as a block | append-only | session |
+| day note | model, at night | harness, on every request (newest four) | 1 per day | keep 4 days; compress at 8 |
+| line | model, during the day, as a `remember` tool call in the stream | harness, on every request, at the tail | append-only | session |
 | pinned source | model | as part of the cut | per pin | branch |
 | work package | model | as a tool result | stack ≤ 32 | until closed |
 
@@ -210,7 +210,7 @@ line.
 | QA gate + rollover | `session/session-maintenance.ts`, `session/qa-rollover.ts` | exists |
 | `remember` tool + line store | `tools/remember.ts`, `session/context-memory.ts` | exists |
 | day-note store + rolling window (4 kept) | `session/context-memory.ts`, `agent-session.ts` | exists; model-driven compression at 8 not implemented |
-| harness injection of day notes + lines | `agent-session.ts` (day start, post-fold, post-compaction) | exists |
+| harness injection of day notes + lines | `agent-session.ts` (`#injectMemoryBlockIntoRequest`) | exists |
 | Δtokens / Δsteps counters | `session/context-memory.ts` | new |
 | threshold reuse | `resolveThresholdTokens`, `resolveModelCompactionSettings` | reuse |
 | prompt files | `prompts/system/rewind-skill.md` (reframe as memory), `night.md`, memory-hint | edit/new |
