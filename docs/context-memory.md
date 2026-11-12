@@ -126,7 +126,9 @@ Two quantities, both measured from the day start:
 | **Δsteps** | settled tool results since the day began | pace |
 
 Both are derived from session entries after the last day note (`AgentSession.#dayStats`)
-and rendered in the injected block, so the model sees its own pace without asking.
+and appended to cut-point reminders (`#memoryFeedbackSuffix`), never to the injected
+block: the block sits inside the cacheable prefix and must stay stable for a retained
+rewind prefix.
 
 Safety is a different quantity: **absolute context** compared against the existing
 compaction threshold. Overflow is a function of the absolute size, not of the increment.
@@ -164,11 +166,11 @@ max = 398.
 Feedback is a hint, not a verdict. It states counts and times; it never recommends an
 action, because a recommendation can silently change the task.
 
-- Tips attach to the injected memory block, not to individual tool results: the block is
-  re-rendered from session state on every request, so counts stay current without
-  rewriting a tool result after the fact.
+- Tips attach to cut-point reminders (the mid-run nudge and the pre-yield demand), not to
+  individual tool results and not to the injected memory block: the block must stay
+  byte-identical within a retained rewind prefix.
 - Repeated command: when the same normalized command runs ≥ 3 times in the window, the
-  block lists `executed 27 times · 3 of the last 5 failed`.
+  reminder lists `executed 27 times · 3 of the last 5 failed`.
 - Exit codes MUST NOT be a hard rule. The model reads the counts and decides.
 - No reasoning-length signal. The behavioral signal for idling is **Δsteps stalled while
   Δtokens grows**, which is independent of the user's effort setting.
@@ -218,8 +220,8 @@ line.
 | `remember` tool + line store | `tools/remember.ts`, `session/context-memory.ts` | exists |
 | day-note store + rolling window (4 kept) | `session/context-memory.ts`, `agent-session.ts` | exists; merge notice at 8, model merges on the next fold |
 | harness injection of day notes + lines | `agent-session.ts` (`#injectMemoryBlockIntoRequest`) | exists |
-| day pace counters (Δtokens / Δsteps) | `agent-session.ts` (`#dayStats`), rendered in the block | exists |
-| command history facts | `session/context-memory.ts` (`summarizeCommandRuns`), rendered in the block | exists |
+| day pace counters (Δtokens / Δsteps) | `agent-session.ts` (`#dayStats`), cut-point reminders | exists |
+| command history facts | `session/context-memory.ts` (`summarizeCommandRuns`), cut-point reminders | exists |
 | curation notices (bank near limit, day notes over window) | `session/context-memory.ts` (`renderContextMemoryBlock`) | exists |
 | threshold reuse | `resolveThresholdTokens`, `resolveModelCompactionSettings` | reuse |
 | prompt files | `prompts/system/rewind-skill.md` (reframe as memory), `night.md`, memory-hint | edit/new |
