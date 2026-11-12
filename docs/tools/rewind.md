@@ -50,8 +50,8 @@ Points are reusable and chained. The notice entry is the cut boundary, so a used
 
 Two runtime timings apply while `checkpoint.enabled` is on and `rewind` is available:
 
-- **Mid-run (advisory).** A hidden hint fires every 12 settled tool results on the point (12, 24, 36, …), naming the point, the count and the call. It never repeats immediately; the next hint comes after another 12 settled results, so a completed observation fold does not silence the rest of a long turn.
-- **Pre-yield (mandatory).** At a text-only stop, if the point still has at least 12 settled results and no fold was completed for it, the runtime injects one mandatory reminder and continues the loop once. A completed observation fold satisfies it; a declined reminder yields to the user instead of looping. The demand carries the same 4,096-token report budget.
+- **Mid-run (advisory).** One hidden hint fires when the point spans 250 settled tool results, and only once: a day that is still producing must not be nudged into a handoff. The hint asks for progress — finish, or fold with what changed — and mentions `remember` for a settled fact.
+- **Pre-yield (mandatory).** At a text-only stop, if the point spans at least 250 settled results and no fold was completed for it, the runtime injects one reminder and continues the loop once. It says to answer only when the task is done or blocked; otherwise fold with the progress and keep working. A declined reminder yields to the user instead of looping. The demand carries the same 4,096-token report budget.
 - **Rollover precedence.** While the point has at least 12 settled results and no completed fold, a QA `new_context` rollover is refused with `QA_REWIND_FOLD_REQUIRED`: fold first, then checkpoint. The hard context report is the exception, because rewind is unavailable there. Rollover rewrites the branch, so evidence not folded first cannot be recovered afterwards.
 
 The advisory hint costs ~55 text tokens per fire; the pre-yield demand fires at most once per point. A fold recorded without a net-benefit cut still satisfies all three timings; the report stays in the rewind result.

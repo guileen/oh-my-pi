@@ -6,8 +6,8 @@ import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import {
+	DAY_STEP_BUDGET,
 	MID_RUN_REWIND_NUDGE_MESSAGE_TYPE,
-	REWIND_NUDGE_TOOL_RESULT_THRESHOLD,
 } from "@oh-my-pi/pi-coding-agent/session/instruction-anchor";
 import type { CustomMessage } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
@@ -20,7 +20,7 @@ import { createInMemoryAuthStorage } from "./helpers/agent-session-setup";
  * folded. This defends the observable contract of the aside:
  *
  *   1. It only fires while a point is live and after
- *      {@link REWIND_NUDGE_TOOL_RESULT_THRESHOLD} settled tool results.
+ *      {@link DAY_STEP_BUDGET} settled tool results, once per point.
  *   2. It is hidden (`display: false`) and model-only.
  *   3. It fires at most once per point; a new instruction re-arms it.
  *   4. Disabled checkpoints mean no point and no hint.
@@ -48,7 +48,7 @@ describe("AgentSession mid-run rewind nudge", () => {
 	let session: AgentSession;
 	let asideProvider: ((boundary: AsideBoundary) => AsideMessage[] | Promise<AsideMessage[]>) | undefined;
 
-	const THRESHOLD = REWIND_NUDGE_TOOL_RESULT_THRESHOLD;
+	const THRESHOLD = DAY_STEP_BUDGET;
 	const NUDGE_TYPE = MID_RUN_REWIND_NUDGE_MESSAGE_TYPE;
 
 	function toolUseAssistant(toolName: string): AssistantMessage {
@@ -165,7 +165,7 @@ describe("AgentSession mid-run rewind nudge", () => {
 		expect(await drainNudges()).toEqual([]);
 	});
 
-	it("re-offers the fold every threshold of settled results on the same point", async () => {
+	it("reminds once per point when the day budget is spent", async () => {
 		createSession(true);
 		await emitUser("fix a");
 		for (let i = 0; i < THRESHOLD; i++) emitToolResult("grep");
@@ -181,14 +181,9 @@ describe("AgentSession mid-run rewind nudge", () => {
 
 		// The poll right after firing must not re-inject.
 		expect(await drainNudges()).toEqual([]);
-		// Below the next boundary the aside stays quiet.
-		for (let i = THRESHOLD; i < THRESHOLD * 2 - 1; i++) emitToolResult("read");
+		// A still-producing day is not nagged again: no second reminder.
+		for (let i = THRESHOLD; i < THRESHOLD * 2; i++) emitToolResult("read");
 		expect(await drainNudges()).toEqual([]);
-		// Another threshold of settled work re-offers the same point.
-		emitToolResult("read");
-		const again = await drainNudges();
-		expect(again.length).toBe(1);
-		expect(again[0]?.content).toContain("`R0`");
 	});
 
 	it("re-arms for the next instruction", async () => {

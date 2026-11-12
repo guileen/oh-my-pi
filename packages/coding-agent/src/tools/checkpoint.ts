@@ -78,7 +78,9 @@ const rewindSchema = type({
 	"demote?": type({ ref: "string", note: "string" })
 		.array()
 		.describe("replace retained source with a concise fact and its location"),
-	nextAction: type("string").describe("one concrete continuation, e.g. Located the entry point; follow its caller"),
+	"nextAction?": type("string").describe(
+		"one concrete continuation, e.g. Located the entry point; follow its caller; omit on an instruction fold that ends the turn",
+	),
 });
 
 type RewindParams = typeof rewindSchema.infer;
@@ -232,7 +234,8 @@ export class RewindTool implements AgentTool<typeof rewindSchema, RewindToolDeta
 				retain: params.retain,
 				release: params.release,
 				demote: params.demote,
-				nextAction: params.nextAction,
+				// Observation folds still require an action at runtime; validateSearchRewind rejects empty.
+				nextAction: params.nextAction?.trim() ?? "",
 			};
 			if (
 				params.read &&
@@ -302,12 +305,14 @@ export class RewindTool implements AgentTool<typeof rewindSchema, RewindToolDeta
 				params.outcome !== undefined ||
 				params.reason !== undefined
 			)
-				throw new ToolError("Instruction rewind accepts only report or note, plus nextAction.");
+				throw new ToolError("Instruction rewind accepts only report or note, plus optional nextAction.");
 			if (params.report !== undefined && params.note !== undefined)
 				throw new ToolError("Instruction rewind accepts report or note, not both.");
 			const report = (params.note ?? params.report)?.trim() ?? "";
-			const nextAction = params.nextAction.trim();
-			if (!report || !nextAction) throw new ToolError("report (or note) and nextAction must be nonempty.");
+			// An instruction fold may be the turn's final act: the answer is already
+			// delivered, so requiring a "next concrete action" would fabricate one.
+			const nextAction = params.nextAction?.trim() ?? "";
+			if (!report) throw new ToolError("report (or note) must be nonempty.");
 			if (!this.session.validateInstructionRewind)
 				throw new ToolError("Instruction rewind requires a live session.");
 			const estimate = this.session.validateInstructionRewind(params.checkpointId, report, nextAction);
@@ -365,7 +370,7 @@ export class RewindTool implements AgentTool<typeof rewindSchema, RewindToolDeta
 			throw new ToolError("Checkpoint ID does not match the active work package. Use its returned checkpointId.");
 		}
 		const report = params.report.trim();
-		const nextAction = params.nextAction.trim();
+		const nextAction = params.nextAction?.trim() ?? "";
 		if (!report || !nextAction) {
 			throw new ToolError("report and nextAction must be nonempty.");
 		}

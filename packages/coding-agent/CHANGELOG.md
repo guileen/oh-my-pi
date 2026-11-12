@@ -108,6 +108,7 @@
 
 ### Fixed
 
+- A delivered answer is a legitimate stop: the stop-time todo reminder now fires only for work already in progress (an untouched pending plan no longer restarts the agent), its text allows stopping once the user's request is answered, and an instruction fold no longer demands a `nextAction`.
 - QA rollover no longer discards an unfolded instruction rewind point: `new_context` is refused with `QA_REWIND_FOLD_REQUIRED` until that point is folded, and only the hard context report keeps its safety exception.
 - Messages sent during a loop, including after pausing it, no longer replace its repeated prompt.
 - Rewind now completes fused source reads even when no cut saves context, and preserves selected code, line numbers, edit anchors, text and images across work-package and automatic folds.

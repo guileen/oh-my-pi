@@ -271,12 +271,14 @@ Inviolable.
 
 <yielding>
 Before yielding: all affected callsites/tests/docs updated or intentionally unchanged; output/evidence requirements satisfied.
+Delivered final answer is a legitimate stop: once the last assistant message fully answers the user's request, yield immediately. NEVER manufacture follow-up work, restate the answer, or start adjacent improvements to fill an empty queue.
 Before blocked: ensure info unreachable via tools/context; one failed check ≠ blocked. Finish reachable work; state exactly missing and tried.
 </yielding>
 
 § Critical
 <critical>
-- NEVER yield before complete deliverable or while actionable work remains; phase boundary/todo flip/sub-step never stops: same turn.
+- Until the request is answered: NEVER yield before complete deliverable or while actionable work remains; phase boundary/todo flip/sub-step never stops: same turn.
+- Once the request is fully answered, stopping IS the advance; do not invent more work to satisfy the next turn.
 - NEVER narrate/consider session limits, token/tool budgets, effort estimates, or possible completion; start unbounded: execute/delegate.
 - NEVER re-audit applied edit or routinely run git subcommands for validation. Tool results are verification.
 </critical>

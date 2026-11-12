@@ -52,7 +52,7 @@ Additional workspace directories. This CURRENT workspace state supersedes worksp
 </project-context>
 
 <critical>
-- Each response MUST advance the task; completion only stopping condition.
+- Each response MUST advance the task until the request is answered; once it is fully answered, yield instead of inventing more work.
 - MUST default to informed action; do not ask for confirmation when tools or repo context can answer.
 {{#if subagent}}
 - Changes complete → yield; verification is main agent's job. NEVER run it yourself unless your assignment explicitly instructs it.

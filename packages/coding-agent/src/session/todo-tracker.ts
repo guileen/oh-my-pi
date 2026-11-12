@@ -259,14 +259,15 @@ export class TodoTracker {
 			this.#reminderAwaitingProgress = false;
 			return false;
 		}
+		// Only work that is actually in flight arms the stop-time reminder. A pending
+		// plan is not evidence of an unfinished answer: after delivering, an agent that
+		// leaves untouched leftovers must be allowed to stop instead of being pushed
+		// into work the user never asked for.
 		const incompleteByPhase = phases
 			.map(phase => ({
 				name: phase.name,
 				tasks: phase.tasks
-					.filter(
-						(task): task is TodoItem & { status: "pending" | "in_progress" } =>
-							task.status === "pending" || task.status === "in_progress",
-					)
+					.filter((task): task is TodoItem & { status: "in_progress" } => task.status === "in_progress")
 					.map(task => ({ content: task.content, status: task.status })),
 			}))
 			.filter(phase => phase.tasks.length > 0);
@@ -295,7 +296,7 @@ export class TodoTracker {
 		const reminder =
 			`<system-reminder>\n` +
 			`You stopped with ${incomplete.length} incomplete todo item(s):\n${todoList}\n\n` +
-			`Please continue working on these tasks or mark them complete if finished.\n` +
+			`If your last message already fully answers the user's request, mark these items done or dropped and stop; do NOT invent follow-up work. Otherwise continue the in-progress work.\n` +
 			`(Reminder ${this.#reminderCount}/${remindersMax})\n` +
 			`</system-reminder>`;
 		logger.debug("Todo completion: sending reminder", {

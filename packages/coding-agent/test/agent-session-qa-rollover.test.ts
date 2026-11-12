@@ -17,6 +17,7 @@ import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AgentSession, type AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { cfgCompactionThresholdTokens } from "@oh-my-pi/pi-coding-agent/session/context-settings";
+import { QA_FOLD_GATE_RESULTS } from "@oh-my-pi/pi-coding-agent/session/instruction-anchor";
 import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
 import {
 	QA_CHECKPOINT_ENTRY_TYPE,
@@ -499,7 +500,7 @@ describe("AgentSession cooperative QA rollover", () => {
 		};
 		const h = await createHarness(
 			[
-				...Array.from({ length: 12 }, () => rememberCycle),
+				...Array.from({ length: QA_FOLD_GATE_RESULTS }, () => rememberCycle),
 				checkpointWithCycle,
 				request => {
 					// The settled point owns the boundary: rollover is refused, not queued.

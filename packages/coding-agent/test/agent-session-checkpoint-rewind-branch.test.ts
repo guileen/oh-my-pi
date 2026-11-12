@@ -17,6 +17,7 @@ import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { cfgCompactionKeepRecentTokens } from "@oh-my-pi/pi-coding-agent/session/context-settings";
 import {
+	DAY_STEP_BUDGET,
 	INSTRUCTION_ANCHOR_MESSAGE_TYPE,
 	REWIND_SKILL_MESSAGE_TYPE,
 	resolveInstructionAnchors,
@@ -3918,7 +3919,7 @@ describe("AgentSession checkpoint rewind branch context", () => {
 	});
 
 	it("demands one fold before yielding when the point still carries exploration", async () => {
-		const rounds = 12;
+		const rounds = DAY_STEP_BUDGET;
 		const responses: MockResponseSource = [
 			...Array.from({ length: rounds }, (_, index) => ({
 				content: [{ type: "toolCall" as const, id: `probe_${index}`, name: "probe", arguments: {} }],

@@ -17,8 +17,19 @@ export const INSTRUCTION_REWIND_KIND = "instruction-rewind";
 /** Hidden aside reminding the model that a point is still waiting after heavy tool work. */
 export const MID_RUN_REWIND_NUDGE_MESSAGE_TYPE = "mid-run-rewind-nudge";
 
-/** Settled tool results after a point before the aside offers a fold. */
-export const REWIND_NUDGE_TOOL_RESULT_THRESHOLD = 12;
+/**
+ * Settled tool results a day may spend before the runtime asks for progress.
+ * Derived from three real sessions: results between cuts p50 151–209, p90 241–279.
+ * Below this the runtime stays silent: a day is not "over" just because it is long.
+ */
+export const DAY_STEP_BUDGET = 250;
+
+/**
+ * Unfolded results that block a QA rollover. This is a safety gate, not pacing:
+ * rollover is requested by the model under context pressure, and it discards the
+ * evidence the fold would keep.
+ */
+export const QA_FOLD_GATE_RESULTS = 12;
 
 /** Live state for an instruction point. Not serialized; recovery reads notice entries. */
 export interface InstructionAnchorState {

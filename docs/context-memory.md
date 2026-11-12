@@ -149,8 +149,7 @@ to stop a catastrophic failure, not to shape normal behavior. Exceeding a limit 
 | Budget | Measured | Value | On exceed |
 | --- | --- | --- | --- |
 | context | absolute tokens | `resolveThresholdTokens(...)` | night |
-| day pace (hint) | Δsteps | 250 | soft tip (§9) |
-| day pace (strong) | Δsteps | 400 | night, with a note |
+| day pace | Δsteps | 250 (one reminder) | soft tip (§9) |
 | day note size | tokens after generation | same threshold function's prompt budget | reject + target, regenerate; if still over, truncate and mark |
 | lines per day | count | 20 | ask the model to select or merge |
 | line length | characters | hint 200, hard 400 | tool error, rewrite |

@@ -1,8 +1,9 @@
 <system-notice>
-You are about to answer. Instruction point `{{anchorId}}` still spans {{toolResults}} settled tool results and was not folded.
+The day's step budget is spent and you are about to answer. Point `{{anchorId}}` spans {{toolResults}} settled tool results.
 
-Fold it before answering:
-`rewind({"checkpointId":"{{anchorId}}","report":"…","nextAction":"…"})`
+Answer only if the task is done or genuinely blocked. Otherwise this is not a handoff:
+- Fold once with a report naming what changed, the evidence and the next step: `rewind({"checkpointId":"{{anchorId}}","report":"…"})`.
+- Then keep working.
 
-`report`: resolved decisions, `file:line` evidence and rejected directions. `nextAction`: what follows the fold, for example reporting the result. The instruction, report, selected evidence and receipts stay; exploration leaves. A fold with no net savings still records the decision without replacing history.
+A fold with no net savings still records the decision. If the day produced nothing new, say so plainly instead of presenting activity as progress.
 </system-notice>

@@ -29,9 +29,9 @@ Failed browser action returned `o3`, text `Connection refused` and an image; kee
 
 ## Instruction point
 
-- Every user instruction opens a point (`R0`, `R1`, …) advertised in the request. `rewind({checkpointId, report, nextAction})` replaces exploration after that point with the report; the instruction, report, selected materials, receipts and todo state stay. No `outcome`, `note`, `keep`/`retain`, `read`, `release` or `demote` fields.
+- Every user instruction opens a point (`R0`, `R1`, …) advertised in the request. `rewind({checkpointId, report, nextAction?})` replaces exploration after that point with the report; the instruction, report, selected materials, receipts and todo state stay. Omit `nextAction` when the fold ends the turn with the final answer; supply it only when work continues. No `outcome`, `note`, `keep`/`retain`, `read`, `release` or `demote` fields.
 - Use it once the question is resolved and before the answer. Every completed fold opens the next point at the retained position; earlier points stay valid and may be reused. A later user instruction, compaction or reset invalidates earlier points; fold summaries never do. No net savings rejects the fold; keep working instead.
-- A hidden hint names one point once it spans 12 settled tool results. Treat it as a signal, not a schedule: fold when the next step no longer needs that raw output, and keep working when it does.
+- A hidden hint names one point once it spans 250 settled tool results (the day budget), and only once. Treat it as a signal, not a schedule: finish, or fold with what changed and keep working. Do not hand off just because a day is long.
 
 ## Work package
 
@@ -43,4 +43,4 @@ Failed browser action returned `o3`, text `Connection refused` and an image; kee
 ## After either mode
 
 - Rewind changes context, never files, external effects or authoritative todo history; it never undoes or replays actions. Parent cuts replace child traces and summaries when beneficial. Cache eligibility is an estimate, not a hit; only usage confirms caching.
-- After success, execute `nextAction` from retained context and any delivered reads. Reopen evidence only for missing detail, changed sources, or contradiction.
+- After success, execute `nextAction` from retained context and any delivered reads. When the fold had no `nextAction`, yield; do not derive work from the report. Reopen evidence only for missing detail, changed sources, or contradiction.

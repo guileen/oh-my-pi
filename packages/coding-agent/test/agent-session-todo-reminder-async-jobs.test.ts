@@ -109,7 +109,7 @@ describe("AgentSession todo reminder async-job deferral", () => {
 			{
 				name: "Pending review",
 				tasks: [
-					{ content: "Slice 81", status: "pending" },
+					{ content: "Slice 81", status: "in_progress" },
 					{ content: "Slice 82", status: "pending" },
 				],
 			},

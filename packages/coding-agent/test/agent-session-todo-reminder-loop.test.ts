@@ -105,7 +105,7 @@ describe("AgentSession todo reminder self-continuation suppression", () => {
 			if (!Array.isArray(content)) return false;
 			return content.some(
 				(item): item is TextContent =>
-					item.type === "text" && item.text.includes("You stopped with 2 incomplete todo item(s):"),
+					item.type === "text" && item.text.includes("You stopped with 1 incomplete todo item(s):"),
 			);
 		});
 	}
@@ -158,7 +158,7 @@ describe("AgentSession todo reminder self-continuation suppression", () => {
 			{
 				name: "Pending review",
 				tasks: [
-					{ content: "Slice 81", status: "pending" },
+					{ content: "Slice 81", status: "in_progress" },
 					{ content: "Slice 82", status: "pending" },
 				],
 			},
@@ -181,6 +181,28 @@ describe("AgentSession todo reminder self-continuation suppression", () => {
 
 		const reminderEntry = todoReminderTranscriptEntry();
 		expect(reminderEntry?.type).toBe("message");
+	});
+
+	it("stays silent when every remaining todo is still pending (planned but not started)", async () => {
+		session.setTodoPhases([
+			{
+				name: "Pending review",
+				tasks: [
+					{ content: "Slice 81", status: "pending" },
+					{ content: "Slice 82", status: "pending" },
+				],
+			},
+		]);
+		const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue();
+
+		emitTextOnlyStop();
+		await session.waitForIdle();
+
+		// A delivered answer with an untouched plan is not unfinished work; pushing
+		// the agent into it manufactures follow-up the user never asked for.
+		expect(reminderAttempts).toEqual([]);
+		expect(todoReminderTranscriptEntry()).toBeUndefined();
+		expect(continueSpy).not.toHaveBeenCalled();
 	});
 
 	it("stays silent when todo is not in the active roster", async () => {

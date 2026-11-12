@@ -116,6 +116,15 @@ describe("instruction rewind through the session tool bridge", () => {
 		});
 	});
 
+	it("accepts an instruction fold with no nextAction when the answer is delivered", async () => {
+		const opened = await openSessionWithPoint("R0");
+		const result = await rewindTool(opened).execute("call-no-next", {
+			checkpointId: "R0",
+			report: "diagnosis delivered; no follow-up work requested",
+		});
+		expect(result.details).toMatchObject({ instructionAnchor: true, checkpointId: "R0" });
+	});
+
 	it("rejects an id that is not on the branch as a stale point", async () => {
 		const opened = await openSessionWithPoint("R0");
 		await expect(

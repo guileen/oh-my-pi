@@ -405,7 +405,8 @@ import {
 	INSTRUCTION_REWIND_KIND,
 	instructionAnchorSequence,
 	MID_RUN_REWIND_NUDGE_MESSAGE_TYPE,
-	REWIND_NUDGE_TOOL_RESULT_THRESHOLD,
+	DAY_STEP_BUDGET,
+	QA_FOLD_GATE_RESULTS,
 	REWIND_SKILL_MESSAGE_TYPE,
 	resolveInstructionAnchor,
 	type InstructionAnchorState,
@@ -4700,7 +4701,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	#pendingInstructionFold(): { anchorId: string; toolResults: number } | undefined {
 		if (!cfgCheckpointEnabled.get(this.settings) || !this.getEnabledToolNames().includes("rewind")) return undefined;
 		const anchor = this.getInstructionAnchor();
-		if (!anchor || anchor.toolResults < REWIND_NUDGE_TOOL_RESULT_THRESHOLD) return undefined;
+		if (!anchor || anchor.toolResults < QA_FOLD_GATE_RESULTS) return undefined;
 		if (this.#rewindFoldedAnchorId === anchor.id) return undefined;
 		return { anchorId: anchor.id, toolResults: anchor.toolResults };
 	}
@@ -4911,18 +4912,16 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	}
 
 	/**
-	 * Hidden aside offering a fold once enough tool output has accumulated after
-	 * the live instruction point. It repeats every threshold of settled results,
-	 * so a long turn is re-offered the fold instead of being hinted once. The
-	 * hint is advisory — the model may judge the output still needed.
+	 * One reminder when the day's step budget is spent. It is deliberately not
+	 * repeated: a day that is still producing must not be nagged into a handoff.
 	 */
 	#takeMidRunRewindNudge(): AgentMessage | null {
 		const anchor = this.#instructionAnchor;
 		if (!anchor) return null;
 		if (this.#isDisposed || this.#maintenance.isManualRewindReporting) return null;
 		if (!cfgCheckpointEnabled.get(this.settings) || !this.getEnabledToolNames().includes("rewind")) return null;
-		const base = this.#rewindNudge?.id === anchor.id ? this.#rewindNudge.toolResults : 0;
-		if (anchor.toolResults < base + REWIND_NUDGE_TOOL_RESULT_THRESHOLD) return null;
+		if (this.#rewindNudge?.id === anchor.id) return null;
+		if (anchor.toolResults < DAY_STEP_BUDGET) return null;
 		this.#rewindNudge = { id: anchor.id, toolResults: anchor.toolResults };
 		return {
 			role: "custom",
@@ -8820,9 +8819,11 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			throw new ToolError(
 				"Instruction rewind point is stale or unavailable. Rewind to a point advertised in the current request.",
 			);
-		if (!report.trim() || !nextAction.trim()) throw new ToolError("report and nextAction must be nonempty.");
+		// `nextAction` is optional here: an instruction fold may be the final act of a
+		// delivered answer. Observation and work-package folds still require it.
+		if (!report.trim()) throw new ToolError("report (or note) must be nonempty.");
 		if (!this.agent.tokenizer.checkTokenBudget([report, nextAction], 4096).fits)
-			throw new ToolError("Handoff exceeds 4096 tokens. Keep only decisions, evidence, risks and the next action.");
+			throw new ToolError("Handoff exceeds 4096 tokens. Keep only decisions, evidence and risks.");
 		const state: CheckpointState = {
 			checkpointEntryId: resolved.entryId,
 			checkpointId: resolved.id,
@@ -13677,7 +13678,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		if (this.#isDisposed || this.#maintenance.isManualRewindReporting) return false;
 		if (!cfgCheckpointEnabled.get(this.settings) || !this.getEnabledToolNames().includes("rewind")) return false;
 		const anchor = this.getInstructionAnchor();
-		if (!anchor || anchor.toolResults < REWIND_NUDGE_TOOL_RESULT_THRESHOLD) return false;
+		if (!anchor || anchor.toolResults < DAY_STEP_BUDGET) return false;
 		if (this.#rewindFoldedAnchorId === anchor.id || this.#rewindYieldRemindedAnchorId === anchor.id) return false;
 		this.#rewindYieldRemindedAnchorId = anchor.id;
 		const reminder =
@@ -13721,7 +13722,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			const checkpointId = stringProperty(details, "checkpointId");
 			const report = stringProperty(details, "report")?.trim() ?? "";
 			const nextAction = stringProperty(details, "nextAction")?.trim() ?? "";
-			if (!checkpointId || !report || !nextAction) continue;
+			if (!checkpointId || !report) continue;
 			if (!resolveInstructionAnchor(this.sessionManager.getBranch(), checkpointId)) continue;
 			return { report, rewound: true, checkpointId, nextAction, instructionAnchor: true };
 		}
