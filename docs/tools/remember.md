@@ -35,7 +35,7 @@ The tool never cuts, rewrites, merges or deletes a line. Curation is initiated b
 
 The harness appends the stored lines together with the last four day notes to every request as one `<system-notice>` block. The block is never journaled and is rendered from current state, so it cannot freeze at its first render; the conversation prefix stays cacheable because the block sits at the request tail.
 
-To keep the rhythm, the harness also injects a hidden reminder roughly every 40k billable tokens of work asking for one line. A line is not progress; it is what saves the next day a detour.
+To keep the rhythm, the harness also injects a hidden reminder whenever the prompt context has grown by ~40k tokens since the last one, asking for one line. It stays quiet while a QA rollover cycle is open or the context is already half the window. A line is not progress; it is what saves the next day a detour.
 
 ## Source
 

@@ -62,7 +62,7 @@ describe("AgentSession mid-run rewind nudge", () => {
 	const THRESHOLD = DAY_STEP_BUDGET;
 	const NUDGE_TYPE = MID_RUN_REWIND_NUDGE_MESSAGE_TYPE;
 
-	function toolUseAssistant(toolName: string): AssistantMessage {
+	function toolUseAssistant(toolName: string, input = 50): AssistantMessage {
 		const id = `call_${toolName}_${Date.now()}_${Math.random()}`;
 		const toolCall: ToolCall = { type: "toolCall", id, name: toolName, arguments: {} };
 		return {
@@ -73,7 +73,7 @@ describe("AgentSession mid-run rewind nudge", () => {
 			model: "claude-sonnet-4-5",
 			stopReason: "toolUse",
 			usage: {
-				input: 50,
+				input,
 				output: 10,
 				cacheRead: 0,
 				cacheWrite: 0,
@@ -94,9 +94,9 @@ describe("AgentSession mid-run rewind nudge", () => {
 	}
 
 	/** Production-shaped tool round trip: assistant toolCall turn + toolResult. */
-	function emitToolResult(toolName: string): void {
+	function emitToolResult(toolName: string, input = 50): void {
 		const toolCallId = `call_${toolName}_${Date.now()}_${Math.random()}`;
-		session.agent.emitExternalEvent({ type: "message_end", message: toolUseAssistant(toolName) });
+		session.agent.emitExternalEvent({ type: "message_end", message: toolUseAssistant(toolName, input) });
 		const content: TextContent[] = [{ type: "text", text: "ok" }];
 		session.agent.emitExternalEvent({
 			type: "message_end",
@@ -229,20 +229,27 @@ describe("AgentSession mid-run rewind nudge", () => {
 		expect(nudges[0]?.content).toContain("`R1`");
 	});
 
-	it("asks for one memory line per 40k tokens of work", async () => {
+	it("asks for one memory line per 40k tokens of context growth", async () => {
 		createSession(true);
 		await emitUser("fix a");
-		const perAssistant = 60; // 50 input + 10 output on each emitted assistant turn
-		const turns = Math.ceil(REMEMBER_TIP_TOKEN_INTERVAL / perAssistant);
-		for (let i = 0; i < turns; i++) emitToolResult("read");
 
+		emitToolResult("read", 20_000);
+		expect(await drainRememberTips()).toEqual([]);
+
+		emitToolResult("read", 40_000);
 		const tips = await drainRememberTips();
 		expect(tips.length).toBe(1);
 		const text = typeof tips[0]?.content === "string" ? tips[0].content : "";
 		expect(text).toContain("remember(");
 		expect(text).toContain("40k tokens");
-		// The counter reset: no immediate second tip.
+		// No immediate second tip.
 		expect(await drainRememberTips()).toEqual([]);
+
+		// Growth below the interval stays quiet; another 40k asks again.
+		emitToolResult("read", 70_000);
+		expect(await drainRememberTips()).toEqual([]);
+		emitToolResult("read", 80_000);
+		expect((await drainRememberTips()).length).toBe(1);
 	});
 
 	it("does nothing when checkpoints are disabled", async () => {

@@ -784,6 +784,11 @@ export class SessionMaintenance {
 		return this.#qaCycle;
 	}
 
+	/** True while a QA rollover cycle is open for the current context. */
+	hasActiveQaCycle(): boolean {
+		return this.#currentQaCycle() !== undefined;
+	}
+
 	/** Called after queued input is folded into the live context, before provider conversion. */
 	prepareQaModelCall(messages: AgentMessage[]): void {
 		if (this.#manualRewindCycle) return;

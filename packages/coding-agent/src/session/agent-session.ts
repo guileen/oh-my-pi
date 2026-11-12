@@ -53,8 +53,10 @@ import {
 	calculatePromptTokens,
 	collectEntriesForBranchSummary,
 	generateBranchSummary,
+	resolveThresholdTokens,
 	type ShakeConfig,
 } from "@oh-my-pi/pi-agent-core/compaction";
+import { resolveModelCompactionSettings } from "./model-compaction-threshold";
 import type {
 	AnthropicFallbackCreditHandle,
 	AssistantMessage,
@@ -1522,8 +1524,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	#pendingInstructionNotice: { message: AgentMessage; messages: CustomMessage[] } | undefined = undefined;
 	/** Point id of the last mid-run aside; the reminder fires once per point. */
 	#rewindNudge: { id: string; toolResults: number } | undefined = undefined;
-	/** Message index after the last memory reminder. */
-	#rememberTipFrom = 0;
+	/** Context tokens at the last memory reminder. */
+	#rememberTipAtTokens = 0;
 	/** Point id whose instruction already folded; suppresses the pre-yield demand. */
 	#rewindFoldedAnchorId: string | undefined = undefined;
 	/** Point id that already received the mandatory pre-yield reminder. */
@@ -4926,8 +4928,10 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	#takeRememberTip(): AgentMessage | null {
 		if (this.#isDisposed || this.#maintenance.isManualRewindReporting) return null;
 		if (!cfgCheckpointEnabled.get(this.settings)) return null;
-		if (this.#tokensSinceRememberTip() < REMEMBER_TIP_TOKEN_INTERVAL) return null;
-		this.#rememberTipFrom = this.agent.state.messages.length;
+		if (this.#underContextPressure()) return null;
+		const used = this.#contextTokens();
+		if (used - this.#rememberTipAtTokens < REMEMBER_TIP_TOKEN_INTERVAL) return null;
+		this.#rememberTipAtTokens = used;
 		return {
 			role: "custom",
 			customType: CONTEXT_MEMORY_REMINDER_MESSAGE_TYPE,
@@ -4938,16 +4942,43 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		};
 	}
 
-	/** Billable tokens accumulated after the last reminder was issued. */
-	#tokensSinceRememberTip(): number {
+	/**
+	 * True while the context is being handed off or is already large. Asking for
+	 * a memory line then competes with the rollover that will rewrite the context.
+	 */
+	#underContextPressure(): boolean {
+		if (this.#maintenance.hasActiveQaCycle()) return true;
+		if (
+			this.agent.state.messages.some(
+				message =>
+					message.role === "custom" &&
+					typeof message.customType === "string" &&
+					message.customType.startsWith("qa-rollover-"),
+			)
+		)
+			return true;
+		const window = this.agent.state.model?.contextWindow ?? 0;
+		if (!window) return true;
 		const messages = this.agent.state.messages;
-		let tokens = 0;
-		for (let index = this.#rememberTipFrom; index < messages.length; index++) {
+		let used = 0;
+		for (let index = messages.length - 1; index >= 0; index--) {
 			const message = messages[index]!;
-			if (message.role === "assistant" && message.usage)
-				tokens += (message.usage.input ?? 0) + (message.usage.cacheRead ?? 0) + (message.usage.output ?? 0);
+			if (message.role !== "assistant" || !message.usage) continue;
+			used = (message.usage.input ?? 0) + (message.usage.cacheRead ?? 0);
+			break;
 		}
-		return tokens;
+		return used * 2 >= window;
+	}
+
+	/** Billable prompt tokens of the last assistant turn. */
+	#contextTokens(): number {
+		const messages = this.agent.state.messages;
+		for (let index = messages.length - 1; index >= 0; index--) {
+			const message = messages[index]!;
+			if (message.role !== "assistant" || !message.usage) continue;
+			return (message.usage.input ?? 0) + (message.usage.cacheRead ?? 0);
+		}
+		return 0;
 	}
 
 	/**
