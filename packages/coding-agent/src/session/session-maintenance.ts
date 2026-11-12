@@ -444,6 +444,8 @@ export interface SessionMaintenanceHost {
 	promptGeneration(): number;
 	sessionId(): string;
 	messages(): AgentMessage[];
+	/** Entry ids a compaction cut may not pass (pinned tool results). */
+	pinnedEntryIds?(): string[];
 	baseSystemPrompt(): string[];
 	goalModeState(): GoalModeState | undefined;
 	planReferencePath(): string;
@@ -1723,7 +1725,7 @@ export class SessionMaintenance {
 				throw new Error("No model selected");
 			}
 			if (compactMode?.name === "relay") {
-				const preparation = prepareCompaction(
+				const preparation = this.#prepareCompaction(
 					this.#host.sessionManager.getBranch(),
 					resolveMethodSettings(this.#compactionSettings, "handoff"),
 					activeModel,
@@ -1849,7 +1851,7 @@ export class SessionMaintenance {
 				);
 			}
 			const pathEntries = this.#host.sessionManager.getBranch();
-			const preparation = prepareCompaction(pathEntries, effectiveSettings, activeModel, this.#tokenizer);
+			const preparation = this.#prepareCompaction(pathEntries, effectiveSettings, activeModel, this.#tokenizer);
 			if (!preparation) {
 				// Check why we can't compact
 				const lastEntry = pathEntries[pathEntries.length - 1];
@@ -2215,7 +2217,7 @@ export class SessionMaintenance {
 	): Promise<CompactionResult> {
 		const entries = this.#host.sessionManager.getBranch();
 		const settings = this.#compactionSettings;
-		const preparation = prepareCompaction(entries, settings, model, this.#tokenizer);
+		const preparation = this.#prepareCompaction(entries, settings, model, this.#tokenizer);
 		if (!preparation)
 			throw new ManualCompactionNoOpError("Nothing to compact (session too small or already rolled over)");
 
@@ -2337,7 +2339,7 @@ export class SessionMaintenance {
 			this.#fixedContextDeadEndNotifiedSessionId = undefined;
 		}
 		const branch = this.#host.sessionManager.getBranch();
-		const preparation = prepareCompaction(branch, settings, model, this.#tokenizer);
+		const preparation = this.#prepareCompaction(branch, settings, model, this.#tokenizer);
 		if (!preparation) return COMPACTION_CHECK_BLOCK_AUTOMATIC_CONTINUATION;
 		const sourceLeafId = branch.at(-1)?.id;
 		const sourceSessionId = this.#host.sessionId();
@@ -2704,7 +2706,7 @@ export class SessionMaintenance {
 		const messageCount = entries.filter(e => e.type === "message").length;
 		if (messageCount < 2) throw new Error("Nothing to hand off (no messages yet)");
 		const compactionSettings = this.#compactionSettings;
-		const preparation = prepareCompaction(
+		const preparation = this.#prepareCompaction(
 			entries,
 			resolveMethodSettings(compactionSettings, "handoff"),
 			model,
@@ -2895,7 +2897,7 @@ export class SessionMaintenance {
 		const branch = this.#host.sessionManager.getBranch();
 		const snapshotLeafId = branch[branch.length - 1]?.id;
 		if (!snapshotLeafId) return clear();
-		const preparation = prepareCompaction(branch, effectiveSettings, model, this.#tokenizer);
+		const preparation = this.#prepareCompaction(branch, effectiveSettings, model, this.#tokenizer);
 		if (!preparation) return clear();
 		const signal = run.controller.signal;
 		let armed: ArmedSpeculation;
@@ -3487,7 +3489,7 @@ export class SessionMaintenance {
 			return;
 		}
 		if (pendingMidTurnDeadEnd !== undefined) {
-			const prep = prepareCompaction(
+			const prep = this.#prepareCompaction(
 				this.#host.sessionManager.getBranch(),
 				compactionSettings,
 				model,
@@ -3661,7 +3663,7 @@ export class SessionMaintenance {
 			// and MUST re-arm rather than stay suppressed until provider overflow.
 			const deadEndFirstKeptId = this.#midTurnCompactionDeadEnds.get(activeMessages);
 			const prep = model
-				? prepareCompaction(this.#host.sessionManager.getBranch(), compactionSettings, model, this.#tokenizer)
+				? this.#prepareCompaction(this.#host.sessionManager.getBranch(), compactionSettings, model, this.#tokenizer)
 				: undefined;
 			if (prep === undefined || (deadEndFirstKeptId !== null && prep.firstKeptEntryId === deadEndFirstKeptId)) {
 				return;
@@ -3711,8 +3713,12 @@ export class SessionMaintenance {
 		});
 		if (result.automaticContinuationBlocked) {
 			const deadEndFirstKeptId = model
-				? (prepareCompaction(this.#host.sessionManager.getBranch(), compactionSettings, model, this.#tokenizer)
-						?.firstKeptEntryId ?? null)
+				? (this.#prepareCompaction(
+						this.#host.sessionManager.getBranch(),
+						compactionSettings,
+						model,
+						this.#tokenizer,
+					)?.firstKeptEntryId ?? null)
 				: null;
 			this.#midTurnCompactionDeadEnds.set(activeMessages, deadEndFirstKeptId);
 			this.#midTurnDeadEndPendingPrePrompt = deadEndFirstKeptId;
@@ -3898,7 +3904,7 @@ export class SessionMaintenance {
 					if (candidate === "shake") return true;
 					if (isLocalCheckpointCompactionMethod(candidate))
 						return this.#currentQaCycle()?.checkpointEntryId !== undefined;
-					const preparation = prepareCompaction(
+					const preparation = this.#prepareCompaction(
 						payloadBranch,
 						resolveMethodSettings(payloadCompactionSettings, candidate),
 						payloadModel,
@@ -4560,6 +4566,19 @@ export class SessionMaintenance {
 
 		if (nativeCompactionFailure) throw nativeCompactionFailure.error;
 		throw this.#buildCompactionAuthError();
+	}
+
+	/**
+	 * Every fold goes through the pin barrier: a pinned tool result moves the
+	 * retained start back (snapped to a turn boundary), so it survives verbatim.
+	 */
+	#prepareCompaction(
+		pathEntries: SessionEntry[],
+		settings: EngineCompactionSettings,
+		activeModel: Model | undefined,
+		tokenizer: Tokenizer,
+	): CompactionPreparation | undefined {
+		return prepareCompaction(pathEntries, settings, activeModel, tokenizer, this.#host.pinnedEntryIds?.() ?? []);
 	}
 
 	async #prepareCompactionFromHooks(
@@ -6288,7 +6307,12 @@ export class SessionMaintenance {
 			const pathEntries = this.#host.sessionManager.getBranch();
 
 			let pathEntriesForCompaction = pathEntries;
-			let preparation = prepareCompaction(pathEntriesForCompaction, effectiveSettings, this.#model, this.#tokenizer);
+			let preparation = this.#prepareCompaction(
+				pathEntriesForCompaction,
+				effectiveSettings,
+				this.#model,
+				this.#tokenizer,
+			);
 			if (!preparation) {
 				// prepareCompaction found nothing to summarize because the kept region
 				// is a single oversized recent turn — findCutPoint never cuts inside a
@@ -6338,7 +6362,7 @@ export class SessionMaintenance {
 								// branch has been rewritten either way.
 								rescueRewroteHistory = true;
 								pathEntriesForCompaction = this.#host.sessionManager.getBranch();
-								preparation = prepareCompaction(
+								preparation = this.#prepareCompaction(
 									pathEntriesForCompaction,
 									effectiveSettings,
 									this.#model,

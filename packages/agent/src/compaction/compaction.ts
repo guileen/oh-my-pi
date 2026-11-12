@@ -597,6 +597,34 @@ export function findCutPoint(
 // Summarization
 // ============================================================================
 
+/**
+ * Pins (and any other protected entry) act as a cut barrier: the retained
+ * suffix must begin at or before the earliest protected entry. The barrier is
+ * snapped back to the nearest turn-start boundary, because a cut inside a turn
+ * would summarize away the assistant message that issued a protected tool
+ * result and leave an orphaned `tool_result` the provider rejects.
+ */
+function clampCutPointForProtected(
+	entries: SessionEntry[],
+	cutPoint: CutPointResult,
+	protectedEntryIds: readonly string[],
+): CutPointResult {
+	if (protectedEntryIds.length === 0) return cutPoint;
+	let earliest = -1;
+	for (const id of protectedEntryIds) {
+		const index = entries.findIndex(entry => entry.id === id);
+		if (index < 0 || index >= cutPoint.firstKeptEntryIndex) continue;
+		if (earliest < 0 || index < earliest) earliest = index;
+	}
+	if (earliest < 0) return cutPoint;
+	const boundaries = findValidCutPoints(entries, 0, earliest + 1).filter(
+		index => index <= earliest && isTurnStartEntry(entries[index]),
+	);
+	const target = boundaries.at(-1);
+	if (target === undefined || target >= cutPoint.firstKeptEntryIndex) return cutPoint;
+	return { firstKeptEntryIndex: target, turnStartIndex: -1, isSplitTurn: false };
+}
+
 const SUMMARIZATION_PROMPT = prompt.render(compactionSummaryPrompt);
 
 const UPDATE_SUMMARIZATION_PROMPT = prompt.render(compactionUpdateSummaryPrompt);
@@ -1458,6 +1486,7 @@ export function prepareCompaction(
 	settings: CompactionSettings,
 	activeModel?: Model,
 	tokenizer: Tokenizer = new Tokenizer(activeModel),
+	protectedEntryIds: readonly string[] = [],
 ): CompactionPreparation | undefined {
 	const lastEntry = pathEntries[pathEntries.length - 1];
 	// A speculative native record may leave uncovered messages before the record.
@@ -1558,7 +1587,11 @@ export function prepareCompaction(
 		}
 	}
 
-	const cutPoint = findCutPoint(compactionEntries, tokenizer, 0, compactionEntries.length, keepRecentTokens);
+	const cutPoint = clampCutPointForProtected(
+		compactionEntries,
+		findCutPoint(compactionEntries, tokenizer, 0, compactionEntries.length, keepRecentTokens),
+		protectedEntryIds,
+	);
 
 	// Get ID of first kept entry
 	const firstKeptEntry = compactionEntries[cutPoint.firstKeptEntryIndex];

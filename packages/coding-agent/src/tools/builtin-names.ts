@@ -17,6 +17,7 @@ export const BUILTIN_TOOL_NAMES = [
 	"rewind",
 	"thinknote",
 	"remember",
+	"pin",
 	"context_notes",
 	"new_context",
 	"security_scan",

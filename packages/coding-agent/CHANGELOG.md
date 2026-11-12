@@ -3,6 +3,11 @@
 ## [Unreleased]
 ### Added
 
+- Added `pin`: marks tool results (by path, line window, or call id) as fold barriers. A pin moves nothing, so the cached prefix is untouched; compaction instead pulls its cut back to the pinned result's turn, keeping it verbatim. Pins are branch-scoped and revocable with `unpin`.
+- Rewind results now state how many further turns a fold needs to pay for itself, computed from the model's cache-read/cache-write/output prices instead of a hard-coded discount.
+- Rewind results also state the keep window (1/α turns: past it, re-reading a folded block is cheaper than carrying it), and fold estimates expose the re-read probability they can tolerate before they lose.
+- After a fold, a read that a later edit or a fuller re-read made stale is replayed as a one-line stub naming the newer evidence, keeping its tool result paired with its call.
+
 - Automatic compaction now tries a local interval rewind first, keeping the original prefix and selected exact source without a separate summary-model request; explicit method orders are preserved.
 - `/compact rewind [focus]` and RPC `mode: "rewind"` manually fold exploration while preserving the original prefix and selected exact source, without changing automatic settings or using a separate summarizer.
 - Every user instruction now opens an automatic rewind point (`R0`, `R1`, …) advertised in the request; each completed fold opens the next point and earlier points stay reusable. `rewind({checkpointId, report, nextAction})` folds exploration after the selected point into a retained report without creating a work package or touching todo state. The first point is preceded by a one-shot how-to-rewind skill notice (what/why/when/where/who/how); every later point carries a one-line reminder, and a compaction that drops the explanation re-opens it once.

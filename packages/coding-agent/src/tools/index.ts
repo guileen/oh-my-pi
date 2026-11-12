@@ -40,6 +40,7 @@ import type { SessionManager } from "../session/session-manager";
 import type { SearchRewindInput } from "../session/search-rewind";
 import type { ThinkNoteDetails } from "../session/think-note";
 import type { ContextMemoryRememberResult } from "../session/context-memory";
+import type { PinResult, PinTarget } from "../session/tool-result-pins";
 import type { ToolChoiceQueue } from "../session/tool-choice-queue";
 import { TaskTool } from "../task";
 import type { AgentOutputManager } from "../task/output-manager";
@@ -64,6 +65,7 @@ import {
 import { ContextNotesTool, NewContextTool } from "./context-notes";
 import { DebugTool } from "./debug";
 import { ThinkNoteTool } from "./think-note";
+import { PinTool } from "./pin";
 import { RememberTool } from "./remember";
 import { cfgIdaAvailable } from "../ida/install";
 import { EvalTool } from "./eval";
@@ -140,6 +142,7 @@ export type {
 export * from "./browser";
 export * from "./checkpoint";
 export * from "./think-note";
+export * from "./pin";
 export * from "./remember";
 export * from "./computer";
 export * from "./computer/supervisor";
@@ -575,6 +578,8 @@ export interface ToolSession {
 	takeThinkNoteOutcome?: (toolCallId: string) => ThinkNoteDetails | undefined;
 	/** Append one long-term memory line; returns the acceptance or the reason to rewrite. */
 	rememberContextLine?: (line: string) => ContextMemoryRememberResult;
+	/** Pin or unpin tool results so a fold keeps them verbatim. */
+	pinToolResults?: (targets: PinTarget[], pinned: boolean) => PinResult;
 	/** Validate a work-package handoff without changing the active transcript. */
 	validateRewind?: (
 		checkpointId: string,
@@ -653,6 +658,7 @@ export const BUILTIN_TOOLS: Record<BuiltinToolName, ToolFactory> = {
 	rewind: RewindTool.createIf,
 	thinknote: ThinkNoteTool.createIf,
 	remember: RememberTool.createIf,
+	pin: PinTool.createIf,
 	context_notes: ContextNotesTool.createIf,
 	new_context: NewContextTool.createIf,
 	task: s => TaskTool.create(s),

@@ -6,6 +6,7 @@ import checkpointDescription from "../prompts/tools/checkpoint.md" with { type: 
 import rewindDescription from "../prompts/tools/rewind.md" with { type: "text" };
 import type { ToolSession } from ".";
 import type { OutputMeta } from "@oh-my-pi/pi-tui/tools/output-meta";
+import { estimateFold, keepWindowTurns, type PriceCard, priceFactors } from "../session/fold-economics";
 import { annotateSearchResult, type SearchRewindInput } from "../session/search-rewind";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { toolResult } from "./tool-result";
@@ -396,9 +397,33 @@ export class RewindTool implements AgentTool<typeof rewindSchema, RewindToolDeta
 				estimate
 					? estimate.willCompact === false
 						? "Work outcome requested; context will be retained because a cut has no net benefit."
-						: `Rewind requested: estimated context ${estimate.beforeTokens} → ${estimate.afterTokens} tokens; unchanged prefix ${estimate.reusablePrefixTokens} tokens (cache eligibility, not guaranteed hits).`
+						: `Rewind requested: estimated context ${estimate.beforeTokens} → ${estimate.afterTokens} tokens; unchanged prefix ${estimate.reusablePrefixTokens} tokens (cache eligibility, not guaranteed hits).${this.#foldPayback(estimate)}`
 					: "Rewind requested. Report captured for context replacement.",
 			)
 			.done();
+	}
+
+	/**
+	 * What the fold costs versus what it saves, in price-card terms. A local fold
+	 * pays the re-cached suffix once and then saves the folded tokens every turn;
+	 * the break-even turn count is the only number that decides whether folding
+	 * again is worth it.
+	 */
+	#foldPayback(estimate: RewindContextEstimate): string {
+		if (estimate.willCompact === false) return "";
+		const model = this.session.getActiveModel?.();
+		const economics = estimateFold({
+			liveTokens: estimate.beforeTokens,
+			foldedTokens: Math.max(0, estimate.beforeTokens - estimate.afterTokens),
+			reportTokens: 0,
+			factors: priceFactors((model as { cost?: PriceCard } | undefined)?.cost),
+			oneshotSummary: false,
+		});
+		if (!Number.isFinite(economics.breakEvenTurns)) return "";
+		// The keep window makes the trade readable: carrying a block for this many
+		// turns already costs one re-read, so anything not needed inside it belongs
+		// in the fold.
+		const keepWindow = Math.max(1, Math.round(keepWindowTurns(economics.factors)));
+		return ` Fold pays back after ~${Math.ceil(economics.breakEvenTurns)} more turns of this session (a re-read costs ~${keepWindow} turns of carrying it).`;
 	}
 }

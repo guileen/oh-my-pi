@@ -556,6 +556,16 @@ import {
 import type { SessionContext, TranscriptSessionContextOptions } from "./session-context";
 import { buildSessionContext, getRestorableSessionModels, isTranscriptEntry } from "./session-context";
 import {
+	type PinResult,
+	type PinTarget,
+	pinRecordsFor,
+	pinnedCallIds,
+	pinnedEntryIds as pinnedEntryIdsOnBranch,
+	resolvePinTargets,
+	TOOL_RESULT_PIN_CUSTOM_TYPE,
+} from "./tool-result-pins";
+import { elideSupersededToolResults, planSupersededReads } from "./tool-result-supersede";
+import {
 	type CacheRefreshOutcome,
 	type CacheWarmer,
 	type CacheWarmingMode,
@@ -4741,6 +4751,24 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		};
 	}
 
+	/**
+	 * Mark tool results as fold barriers, or release them. A pin is a flag entry,
+	 * so nothing moves in the transcript and the cached prefix is untouched.
+	 */
+	pinToolResults(targets: PinTarget[], pinned: boolean): PinResult {
+		const branch = this.sessionManager.getBranch();
+		const result = resolvePinTargets(branch, targets, this.sessionManager.getCwd());
+		for (const record of pinRecordsFor(result.resolved, pinned)) {
+			this.sessionManager.appendCustomEntry(TOOL_RESULT_PIN_CUSTOM_TYPE, record);
+		}
+		return result;
+	}
+
+	/** Entry ids a compaction cut may not pass; empty when nothing is pinned. */
+	pinnedEntryIds(): string[] {
+		return pinnedEntryIdsOnBranch(this.sessionManager.getBranch());
+	}
+
 	/** Cut-point feedback: counts only, never advice, and never in the cacheable prefix. */
 	#memoryFeedbackSuffix(): string {
 		const stats = this.#dayStats();
@@ -8483,7 +8511,24 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	}
 
 	buildDisplaySessionContext(model = this.model): SessionContext {
-		return this.#withEvalStateContext(this.#providerBoundary.buildDisplaySessionContext(model));
+		const context = this.#withEvalStateContext(this.#providerBoundary.buildDisplaySessionContext(model));
+		return this.#elideSupersededReads(context);
+	}
+
+	/**
+	 * After a fold, drop the payload of reads that a later edit or a later read
+	 * made stale. Only the request projection changes: the journal keeps the
+	 * original bytes, and pinned results are exempt.
+	 */
+	#elideSupersededReads(context: SessionContext): SessionContext {
+		const branch = this.sessionManager.getBranch();
+		if (!branch.some(entry => entry.type === "compaction")) return context;
+		const superseded = planSupersededReads(branch);
+		if (superseded.size === 0) return context;
+		const pinned = pinnedCallIds(branch);
+		for (const callId of pinned) superseded.delete(callId);
+		if (superseded.size === 0) return context;
+		return { ...context, messages: elideSupersededToolResults(context.messages, superseded) };
 	}
 
 	#withEvalStateContext(context: SessionContext): SessionContext {
