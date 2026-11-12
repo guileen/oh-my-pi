@@ -433,6 +433,7 @@ import {
 	recentDayNotes,
 	renderContextMemoryBlock,
 	summarizeCommandRuns,
+	formatTokenCount,
 	type CommandRun,
 	type ContextMemoryLine,
 	type ContextMemoryRememberResult,
@@ -4730,6 +4731,20 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		};
 	}
 
+	/** Cut-point feedback: counts only, never advice, and never in the cacheable prefix. */
+	#memoryFeedbackSuffix(): string {
+		const stats = this.#dayStats();
+		const commands = summarizeCommandRuns(this.#commandRuns());
+		const lines: string[] = [];
+		if (stats.steps > 0 || stats.tokens > 0) {
+			const noun = stats.steps === 1 ? "step" : "steps";
+			lines.push(`This day: ${stats.steps} settled ${noun} · ${formatTokenCount(stats.tokens)} tokens.`);
+		}
+		if (commands.length > 0)
+			lines.push(`Repeated commands (facts):\n${commands.map(line => `- ${line}`).join("\n")}`);
+		return lines.length > 0 ? `\n\n${lines.join("\n")}` : "";
+	}
+
 	/** Lines in this session, in append order; abandoned branches keep theirs. */
 	#contextMemoryLines(): ContextMemoryLine[] {
 		const lines: ContextMemoryLine[] = [];
@@ -4836,8 +4851,6 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		const content = renderContextMemoryBlock({
 			notes: recentDayNotes(notes),
 			lines,
-			stats: this.#dayStats(),
-			commands: summarizeCommandRuns(this.#commandRuns()),
 			dayNoteTotal: notes.length,
 			lineDayCount: linesSinceDay(lines, notes.at(-1)?.ts).length,
 		});
@@ -4914,7 +4927,9 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		return {
 			role: "custom",
 			customType: MID_RUN_REWIND_NUDGE_MESSAGE_TYPE,
-			content: prompt.render(midRunRewindNudgePrompt, { anchorId: anchor.id, toolResults: anchor.toolResults }),
+			content:
+				prompt.render(midRunRewindNudgePrompt, { anchorId: anchor.id, toolResults: anchor.toolResults }) +
+				this.#memoryFeedbackSuffix(),
 			display: false,
 			attribution: "agent",
 			timestamp: Date.now(),
@@ -13665,10 +13680,11 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		if (!anchor || anchor.toolResults < REWIND_NUDGE_TOOL_RESULT_THRESHOLD) return false;
 		if (this.#rewindFoldedAnchorId === anchor.id || this.#rewindYieldRemindedAnchorId === anchor.id) return false;
 		this.#rewindYieldRemindedAnchorId = anchor.id;
-		const reminder = prompt.render(rewindBeforeYieldPrompt, {
-			anchorId: anchor.id,
-			toolResults: anchor.toolResults,
-		});
+		const reminder =
+			prompt.render(rewindBeforeYieldPrompt, {
+				anchorId: anchor.id,
+				toolResults: anchor.toolResults,
+			}) + this.#memoryFeedbackSuffix();
 		const message: Message = {
 			role: "developer",
 			content: [{ type: "text", text: reminder }],

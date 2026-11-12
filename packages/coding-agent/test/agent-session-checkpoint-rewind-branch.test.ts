@@ -4026,29 +4026,6 @@ describe("AgentSession checkpoint rewind branch context", () => {
 		expect(secondRequest).toContain("day one settled the guard");
 	});
 
-	it("reports the day pace in the injected block", async () => {
-		const responses = (async function* () {
-			yield {
-				content: [
-					{ type: "toolCall", id: "g1", name: "grep", arguments: { pattern: "INSTRUCTION_NEEDLE", path: "." } },
-				],
-				stopReason: "toolUse" as const,
-			};
-			yield { content: ["done"], stopReason: "stop" as const };
-		})() as MockResponseSource;
-		const { session, mock, tempDir } = await createHarness(responses, [], {
-			realTools: true,
-			realSearchTools: true,
-		});
-		await Bun.write(path.join(tempDir.path(), "x.ts"), "INSTRUCTION_NEEDLE\n");
-
-		await session.prompt("explore");
-
-		const afterTool = mock.calls[1]!.context.messages.map(messageText).join("\n");
-		expect(afterTool).toContain("This day:");
-		expect(afterTool).toContain("settled step");
-	});
-
 	it("renders day notes and lines into one block", () => {
 		const block = renderContextMemoryBlock({
 			notes: [{ ts: "2026-11-11T10:00:00.000Z", text: "day one settled the build switch" }],
@@ -4084,9 +4061,7 @@ describe("AgentSession checkpoint rewind branch context", () => {
 			lines,
 			lineDayCount: 16,
 			dayNoteTotal: 8,
-			stats: { steps: 12, tokens: 4_200 },
 		});
-		expect(block).toContain("This day: 12 settled steps · 4.2k tokens");
 		expect(block).toContain("near the daily limit (16/20)");
 		expect(block).toContain("Day notes exceed the window (8)");
 	});

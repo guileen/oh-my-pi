@@ -91,9 +91,6 @@ export function summarizeCommandRuns(runs: CommandRun[], limit = 3): string[] {
 export interface ContextMemoryBlockInput {
 	notes: DayNote[];
 	lines: ContextMemoryLine[];
-	stats?: DayStats;
-	/** Pre-summarized repeated-command facts. */
-	commands?: string[];
 	/** Notes recorded since the session began, including those outside the injected window. */
 	dayNoteTotal?: number;
 	/** Lines recorded in the current day, for the daily-limit warning. */
@@ -101,16 +98,9 @@ export interface ContextMemoryBlockInput {
 }
 
 export function renderContextMemoryBlock(input: ContextMemoryBlockInput): string | undefined {
-	const { notes, lines, stats, commands = [], dayNoteTotal = notes.length, lineDayCount = lines.length } = input;
-	if (notes.length === 0 && lines.length === 0 && commands.length === 0 && !stats) return undefined;
+	const { notes, lines, dayNoteTotal = notes.length, lineDayCount = lines.length } = input;
+	if (notes.length === 0 && lines.length === 0) return undefined;
 	const sections: string[] = [];
-	if (stats && (stats.steps > 0 || stats.tokens > 0)) {
-		const noun = stats.steps === 1 ? "step" : "steps";
-		sections.push(`This day: ${stats.steps} settled ${noun} · ${formatTokenCount(stats.tokens)} tokens.`);
-	}
-	if (commands.length > 0) {
-		sections.push(`Command history (facts, not advice):\n${commands.map(line => `- ${line}`).join("\n")}`);
-	}
 	if (notes.length > 0) {
 		const body = notes.map(note => `- ${note.ts.slice(0, 16).replace("T", " ")} · ${note.text}`).join("\n");
 		sections.push(`Day notes (newest last):\n${body}`);
