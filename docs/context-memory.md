@@ -170,6 +170,10 @@ action, because a recommendation can silently change the task.
   byte-identical within a retained rewind prefix.
 - Repeated command: when the same normalized command runs ≥ 3 times in the window, the
   reminder lists `executed 27 times · 3 of the last 5 failed`.
+- Every ~40k billable tokens of work, a hidden reminder asks for one memory line. This
+  repetition is deliberate: a line is not progress, it is what saves the next day a
+  detour, and without a prompt the model rarely writes one. The counter resets when the
+  reminder is issued.
 - Exit codes MUST NOT be a hard rule. The model reads the counts and decides.
 - No reasoning-length signal. The behavioral signal for idling is **Δsteps stalled while
   Δtokens grows**, which is independent of the user's effort setting.

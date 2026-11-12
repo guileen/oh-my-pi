@@ -35,6 +35,8 @@ The tool never cuts, rewrites, merges or deletes a line. Curation is initiated b
 
 The harness appends the stored lines together with the last four day notes to every request as one `<system-notice>` block. The block is never journaled and is rendered from current state, so it cannot freeze at its first render; the conversation prefix stays cacheable because the block sits at the request tail.
 
+To keep the rhythm, the harness also injects a hidden reminder roughly every 40k billable tokens of work asking for one line. A line is not progress; it is what saves the next day a detour.
+
 ## Source
 
 - Entry: `packages/coding-agent/src/tools/remember.ts` (`RememberTool`)

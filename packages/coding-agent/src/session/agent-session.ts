@@ -206,6 +206,7 @@ import autoContinuePrompt from "../prompts/system/auto-continue.md" with { type:
 import checkpointActiveNoticeTemplate from "../prompts/system/checkpoint-active-notice.md" with { type: "text" };
 import instructionRewindPointPrompt from "../prompts/system/instruction-rewind-point.md" with { type: "text" };
 import midRunRewindNudgePrompt from "../prompts/system/mid-run-rewind-nudge.md" with { type: "text" };
+import rememberTipPrompt from "../prompts/system/remember-tip.md" with { type: "text" };
 import rewindSkillPrompt from "../prompts/system/rewind-skill.md" with { type: "text" };
 import rewindBeforeYieldPrompt from "../prompts/system/rewind-before-yield.md" with { type: "text" };
 import interruptedThinkingTemplate from "../prompts/system/interrupted-thinking.md" with { type: "text" };
@@ -421,6 +422,8 @@ import {
 } from "./think-note";
 import {
 	CONTEXT_MEMORY_BLOCK_TAG,
+	CONTEXT_MEMORY_REMINDER_MESSAGE_TYPE,
+	REMEMBER_TIP_TOKEN_INTERVAL,
 	CONTEXT_MEMORY_LINE_CUSTOM_TYPE,
 	CONTEXT_MEMORY_LINE_HINT_CHARS,
 	CONTEXT_MEMORY_LINE_MAX_CHARS,
@@ -1517,8 +1520,10 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	#instructionNoticeMessage: AgentMessage | undefined = undefined;
 	/** Steered instruction notices persisted right after their user entry. */
 	#pendingInstructionNotice: { message: AgentMessage; messages: CustomMessage[] } | undefined = undefined;
-	/** Point id and settled-result count at the last mid-run aside; repeats every threshold. */
+	/** Point id of the last mid-run aside; the reminder fires once per point. */
 	#rewindNudge: { id: string; toolResults: number } | undefined = undefined;
+	/** Message index after the last memory reminder. */
+	#rememberTipFrom = 0;
 	/** Point id whose instruction already folded; suppresses the pre-yield demand. */
 	#rewindFoldedAnchorId: string | undefined = undefined;
 	/** Point id that already received the mandatory pre-yield reminder. */
@@ -2710,6 +2715,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			// Mid-run fold reminder — same injection boundary, evaluated lazily so a
 			// fold that lands just before the poll suppresses a stale hint.
 			thunks.push(() => this.#takeMidRunRewindNudge());
+			// Memory rhythm: roughly every 40k tokens of work, ask for one line.
+			thunks.push(() => this.#takeRememberTip());
 			const contextNotesReminder = this.#experimentalContextNotesReminder;
 			if (contextNotesReminder) {
 				this.#experimentalContextNotesReminder = undefined;
@@ -4909,6 +4916,38 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		if (afterTokens * THINK_NOTE_TOKEN_RATIO > beforeTokens)
 			return kept(`note is not small enough (${afterTokens} vs ${beforeTokens} tokens)`, beforeTokens);
 		return { toolCallId: call.id, mode: "replace", note, beforeTokens, afterTokens };
+	}
+
+	/**
+	 * One reminder every ~40k tokens of work. Repeated prompting is the point:
+	 * a line is not progress, it is what keeps the next day from re-deriving
+	 * settled facts. The counter resets on restart, which only delays one tip.
+	 */
+	#takeRememberTip(): AgentMessage | null {
+		if (this.#isDisposed || this.#maintenance.isManualRewindReporting) return null;
+		if (!cfgCheckpointEnabled.get(this.settings)) return null;
+		if (this.#tokensSinceRememberTip() < REMEMBER_TIP_TOKEN_INTERVAL) return null;
+		this.#rememberTipFrom = this.agent.state.messages.length;
+		return {
+			role: "custom",
+			customType: CONTEXT_MEMORY_REMINDER_MESSAGE_TYPE,
+			content: prompt.render(rememberTipPrompt),
+			display: false,
+			attribution: "agent",
+			timestamp: Date.now(),
+		};
+	}
+
+	/** Billable tokens accumulated after the last reminder was issued. */
+	#tokensSinceRememberTip(): number {
+		const messages = this.agent.state.messages;
+		let tokens = 0;
+		for (let index = this.#rememberTipFrom; index < messages.length; index++) {
+			const message = messages[index]!;
+			if (message.role === "assistant" && message.usage)
+				tokens += (message.usage.input ?? 0) + (message.usage.cacheRead ?? 0) + (message.usage.output ?? 0);
+		}
+		return tokens;
 	}
 
 	/**

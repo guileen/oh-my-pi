@@ -41,6 +41,12 @@ export function recentDayNotes(notes: DayNote[]): DayNote[] {
 	return notes.length <= DAY_NOTES_KEPT ? notes : notes.slice(-DAY_NOTES_KEPT);
 }
 
+/** Tokens of work between memory reminders; a day yields several lines. */
+export const REMEMBER_TIP_TOKEN_INTERVAL = 40_000;
+
+/** Hidden reminder asking for one memory line. */
+export const CONTEXT_MEMORY_REMINDER_MESSAGE_TYPE = "context-memory-reminder";
+
 /** First line of an injected block; requests are deduped by this tag. */
 export const CONTEXT_MEMORY_BLOCK_TAG = "Recorded memory for this session.";
 

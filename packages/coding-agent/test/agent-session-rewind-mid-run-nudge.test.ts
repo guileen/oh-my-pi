@@ -9,6 +9,10 @@ import {
 	DAY_STEP_BUDGET,
 	MID_RUN_REWIND_NUDGE_MESSAGE_TYPE,
 } from "@oh-my-pi/pi-coding-agent/session/instruction-anchor";
+import {
+	CONTEXT_MEMORY_REMINDER_MESSAGE_TYPE,
+	REMEMBER_TIP_TOKEN_INTERVAL,
+} from "@oh-my-pi/pi-coding-agent/session/context-memory";
 import type { CustomMessage } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
@@ -39,6 +43,13 @@ afterAll(() => {
 const rewindStub = {
 	name: "rewind",
 	description: "fold the current instruction's exploration",
+	parameters: {},
+	execute: async () => ({ content: [{ type: "text" as const, text: "ok" }] }),
+} as unknown as AgentTool;
+
+const rememberStub = {
+	name: "remember",
+	description: "record one memory line",
 	parameters: {},
 	execute: async () => ({ content: [{ type: "text" as const, text: "ok" }] }),
 } as unknown as AgentTool;
@@ -114,6 +125,20 @@ describe("AgentSession mid-run rewind nudge", () => {
 		return out;
 	}
 
+	async function drainRememberTips(): Promise<CustomMessage[]> {
+		if (!asideProvider) throw new Error("aside provider was never captured");
+		const thunks = await asideProvider("work");
+		const out: CustomMessage[] = [];
+		for (const entry of thunks) {
+			const message = typeof entry === "function" ? entry() : entry;
+			if (!message) continue;
+			if (message.role !== "custom") continue;
+			if ((message as CustomMessage).customType !== CONTEXT_MEMORY_REMINDER_MESSAGE_TYPE) continue;
+			out.push(message as CustomMessage);
+		}
+		return out;
+	}
+
 	function createSession(checkpointsEnabled: boolean): void {
 		tempDir = TempDir.createSync("@pi-rewind-mid-run-nudge-");
 		const sessionManager = SessionManager.inMemory(tempDir.path());
@@ -129,7 +154,7 @@ describe("AgentSession mid-run rewind nudge", () => {
 			initialState: {
 				model,
 				systemPrompt: ["Test"],
-				tools: [rewindStub],
+				tools: [rewindStub, rememberStub],
 				messages: [],
 			},
 		});
@@ -144,7 +169,10 @@ describe("AgentSession mid-run rewind nudge", () => {
 			sessionManager,
 			settings,
 			modelRegistry: sharedModelRegistry,
-			toolRegistry: new Map([["rewind", rewindStub]]),
+			toolRegistry: new Map([
+				["rewind", rewindStub],
+				["remember", rememberStub],
+			]),
 		});
 	}
 
@@ -199,6 +227,22 @@ describe("AgentSession mid-run rewind nudge", () => {
 		const nudges = await drainNudges();
 		expect(nudges.length).toBe(1);
 		expect(nudges[0]?.content).toContain("`R1`");
+	});
+
+	it("asks for one memory line per 40k tokens of work", async () => {
+		createSession(true);
+		await emitUser("fix a");
+		const perAssistant = 60; // 50 input + 10 output on each emitted assistant turn
+		const turns = Math.ceil(REMEMBER_TIP_TOKEN_INTERVAL / perAssistant);
+		for (let i = 0; i < turns; i++) emitToolResult("read");
+
+		const tips = await drainRememberTips();
+		expect(tips.length).toBe(1);
+		const text = typeof tips[0]?.content === "string" ? tips[0].content : "";
+		expect(text).toContain("remember(");
+		expect(text).toContain("40k tokens");
+		// The counter reset: no immediate second tip.
+		expect(await drainRememberTips()).toEqual([]);
 	});
 
 	it("does nothing when checkpoints are disabled", async () => {
