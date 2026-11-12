@@ -27,6 +27,7 @@ import {
 	linesSinceDay,
 	recentDayNotes,
 	renderContextMemoryBlock,
+	summarizeCommandRuns,
 } from "@oh-my-pi/pi-coding-agent/session/context-memory";
 import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
@@ -4025,15 +4026,69 @@ describe("AgentSession checkpoint rewind branch context", () => {
 		expect(secondRequest).toContain("day one settled the guard");
 	});
 
+	it("reports the day pace in the injected block", async () => {
+		const responses = (async function* () {
+			yield {
+				content: [
+					{ type: "toolCall", id: "g1", name: "grep", arguments: { pattern: "INSTRUCTION_NEEDLE", path: "." } },
+				],
+				stopReason: "toolUse" as const,
+			};
+			yield { content: ["done"], stopReason: "stop" as const };
+		})() as MockResponseSource;
+		const { session, mock, tempDir } = await createHarness(responses, [], {
+			realTools: true,
+			realSearchTools: true,
+		});
+		await Bun.write(path.join(tempDir.path(), "x.ts"), "INSTRUCTION_NEEDLE\n");
+
+		await session.prompt("explore");
+
+		const afterTool = mock.calls[1]!.context.messages.map(messageText).join("\n");
+		expect(afterTool).toContain("This day:");
+		expect(afterTool).toContain("settled step");
+	});
+
 	it("renders day notes and lines into one block", () => {
-		const block = renderContextMemoryBlock(
-			[{ ts: "2026-11-11T10:00:00.000Z", text: "day one settled the build switch" }],
-			[{ ts: "2026-11-11T10:05:00.000Z", text: "engine default stays rust", chars: 24 }],
-		);
+		const block = renderContextMemoryBlock({
+			notes: [{ ts: "2026-11-11T10:00:00.000Z", text: "day one settled the build switch" }],
+			lines: [{ ts: "2026-11-11T10:05:00.000Z", text: "engine default stays rust", chars: 24 }],
+		});
 		expect(block).toContain("Day notes");
 		expect(block).toContain("day one settled the build switch");
 		expect(block).toContain("engine default stays rust");
-		expect(renderContextMemoryBlock([], [])).toBeUndefined();
+		expect(renderContextMemoryBlock({ notes: [], lines: [] })).toBeUndefined();
+	});
+
+	it("summarizes repeated commands as facts", () => {
+		const lines = summarizeCommandRuns([
+			{ command: "npm test", isError: false, ts: 1 },
+			{ command: "npm test", isError: true, ts: 2 },
+			{ command: "npm test", isError: true, ts: 3 },
+			{ command: "ls", isError: false, ts: 4 },
+			{ command: "  npm   test ", isError: false, ts: 5 },
+		]);
+		expect(lines).toHaveLength(1);
+		expect(lines[0]).toContain("×4");
+		expect(lines[0]).toContain("2 of the last 4 failed");
+	});
+
+	it("warns when the memory bank nears its limits", () => {
+		const lines = Array.from({ length: 16 }, (_, index) => ({
+			ts: "2026-11-11T10:00:00.000Z",
+			text: `line ${index}`,
+			chars: 8,
+		}));
+		const block = renderContextMemoryBlock({
+			notes: [],
+			lines,
+			lineDayCount: 16,
+			dayNoteTotal: 8,
+			stats: { steps: 12, tokens: 4_200 },
+		});
+		expect(block).toContain("This day: 12 settled steps · 4.2k tokens");
+		expect(block).toContain("near the daily limit (16/20)");
+		expect(block).toContain("Day notes exceed the window (8)");
 	});
 
 	it("scopes the line budget to the current day", () => {

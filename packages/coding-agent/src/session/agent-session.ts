@@ -432,9 +432,12 @@ import {
 	parseDayNote,
 	recentDayNotes,
 	renderContextMemoryBlock,
+	summarizeCommandRuns,
+	type CommandRun,
 	type ContextMemoryLine,
 	type ContextMemoryRememberResult,
 	type DayNote,
+	type DayStats,
 } from "./context-memory";
 import type { ClientBridge } from "./client-bridge";
 import {
@@ -4749,6 +4752,48 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		return notes;
 	}
 
+	/** Pace since the day began (the last recorded day note), or the whole session. */
+	#dayStats(): DayStats {
+		const dayStart = this.#dayNotes().at(-1)?.ts ?? "";
+		let steps = 0;
+		let tokens = 0;
+		for (const entry of this.sessionManager.getEntries()) {
+			if (entry.type !== "message" || entry.timestamp < dayStart) continue;
+			const message = entry.message;
+			if (message.role === "toolResult") {
+				steps++;
+				continue;
+			}
+			if (message.role === "assistant" && message.usage)
+				tokens += (message.usage.input ?? 0) + (message.usage.cacheRead ?? 0) + (message.usage.output ?? 0);
+		}
+		return { steps, tokens };
+	}
+
+	/** Bash runs in this session, paired with their outcomes for repeat counts. */
+	#commandRuns(): CommandRun[] {
+		const failures = new Map<string, boolean>();
+		for (const entry of this.sessionManager.getEntries()) {
+			if (entry.type !== "message") continue;
+			const message = entry.message;
+			if (message.role === "toolResult" && message.toolName === "bash")
+				failures.set(message.toolCallId, message.isError === true);
+		}
+		const runs: CommandRun[] = [];
+		for (const entry of this.sessionManager.getEntries()) {
+			if (entry.type !== "message") continue;
+			const message = entry.message;
+			if (message.role !== "assistant") continue;
+			for (const block of message.content) {
+				if (block.type !== "toolCall" || block.name !== "bash") continue;
+				const command = block.arguments?.command;
+				if (typeof command !== "string") continue;
+				runs.push({ command, isError: failures.get(block.id) ?? false, ts: message.timestamp });
+			}
+		}
+		return runs;
+	}
+
 	/**
 	 * Rewrite this turn's reasoning for the next provider request only. Signed or
 	 * encrypted reasoning stays: its provider binds the content to it. The note
@@ -4786,7 +4831,16 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 * as the request's own tail, so the conversation prefix stays cacheable.
 	 */
 	#injectMemoryBlockIntoRequest(context: Context): void {
-		const content = renderContextMemoryBlock(recentDayNotes(this.#dayNotes()), this.#contextMemoryLines());
+		const notes = this.#dayNotes();
+		const lines = this.#contextMemoryLines();
+		const content = renderContextMemoryBlock({
+			notes: recentDayNotes(notes),
+			lines,
+			stats: this.#dayStats(),
+			commands: summarizeCommandRuns(this.#commandRuns()),
+			dayNoteTotal: notes.length,
+			lineDayCount: linesSinceDay(lines, notes.at(-1)?.ts).length,
+		});
 		const kept = context.messages.filter(
 			message => typeof message.content !== "string" || !message.content.includes(CONTEXT_MEMORY_BLOCK_TAG),
 		);
